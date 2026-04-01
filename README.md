@@ -37,16 +37,28 @@ Selenium, browser scraping, or brittle UI scripts.
 
 ## Install
 
-Download the latest release for your platform from the repository's **Releases** page.
-
 ### macOS
 
-1. Run the PKG installer.
+#### Option 1: Homebrew
+1. Tap the repository:
+   ```bash
+   brew tap ScalableCapital/tap
+   ```
+2. Install the CLI:
+   ```bash
+   brew install scalable-cli
+   ```
+
+#### Option 2: Manual install
+1. Download the macOS PKG installer from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
+2. Run the installer.
 
 ### Linux
 
-1. Extract the archive.
-2. Put the `sc` binary somewhere on your `PATH`.
+#### Manual install
+1. Download the tar.gz archive for your architecture (x86_64 or ARM) from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
+2. Extract the archive.
+3. Move the `sc` binary to a directory on your `PATH`.
 
 ### Verification
 
