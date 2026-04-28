@@ -1,0 +1,76 @@
+name: CLI UX feedback
+description: Report confusing commands, output, naming, help text, or error messages
+title: "ux: "
+labels: ["ux", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the Scalable CLI.
+
+        This repository is source-available. We review issues and feedback, but we do not accept external code contributions or pull requests.
+
+        Do not include access tokens, refresh tokens, device codes, account IDs, portfolio IDs, order IDs, personal financial data, or other sensitive information.
+
+  - type: dropdown
+    id: feedback-area
+    attributes:
+      label: Feedback area
+      options:
+        - Command naming
+        - Help text
+        - Error message
+        - Output formatting
+        - JSON output
+        - Authentication flow
+        - Broker context selection
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-was-confusing
+    attributes:
+      label: What was confusing?
+      description: Describe what made the command, output, naming, help text, or error message hard to use.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-instead
+    attributes:
+      label: What did you expect instead?
+      description: Describe the behavior, wording, or structure you expected.
+    validations:
+      required: true
+
+  - type: input
+    id: command-or-workflow
+    attributes:
+      label: Command or workflow
+      placeholder: sc ...
+
+  - type: textarea
+    id: example-output
+    attributes:
+      label: Example output or message
+      description: Paste the relevant output or message. Remove tokens, IDs, and sensitive data before posting.
+      render: text
+
+  - type: textarea
+    id: suggested-improvement
+    attributes:
+      label: Suggested improvement
+      description: If you have a concrete suggestion, describe it here.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues.
+          required: true
+        - label: I have removed tokens, IDs, and personal financial data.
+          required: true
+        - label: I understand this repository is source-available and does not accept external PRs.
+          required: true

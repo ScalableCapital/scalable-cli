@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest an improvement or new capability for the Scalable CLI
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the Scalable CLI.
+
+        This repository is source-available. We review issues and feedback, but we do not accept external code contributions or pull requests.
+
+        Do not include access tokens, refresh tokens, device codes, account IDs, portfolio IDs, order IDs, personal financial data, or other sensitive information.
+
+  - type: textarea
+    id: problem-or-use-case
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Describe the improvement or new capability you would like to see.
+
+  - type: textarea
+    id: alternatives-considered
+    attributes:
+      label: Alternatives considered
+      description: Describe any current workaround or alternative you considered.
+
+  - type: input
+    id: relevant-command
+    attributes:
+      label: Relevant command or workflow
+      placeholder: sc ...
+
+  - type: dropdown
+    id: user-impact
+    attributes:
+      label: User impact
+      options:
+        - Small quality-of-life improvement
+        - Important for a specific workflow
+        - Blocking a workflow
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues.
+          required: true
+        - label: This is a CLI feature request, not an account/support request.
+          required: true
+        - label: I understand this repository is source-available and does not accept external PRs.
+          required: true

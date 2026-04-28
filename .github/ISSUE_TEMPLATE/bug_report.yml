@@ -1,0 +1,157 @@
+name: Bug report
+description: Report a reproducible problem with the Scalable CLI
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the Scalable CLI.
+
+        This repository is source-available. We review issues and feedback, but we do not accept external code contributions or pull requests.
+
+        Do not include access tokens, refresh tokens, device codes, account IDs, portfolio IDs, order IDs, personal financial data, or other sensitive information.
+
+  - type: textarea
+    id: describe-the-bug
+    attributes:
+      label: Describe the bug
+      description: What happened? Keep this concise, but include the command or workflow that failed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the exact steps needed to reproduce the problem.
+      placeholder: |
+        1. Run `sc ...`
+        2. Observe `...`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect the CLI to do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: Paste the exact error, output, or unexpected result. Remove tokens, IDs, and sensitive data before posting.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: cli-version
+    attributes:
+      label: CLI version
+      placeholder: 0.1.0; run sc --version
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Homebrew
+        - Release artifact
+        - Cargo build
+        - Source checkout
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS and version
+      placeholder: macOS 26.2, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture
+      options:
+        - x86_64
+        - aarch64 (arm64)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      placeholder: zsh, bash, fish, PowerShell
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      placeholder: sc ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: output-mode
+    attributes:
+      label: Output mode
+      options:
+        - Human
+        - JSON / --json
+        - Both
+        - Not relevant
+    validations:
+      required: true
+
+  - type: dropdown
+    id: logged-in
+    attributes:
+      label: Logged in before running the command
+      options:
+        - "Yes"
+        - "No"
+        - Not relevant
+    validations:
+      required: true
+
+  - type: dropdown
+    id: broker-context-selected
+    attributes:
+      label: Broker context selected
+      options:
+        - "Yes"
+        - "No"
+        - Not relevant
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add logs, screenshots, links, or other context that helps explain the issue. Do not include sensitive information.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues.
+          required: true
+        - label: I am using the latest available version of the CLI.
+          required: true
+        - label: This is about the Scalable CLI, not an account, trading, payment, or broker support request.
+          required: true
+        - label: I have removed tokens, IDs, and personal financial data.
+          required: true

@@ -56,19 +56,28 @@ Selenium, browser scraping, or brittle UI scripts.
 ### Linux
 
 #### Manual install
-1. Download the tar.gz archive for your architecture (x86_64 or ARM) from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
+1. Download the tar.gz archive for your architecture (`x86_64` or `aarch64`) from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
 2. Extract the archive.
 3. Move the `sc` binary to a directory on your `PATH`.
 
-### Verification
+### Official binaries and source builds
+
+Official Scalable-distributed binaries are the release assets published by
+Scalable Capital on GitHub and the packages installed from the official
+Scalable Homebrew tap.
+
+If you build this repository yourself, use a fork, install from a third-party
+package manager, pull a container image, or receive a redistributed binary from
+someone else, that binary is not distributed by Scalable Capital. Only use
+binaries whose source and provenance you trust, especially before logging in or
+running broker commands.
+
+### Basic verification
 
 ```bash
 sc --version
 sc --help
 ```
-
-Release assets also include checksums and Sigstore signature material for users
-who want to verify integrity and provenance before installing.
 
 ## Quick start
 
@@ -101,6 +110,101 @@ sc broker overview --json
 `sc login` uses an OAuth 2.0 device-code flow.
 For security and reliability, complete login yourself rather than via an AI agent.
 
+## Release artifact provenance
+
+Release assets include checksums and a minisign signature for the checksum
+manifest. The examples below assume `minisign` and the GitHub CLI (`gh`) are
+installed.
+
+Each snippet below pins the current Scalable Capital minisign release signing
+public key: `RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b`.
+
+### Verify a Linux tarball
+
+```bash
+tag="vX.Y.Z"
+arch="x86_64" # or aarch64
+repo="ScalableCapital/scalable-cli"
+minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
+
+asset="sc-${tag}-linux-${arch}-gnu.tar.gz"
+checksums="sc-${tag}-SHA256SUMS"
+
+gh release download "${tag}" \
+  --repo "${repo}" \
+  --pattern "${asset}" \
+  --pattern "${checksums}" \
+  --pattern "${checksums}.minisig" \
+  --clobber
+
+minisign -V \
+  -P "${minisign_public_key}" \
+  -m "${checksums}" \
+  -x "${checksums}.minisig"
+
+set -o pipefail
+grep -F "  ${asset}" "${checksums}" | sha256sum -c -
+```
+
+### Verify a macOS PKG installer
+
+```bash
+tag="vX.Y.Z"
+repo="ScalableCapital/scalable-cli"
+minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
+
+asset="sc-${tag}-macos-universal2.pkg"
+checksums="sc-${tag}-SHA256SUMS"
+
+gh release download "${tag}" \
+  --repo "${repo}" \
+  --pattern "${asset}" \
+  --pattern "${checksums}" \
+  --pattern "${checksums}.minisig" \
+  --clobber
+
+minisign -V \
+  -P "${minisign_public_key}" \
+  -m "${checksums}" \
+  -x "${checksums}.minisig"
+
+set -o pipefail
+grep -F "  ${asset}" "${checksums}" | shasum -a 256 -c -
+pkgutil --check-signature "${asset}"
+spctl -a -vv --type install "${asset}"
+```
+
+### Verify the macOS Homebrew runtime ZIP
+
+```bash
+tag="vX.Y.Z"
+repo="ScalableCapital/scalable-cli"
+minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
+
+asset="sc-${tag}-macos-universal2.zip"
+checksums="sc-${tag}-SHA256SUMS"
+
+gh release download "${tag}" \
+  --repo "${repo}" \
+  --pattern "${asset}" \
+  --pattern "${checksums}" \
+  --pattern "${checksums}.minisig" \
+  --clobber
+
+minisign -V \
+  -P "${minisign_public_key}" \
+  -m "${checksums}" \
+  -x "${checksums}.minisig"
+
+set -o pipefail
+grep -F "  ${asset}" "${checksums}" | shasum -a 256 -c -
+
+rm -rf ./sc-homebrew-runtime
+unzip -q "${asset}" -d ./sc-homebrew-runtime
+codesign -dv --verbose=4 ./sc-homebrew-runtime/Sc.app
+spctl -a -vv --type exec ./sc-homebrew-runtime/Sc.app
+```
+
 ## Common commands
 
 ### Identity and session
@@ -116,7 +220,9 @@ sc logout
 sc broker overview
 sc broker analytics
 sc broker transactions
+sc broker transaction details --transaction-id <TRANSACTION_ID>
 sc broker holdings
+sc broker quote --isin US0378331005
 sc broker watchlist
 sc broker search "apple"
 sc broker security-news --isin US0378331005 --locale en_DE
@@ -130,8 +236,10 @@ sc broker watchlist remove --isin US0378331005
 sc broker price-alerts --active-only
 sc broker price-alerts add --isin US0378331005 --price 180.00
 sc broker price-alerts add --ticker BTC --price 45000.00
+sc broker price-alerts remove --alert-id <ALERT_ID>
 sc broker savings-plans
 sc broker savings-plans add --isin US0378331005 --amount 100
+sc broker savings-plans remove --isin US0378331005
 ```
 
 ### Broker context
@@ -164,6 +272,7 @@ The same confirmation model applies to sell orders:
 
 ```bash
 sc broker trade sell --isin US0378331005 --shares 1 --order-type market
+sc broker trade cancel --order-id <ORDER_ID>
 ```
 
 Supported order types:
@@ -171,6 +280,10 @@ Supported order types:
 - `market`
 - `limit`
 - `stop`
+
+Trade cancellation is a separate single-step command for pending orders. Use
+the `order_id` returned by `sc broker trade buy` or `sc broker trade sell`; it
+is the same ID shown in `sc broker transactions`.
 
 ## Automation
 
@@ -188,11 +301,12 @@ sc broker trade buy --help
 
 ## Configuration
 
-`config.toml` is optional local runtime config for storage backends. The default configuration is the most secure one per platform.
+`config.toml` is optional local runtime config for storage backends. The default
+configuration is platform-specific.
 
 Example:
 
-```
+```toml
 [auth]
 session_backend = "keyring"
 signing_key_backend = "secure_enclave"
@@ -201,12 +315,71 @@ signing_key_backend = "secure_enclave"
 Configuration options:
 
 - session_backend: where the login session is stored. Supported values: `keyring`, `file`. Default is `keyring` on macOS/Linux.
-- signing_key_backend: where the signing key is stored. Supported values: `file`, `secure_enclave`. Default is `secure_enclave` on macOS and `file` on Linux. `secure_enclave` is macOS-only.
+- signing_key_backend: where the authentication signing key is stored. Supported values: `file`, `secure_enclave`, `pkcs11`. Default is `secure_enclave` on macOS and `file` on Linux. `secure_enclave` is macOS-only. `pkcs11` is Linux-only and opt-in.
+
+### Linux PKCS#11 signing key
+
+PKCS#11 lets the CLI use an existing hardware token, smartcard, or HSM-backed
+key for its authentication signing key. The CLI does not create, import, rotate,
+delete, export, or store PKCS#11 private keys.
+
+```toml
+[auth]
+signing_key_backend = "pkcs11"
+
+[auth.pkcs11]
+module_path = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
+key_uri = "pkcs11:token=YubiKey%20PIV;id=%01"
+```
+
+PKCS#11 options:
+
+- module_path: required path to the PKCS#11 provider library.
+- key_uri: required PKCS#11 URI for the existing key.
+
+The URI must start with `pkcs11:` and identify exactly one EC P-256 private
+key. Use `id=` or `object=` to identify the key; add `token=`, `serial=`,
+`manufacturer=`, or `model=` if needed to make token selection unambiguous.
+Percent-encode binary IDs and spaces.
+
+If the token requires login, use either the token/provider protected
+authentication path or set `SC_PKCS11_PIN` in the environment. The CLI does not
+prompt for or store the PIN.
+
+PKCS#11 failures do not fall back to `file`. Switching signing backends changes
+the authentication key identity, so run `sc login` again after changing this
+setting.
 
 Config file locations:
 
 - macOS: ~/.config/scalable-cli/config.toml
 - Linux: $XDG_CONFIG_HOME/scalable-cli/config.toml, falling back to ~/.config/scalable-cli/config.toml
+
+## Build from source
+
+Building from source is useful for inspection, local development, and advanced
+users. A locally built binary is self-built; it is not an official
+Scalable-distributed release artifact unless it was built and published by
+Scalable Capital through the official release process above.
+
+Build the production-channel binary:
+
+```bash
+cargo build --locked --release --features channel-prod --bin sc
+```
+
+The binary is written to:
+
+```bash
+target/release/sc
+```
+
+Verify the build:
+
+```bash
+target/release/sc --version
+target/release/sc --help
+```
 
 ## Run as a dedicated Unix user
 
