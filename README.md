@@ -110,6 +110,12 @@ sc broker overview --json
 `sc login` uses an OAuth 2.0 device-code flow.
 For security and reliability, complete login yourself rather than via an AI agent.
 
+Optional local write guard:
+
+- `sc login --local-read-only` stores the session in a locally enforced read-only mode.
+- This does not change token permissions or backend access.
+- Read commands and local commands such as `sc broker context select` continue to work, while write commands are blocked locally until you run `sc login` again without `--local-read-only`.
+
 ## Release artifact provenance
 
 Release assets include checksums and a minisign signature for the checksum
@@ -225,8 +231,14 @@ sc broker holdings
 sc broker quote --isin US0378331005
 sc broker watchlist
 sc broker search "apple"
+sc broker derivatives search --underlying US0378331005 --type knockout --strategy long
 sc broker security-news --isin US0378331005 --locale en_DE
 ```
+
+`sc broker derivatives search` supports derivative discovery for a known
+underlying ISIN. The selected derivative ISIN can then be quoted with
+`sc broker quote --isin ...`. The CLI also verifies trade buy phase-1 input
+acceptance for derivative-style ISINs.
 
 ### Watchlist, alerts and savings plans
 

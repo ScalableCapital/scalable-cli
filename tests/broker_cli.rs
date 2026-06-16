@@ -1,8 +1,11 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use scalable_cli::dpop::DpopKeyMaterial;
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 
 fn sc_command() -> Command {
@@ -28,7 +31,55 @@ fn current_session_env() -> &'static str {
     }
 }
 
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+        let previous = std::env::var_os(key);
+        let value = value.into();
+        unsafe {
+            std::env::set_var(key, &value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn test_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn ensure_runtime_dpop_key(config_dir: &Path) -> String {
+    let _lock = test_env_lock().lock().expect("lock");
+    let _guard = EnvGuard::set("SC_CONFIG_DIR", config_dir.as_os_str());
+    let key = DpopKeyMaterial::load_or_create_default().expect("create dpop key");
+    key.jwk_thumbprint().expect("dpop thumbprint")
+}
+
 fn write_test_session(config_dir: &Path, access_token: &str) {
+    write_test_session_with_options(config_dir, access_token, None, None);
+}
+
+fn write_test_session_with_options(
+    config_dir: &Path,
+    access_token: &str,
+    mode: Option<&str>,
+    dpop_jwk_thumbprint: Option<&str>,
+) {
     fs::write(
         config_dir.join("session.json"),
         json!({
@@ -40,7 +91,9 @@ fn write_test_session(config_dir: &Path, access_token: &str) {
                 "expires_at": 9_999_999_999_i64,
                 "person_id": "p-1",
                 "source": "device_code"
-            }
+            },
+            "dpop_jwk_thumbprint": dpop_jwk_thumbprint,
+            "mode": mode,
         })
         .to_string(),
     )
@@ -149,6 +202,69 @@ fn broker_context_select_and_show_roundtrip_json() {
         .success()
         .stdout(predicate::str::contains("\"account_id\":\"p-1\""))
         .stdout(predicate::str::contains("\"portfolio_id\":\"p1\""));
+}
+
+#[test]
+fn broker_context_select_is_allowed_with_local_read_only_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        Some("local_read_only"),
+        None,
+    );
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "context",
+            "select",
+            "--portfolio-id",
+            "p-local",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"saved\":true"))
+        .stdout(predicate::str::contains("\"portfolio_id\":\"p-local\""));
+}
+
+#[test]
+fn broker_watchlist_add_json_returns_local_read_only_machine_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        Some("local_read_only"),
+        Some(thumbprint.as_str()),
+    );
+    write_test_broker_context(tmp.path(), "p-1", "portfolio-1");
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "watchlist",
+            "add",
+            "--isin",
+            "US0378331005",
+            "--json",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains(
+            "\"command\":\"broker.watchlist.add\"",
+        ))
+        .stdout(predicate::str::contains("\"code\":\"local_read_only\""))
+        .stdout(predicate::str::contains(
+            "local read-only mode blocks write operation 'BrokerAddToWatchlist'",
+        ));
 }
 
 #[test]

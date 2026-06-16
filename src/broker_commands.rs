@@ -7,6 +7,7 @@ use crate::broker_context::{
 };
 use crate::broker_query_execution::{
     execute_broker_analytics as execute_broker_analytics_query,
+    execute_broker_derivatives_search as execute_broker_derivatives_search_query,
     execute_broker_holdings as execute_broker_holdings_query,
     execute_broker_overview as execute_broker_overview_query,
     execute_broker_price_alerts as execute_broker_price_alerts_query,
@@ -22,9 +23,9 @@ use crate::broker_shared::{
     RESOLVE_BROKER_IDS_QUERY, load_active_session, resolve_broker_ids, validated_broker_input,
 };
 use crate::cli::{
-    BrokerArgs, BrokerCommand, BrokerContextCommand, BrokerPriceAlertsCommand,
-    BrokerSavingsPlansCommand, BrokerTradeCommand, BrokerTransactionCommand,
-    BrokerWatchlistCommand,
+    BrokerArgs, BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand,
+    BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
+    BrokerTransactionCommand, BrokerWatchlistCommand,
 };
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
 use crate::graphql::execute_graphql;
@@ -70,6 +71,7 @@ pub(crate) fn bootstrap_broker_context_after_login(
         bail!("No active session for {env} after login");
     }
     let mut session = stored.session;
+    let access_context = crate::graphql::GraphqlAccessContext::with_session_mode(stored.mode);
 
     // Always bootstrap at least account_id from the authenticated session.
     let mut context = BrokerContext {
@@ -91,6 +93,7 @@ pub(crate) fn bootstrap_broker_context_after_login(
                 RESOLVE_BROKER_IDS_QUERY,
                 &json!({ "id": person_id }),
                 Some("ResolveBrokerIds"),
+                access_context,
                 dpop_options,
             )
         },
@@ -294,6 +297,14 @@ pub(crate) fn run_broker_command_human(
             let payload = execute_broker_search(search_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
         }
+        BrokerCommand::Derivatives(derivatives_args) => match derivatives_args.command {
+            BrokerDerivativesCommand::Search(search_args) => {
+                let compact = search_args.json;
+                let payload =
+                    execute_broker_derivatives_search(search_args, config, session_manager)?;
+                Ok(HumanBrokerOutput::Json(payload, compact))
+            }
+        },
         BrokerCommand::Quote(quote_args) => {
             let compact = quote_args.json;
             let payload = execute_broker_quote(quote_args, config, session_manager)?;
@@ -477,6 +488,11 @@ pub(crate) fn run_broker_command_machine(
             }
         }
         BrokerCommand::Search(args) => execute_broker_search(args, config, session_manager),
+        BrokerCommand::Derivatives(args) => match args.command {
+            BrokerDerivativesCommand::Search(search_args) => {
+                execute_broker_derivatives_search(search_args, config, session_manager)
+            }
+        },
         BrokerCommand::Quote(args) => execute_broker_quote(args, config, session_manager),
         BrokerCommand::SecurityNews(args) => {
             execute_broker_security_news(args, config, session_manager)
@@ -751,6 +767,22 @@ fn render_security_trade_text(lines: &mut Vec<String>, result: &Value, currency:
         display_money(trade_amounts.get("tax_amount"), currency)
     ));
     lines.push(format!(
+        "transaction_fee: {}",
+        display_money(trade_amounts.get("transaction_fee"), currency)
+    ));
+    lines.push(format!(
+        "venue_fee: {}",
+        display_money(trade_amounts.get("venue_fee"), currency)
+    ));
+    lines.push(format!(
+        "crypto_spread_fee: {}",
+        display_money(trade_amounts.get("crypto_spread_fee"), currency)
+    ));
+    lines.push(format!(
+        "total_tax: {}",
+        display_money(aggregated_taxes.get("total_tax"), currency)
+    ));
+    lines.push(format!(
         "capital_gains_tax: {}",
         display_money(aggregated_taxes.get("capital_gains_tax"), currency)
     ));
@@ -946,7 +978,9 @@ pub(crate) fn execute_broker_watchlist_add(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -970,6 +1004,7 @@ pub(crate) fn execute_broker_watchlist_add(
                 BROKER_ADD_TO_WATCHLIST_MUTATION,
                 &variables,
                 Some("BrokerAddToWatchlist"),
+                access_context,
                 dpop_options,
             )
         },
@@ -995,7 +1030,9 @@ pub(crate) fn execute_broker_watchlist_remove(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -1019,6 +1056,7 @@ pub(crate) fn execute_broker_watchlist_remove(
                 BROKER_REMOVE_FROM_WATCHLIST_MUTATION,
                 &variables,
                 Some("BrokerRemoveFromWatchlist"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1041,6 +1079,14 @@ pub(crate) fn execute_broker_search(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     execute_broker_search_query(args, config, session_manager)
+}
+
+pub(crate) fn execute_broker_derivatives_search(
+    args: crate::cli::BrokerDerivativesSearchArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    execute_broker_derivatives_search_query(args, config, session_manager)
 }
 
 pub(crate) fn execute_broker_quote(
@@ -1076,7 +1122,9 @@ pub(crate) fn execute_broker_price_alert_add(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -1110,6 +1158,7 @@ pub(crate) fn execute_broker_price_alert_add(
                     BROKER_ADD_PRICE_ALERT_MUTATION,
                     &variables,
                     Some("BrokerAddPriceAlert"),
+                    access_context,
                     dpop_options,
                 )
             },
@@ -1139,6 +1188,7 @@ pub(crate) fn execute_broker_price_alert_add(
                     BROKER_ADD_CRYPTO_PRICE_ALERT_MUTATION,
                     &variables,
                     Some("BrokerAddCryptoPriceAlert"),
+                    access_context,
                     dpop_options,
                 )
             },
@@ -1179,7 +1229,9 @@ pub(crate) fn execute_broker_price_alert_remove(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -1217,6 +1269,7 @@ pub(crate) fn execute_broker_price_alert_remove(
                         BROKER_REMOVE_PRICE_ALERT_MUTATION,
                         &variables,
                         Some("BrokerRemovePriceAlert"),
+                        access_context,
                         dpop_options,
                     )
                 },
@@ -1238,6 +1291,7 @@ pub(crate) fn execute_broker_price_alert_remove(
                         BROKER_REMOVE_CRYPTO_PRICE_ALERT_MUTATION,
                         &variables,
                         Some("BrokerRemoveCryptoPriceAlert"),
+                        access_context,
                         dpop_options,
                     )
                 },
@@ -1285,6 +1339,7 @@ fn lookup_price_alert_by_id(
                 BROKER_PRICE_ALERTS_QUERY,
                 &security_variables,
                 Some("BrokerPriceAlerts"),
+                crate::graphql::GraphqlAccessContext::default(),
                 dpop_options,
             )
         },
@@ -1315,6 +1370,7 @@ fn lookup_price_alert_by_id(
                     BROKER_CRYPTO_PRICE_ALERTS_QUERY,
                     &crypto_variables,
                     Some("BrokerCryptoPriceAlerts"),
+                    crate::graphql::GraphqlAccessContext::default(),
                     dpop_options,
                 )
             },
@@ -1484,7 +1540,9 @@ pub(crate) fn execute_broker_savings_plan_add(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
 
     let isin = args.isin.trim().to_string();
     if isin.is_empty() {
@@ -1519,6 +1577,7 @@ pub(crate) fn execute_broker_savings_plan_add(
                 BROKER_SAVINGS_PLAN_CONFIG_QUERY,
                 &config_variables,
                 Some("BrokerSavingsPlanConfig"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1566,6 +1625,7 @@ pub(crate) fn execute_broker_savings_plan_add(
                 BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
                 &mutation_variables,
                 Some("BrokerCreateOrUpdateSavingsPlan"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1588,6 +1648,7 @@ pub(crate) fn execute_broker_savings_plan_add(
                 BROKER_SAVINGS_PLAN_BY_ISIN_QUERY,
                 &readback_variables,
                 Some("BrokerSavingsPlanByIsin"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1652,7 +1713,9 @@ pub(crate) fn execute_broker_savings_plan_remove(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -1682,6 +1745,7 @@ pub(crate) fn execute_broker_savings_plan_remove(
                 BROKER_REMOVE_SAVINGS_PLAN_MUTATION,
                 &variables,
                 Some("BrokerRemoveSavingsPlan"),
+                access_context,
                 dpop_options,
             )
         },
@@ -2570,6 +2634,7 @@ mod tests {
                 env: crate::channel::current_env(),
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
             })
             .expect("save session");
 
@@ -2598,5 +2663,136 @@ mod tests {
         }
 
         cancel_mock.assert();
+    }
+
+    #[test]
+    fn render_broker_transaction_details_text_includes_nested_fee_and_total_tax_fields() {
+        let payload = json!({
+            "result": {
+                "id": "tx-42",
+                "transaction_reference": "WUM 872598752",
+                "type": "TRADE",
+                "detail_type": "security_trade",
+                "currency": "EUR",
+                "last_event_datetime": "2026-04-15T10:22:31Z",
+                "security": {
+                    "isin": "IE00B4ND3602",
+                    "name": "Example ETF",
+                    "security_type": "ETF"
+                },
+                "security_trade": {
+                    "status": "FILLED",
+                    "side": "BUY",
+                    "order_kind": "SINGLE",
+                    "number_of_shares": {
+                        "filled": "10",
+                        "total": "10"
+                    },
+                    "average_price": "10.25",
+                    "total_amount": "102.50",
+                    "finalisation_reason": Value::Null,
+                    "limit_price": Value::Null,
+                    "stop_price": Value::Null,
+                    "valid_until": Value::Null,
+                    "is_cancellation_requested": false,
+                    "trading_venue": "MUNC",
+                    "fee": "1.11",
+                    "transactional_fee": "0.22",
+                    "taxes": "2.50",
+                    "trade_transaction_amounts": {
+                        "tax_amount": "2.50",
+                        "transaction_fee": "0.99",
+                        "venue_fee": "1.01",
+                        "crypto_spread_fee": "0.03"
+                    },
+                    "aggregated_transaction_taxes": {
+                        "total_tax": "2.50",
+                        "capital_gains_tax": "2.10",
+                        "church_tax": "0.10",
+                        "solidarity_tax": "0.30",
+                        "source_tax": Value::Null,
+                        "financial_transaction_tax": Value::Null
+                    }
+                },
+                "documents": [],
+                "linked_transaction_ids": [],
+                "history": []
+            }
+        });
+
+        let lines = render_broker_transaction_details_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "transaction_fee: 0.99 EUR"));
+        assert!(lines.iter().any(|line| line == "venue_fee: 1.01 EUR"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "crypto_spread_fee: 0.03 EUR")
+        );
+        assert!(lines.iter().any(|line| line == "total_tax: 2.50 EUR"));
+    }
+
+    #[test]
+    fn render_broker_transaction_details_text_shows_missing_nested_fee_and_total_tax_fields_as_none()
+     {
+        let payload = json!({
+            "result": {
+                "id": "tx-42",
+                "transaction_reference": "WUM 872598752",
+                "type": "TRADE",
+                "detail_type": "security_trade",
+                "currency": "EUR",
+                "last_event_datetime": "2026-04-15T10:22:31Z",
+                "security": {
+                    "isin": "IE00B4ND3602",
+                    "name": "Example ETF",
+                    "security_type": "ETF"
+                },
+                "security_trade": {
+                    "status": "FILLED",
+                    "side": "BUY",
+                    "order_kind": "SINGLE",
+                    "number_of_shares": {
+                        "filled": "10",
+                        "total": "10"
+                    },
+                    "average_price": "10.25",
+                    "total_amount": "102.50",
+                    "finalisation_reason": Value::Null,
+                    "limit_price": Value::Null,
+                    "stop_price": Value::Null,
+                    "valid_until": Value::Null,
+                    "is_cancellation_requested": false,
+                    "trading_venue": "MUNC",
+                    "fee": Value::Null,
+                    "transactional_fee": Value::Null,
+                    "taxes": Value::Null,
+                    "trade_transaction_amounts": {
+                        "tax_amount": Value::Null,
+                        "transaction_fee": Value::Null,
+                        "venue_fee": Value::Null,
+                        "crypto_spread_fee": Value::Null
+                    },
+                    "aggregated_transaction_taxes": {
+                        "total_tax": Value::Null,
+                        "capital_gains_tax": Value::Null,
+                        "church_tax": Value::Null,
+                        "solidarity_tax": Value::Null,
+                        "source_tax": Value::Null,
+                        "financial_transaction_tax": Value::Null
+                    }
+                },
+                "documents": [],
+                "linked_transaction_ids": [],
+                "history": []
+            }
+        });
+
+        let lines = render_broker_transaction_details_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "transaction_fee: <none>"));
+        assert!(lines.iter().any(|line| line == "venue_fee: <none>"));
+        assert!(lines.iter().any(|line| line == "crypto_spread_fee: <none>"));
+        assert!(lines.iter().any(|line| line == "total_tax: <none>"));
     }
 }

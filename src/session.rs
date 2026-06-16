@@ -20,6 +20,12 @@ pub enum LoginSource {
     DeviceCode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    LocalReadOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub access_token: String,
@@ -36,6 +42,8 @@ pub struct StoredSession {
     pub session: Session,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpop_jwk_thumbprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SessionMode>,
 }
 
 pub trait SecretStore {
@@ -341,6 +349,7 @@ mod tests {
             env: TargetEnv::Prod,
             session: sample_session(),
             dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
+            mode: None,
         }
     }
 
@@ -388,6 +397,7 @@ mod tests {
         assert_eq!(loaded.session.person_id, "person");
         assert_eq!(loaded.session.access_token, "access");
         assert_eq!(loaded.dpop_jwk_thumbprint.as_deref(), Some("thumbprint-1"));
+        assert_eq!(loaded.mode, None);
     }
 
     #[test]
@@ -494,5 +504,44 @@ mod tests {
 
         assert_eq!(loaded.env, TargetEnv::Prod);
         assert_eq!(loaded.dpop_jwk_thumbprint, None);
+        assert_eq!(loaded.mode, None);
+    }
+
+    #[test]
+    fn load_active_accepts_legacy_session_without_mode() {
+        let store = MemoryStore::default();
+        let manager = SessionManager::with_store(store);
+        manager
+            .store
+            .set(
+                SESSION_ACCOUNT,
+                r#"{"env":"prod","session":{"access_token":"access","refresh_token":"refresh","id_token":"id","expires_at":1,"person_id":"person","source":"device_code"},"dpop_jwk_thumbprint":"thumbprint-1"}"#,
+            )
+            .expect("write legacy payload");
+
+        let loaded = manager
+            .load_active()
+            .expect("load")
+            .expect("session exists");
+
+        assert_eq!(loaded.mode, None);
+    }
+
+    #[test]
+    fn save_and_load_session_preserves_mode() {
+        let store = MemoryStore::default();
+        let mut manager = SessionManager::with_store(store);
+        let stored = StoredSession {
+            mode: Some(SessionMode::LocalReadOnly),
+            ..sample_stored_session()
+        };
+
+        manager.save_active(&stored).expect("save");
+        let loaded = manager
+            .load_active()
+            .expect("load")
+            .expect("session exists");
+
+        assert_eq!(loaded.mode, Some(SessionMode::LocalReadOnly));
     }
 }

@@ -8,15 +8,17 @@ use crate::broker_shared::{
 use crate::config::AppConfig;
 use crate::graphql::execute_graphql;
 use crate::helpers::{
-    BROKER_ANALYTICS_QUERY, BROKER_HOLDINGS_QUERY, BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY,
-    BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY, BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY,
-    BROKER_SECURITY_NEWS_QUERY, BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY,
-    BROKER_WATCHLIST_QUERY, broker_analytics_variables, broker_holdings_variables,
+    BROKER_ANALYTICS_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY, BROKER_HOLDINGS_QUERY,
+    BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY,
+    BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY, BROKER_SECURITY_NEWS_QUERY,
+    BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY, BROKER_WATCHLIST_QUERY,
+    broker_analytics_variables, broker_derivatives_search_variables, broker_holdings_variables,
     broker_limits_variables, broker_overview_variables, broker_price_alerts_variables,
     broker_quote_variables, broker_savings_plans_variables, broker_search_variables,
     broker_transaction_details_variables, broker_transactions_variables_from_normalized,
-    broker_watchlist_variables, normalize_broker_transactions_query_input,
-    project_broker_analytics_response, project_broker_holdings_response,
+    broker_watchlist_variables, normalize_broker_derivatives_search_query_input,
+    normalize_broker_transactions_query_input, project_broker_analytics_response,
+    project_broker_derivatives_search_response, project_broker_holdings_response,
     project_broker_limits_response, project_broker_overview_response,
     project_broker_price_alerts_response, project_broker_quote_response,
     project_broker_savings_plans_response, project_broker_search_response,
@@ -47,7 +49,9 @@ pub(crate) fn execute_broker_overview(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -71,6 +75,7 @@ pub(crate) fn execute_broker_overview(
                 BROKER_OVERVIEW_QUERY,
                 &variables,
                 Some("BrokerOverview"),
+                access_context,
                 dpop_options,
             )
         },
@@ -88,7 +93,9 @@ pub(crate) fn execute_broker_analytics(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -112,6 +119,7 @@ pub(crate) fn execute_broker_analytics(
                 BROKER_ANALYTICS_QUERY,
                 &variables,
                 Some("BrokerAnalytics"),
+                access_context,
                 dpop_options,
             )
         },
@@ -140,7 +148,9 @@ pub(crate) fn execute_broker_transactions(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -164,6 +174,7 @@ pub(crate) fn execute_broker_transactions(
                 BROKER_TRANSACTIONS_QUERY,
                 &variables,
                 Some("BrokerTransactions"),
+                access_context,
                 dpop_options,
             )
         },
@@ -193,7 +204,9 @@ pub(crate) fn execute_broker_transaction_details(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -217,6 +230,7 @@ pub(crate) fn execute_broker_transaction_details(
                 BROKER_TRANSACTION_DETAILS_QUERY,
                 &variables,
                 Some("BrokerTransactionDetails"),
+                access_context,
                 dpop_options,
             )
         },
@@ -234,7 +248,9 @@ pub(crate) fn execute_broker_holdings(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -262,6 +278,7 @@ pub(crate) fn execute_broker_holdings(
                 BROKER_HOLDINGS_QUERY,
                 &variables,
                 Some("BrokerHoldings"),
+                access_context,
                 dpop_options,
             )
         },
@@ -279,7 +296,9 @@ pub(crate) fn execute_broker_watchlist(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -307,6 +326,7 @@ pub(crate) fn execute_broker_watchlist(
                 BROKER_WATCHLIST_QUERY,
                 &variables,
                 Some("BrokerWatchlist"),
+                access_context,
                 dpop_options,
             )
         },
@@ -324,7 +344,9 @@ pub(crate) fn execute_broker_search(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -353,11 +375,58 @@ pub(crate) fn execute_broker_search(
                 BROKER_SEARCH_QUERY,
                 &variables,
                 Some("BrokerSecuritySearch"),
+                access_context,
                 dpop_options,
             )
         },
     )?;
     let projected = project_broker_search_response(&input, query, &response)?;
+    Ok(broker_result_envelope(&ids, projected))
+}
+
+pub(crate) fn execute_broker_derivatives_search(
+    args: crate::cli::BrokerDerivativesSearchArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let normalized_query = normalize_broker_derivatives_search_query_input(&args)?;
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    let env_cfg = crate::channel::current_env_config();
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
+    let ids = resolve_broker_ids(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        args.portfolio_id.as_deref(),
+    )?;
+    let input = validated_broker_input(&ids, false, None)?;
+    let variables = broker_derivatives_search_variables(&input, &normalized_query)?;
+    let response = execute_with_refresh_retry(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        |token| {
+            execute_graphql(
+                &env_cfg.graphql_url,
+                token,
+                BROKER_DERIVATIVES_SEARCH_QUERY,
+                &variables,
+                Some("BrokerDerivativesSearch"),
+                access_context,
+                dpop_options,
+            )
+        },
+    )?;
+    let projected =
+        project_broker_derivatives_search_response(&input, &normalized_query, &response)?;
     Ok(broker_result_envelope(&ids, projected))
 }
 
@@ -370,7 +439,9 @@ pub(crate) fn execute_broker_quote(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -399,6 +470,7 @@ pub(crate) fn execute_broker_quote(
                 BROKER_QUOTE_QUERY,
                 &variables,
                 Some("BrokerQuote"),
+                access_context,
                 dpop_options,
             )
         },
@@ -416,7 +488,9 @@ pub(crate) fn execute_broker_security_news(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let locale = args
         .locale
         .as_deref()
@@ -442,6 +516,7 @@ pub(crate) fn execute_broker_security_news(
                 BROKER_SECURITY_NEWS_QUERY,
                 &variables,
                 Some("BrokerSecurityNews"),
+                access_context,
                 dpop_options,
             )
         },
@@ -465,7 +540,9 @@ pub(crate) fn execute_broker_price_alerts(
 
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -489,6 +566,7 @@ pub(crate) fn execute_broker_price_alerts(
                 BROKER_PRICE_ALERTS_QUERY,
                 &variables,
                 Some("BrokerPriceAlerts"),
+                access_context,
                 dpop_options,
             )
         },
@@ -506,7 +584,9 @@ pub(crate) fn execute_broker_limits(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -530,6 +610,7 @@ pub(crate) fn execute_broker_limits(
                 BROKER_LIMITS_QUERY,
                 &variables,
                 Some("BrokerLimits"),
+                access_context,
                 dpop_options,
             )
         },
@@ -553,7 +634,9 @@ pub(crate) fn execute_broker_savings_plans(
 
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -577,6 +660,7 @@ pub(crate) fn execute_broker_savings_plans(
                 BROKER_SAVINGS_PLANS_QUERY,
                 &variables,
                 Some("BrokerSavingsPlans"),
+                access_context,
                 dpop_options,
             )
         },
@@ -591,7 +675,10 @@ mod tests {
     use mockito::{Matcher, Server};
 
     use crate::cli::{
-        BrokerOverviewArgs, BrokerQuoteArgs, BrokerSearchArgs, BrokerTransactionsArgs,
+        BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField,
+        BrokerDerivativeSortOrder, BrokerDerivativeStrategy, BrokerDerivativeType,
+        BrokerDerivativesSearchArgs, BrokerOverviewArgs, BrokerQuoteArgs, BrokerSearchArgs,
+        BrokerTransactionsArgs,
     };
     use crate::config::TargetEnv;
     use crate::session::{LoginSource, Session, StoredSession};
@@ -663,6 +750,7 @@ mod tests {
             env,
             session: sample_session(),
             dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint()),
+            mode: None,
         }
     }
 
@@ -694,6 +782,36 @@ mod tests {
             portfolio_id: Some("portfolio-1".to_string()),
             include_year_to_date: true,
             quote_source: Some("CONSOLIDATED".to_string()),
+            json: true,
+        }
+    }
+
+    fn sample_derivatives_search_args() -> BrokerDerivativesSearchArgs {
+        BrokerDerivativesSearchArgs {
+            portfolio_id: Some("portfolio-1".to_string()),
+            underlying: "US0378331005".to_string(),
+            derivative_type: BrokerDerivativeType::Knockout,
+            limit: 25,
+            offset: 50,
+            issuer: vec![BrokerDerivativeIssuer::Hsbc],
+            strategy: BrokerDerivativeStrategy::Long,
+            product_subcategory: vec![BrokerDerivativeKnockoutSubcategory::Turbo],
+            leverage_min: Some("2".to_string()),
+            leverage_max: Some("5".to_string()),
+            knockout_barrier_min: Some("180".to_string()),
+            knockout_barrier_max: Some("200".to_string()),
+            strike_min: Some("175".to_string()),
+            strike_max: Some("195".to_string()),
+            omega_min: None,
+            omega_max: None,
+            delta_min: None,
+            delta_max: None,
+            factor_min: None,
+            factor_max: None,
+            expiry_from: None,
+            expiry_to: None,
+            sort_field: Some(BrokerDerivativeSortField::Leverage),
+            sort_order: Some(BrokerDerivativeSortOrder::Desc),
             json: true,
         }
     }
@@ -1070,6 +1188,281 @@ mod tests {
             Some("US88160R1014")
         );
         search_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_derivatives_search_happy_path_wraps_results_in_resolution_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let search_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerDerivativesSearch".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "input": {
+                        "knockoutInput": {
+                            "underlyingIsin": "US0378331005",
+                            "pagination": {
+                                "offset": 50,
+                                "limit": 25
+                            },
+                            "strategy": "LONG",
+                            "issuers": ["HSBC"],
+                            "productSubcategories": ["TURBO"],
+                            "leverageRange": {
+                                "min": "2",
+                                "max": "5"
+                            },
+                            "knockoutBarrier": {
+                                "min": "180",
+                                "max": "200"
+                            },
+                            "strike": {
+                                "min": "175",
+                                "max": "195"
+                            },
+                            "sortBy": {
+                                "field": "LEVERAGE",
+                                "order": "DESC"
+                            }
+                        },
+                        "warrantInput": Value::Null,
+                        "factorCertificateInput": Value::Null
+                    }
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "derivativesSearch": {
+                                    "pagination": {
+                                        "offset": 50,
+                                        "limit": 25,
+                                        "totalAvailable": 2
+                                    },
+                                    "results": [
+                                        {
+                                            "__typename": "KnockoutSearchResult",
+                                            "id": "derivative-1",
+                                            "isin": "DE000HSBC123",
+                                            "underlyingIsin": "US0378331005",
+                                            "issuer": "HSBC",
+                                            "premiumPercentage": "0.0415",
+                                            "expiryDate": {
+                                                "date": null,
+                                                "isOpenEnd": true
+                                            },
+                                            "leverage": "4.2",
+                                            "knockoutBarrier": {
+                                                "__typename": "Money",
+                                                "currencyIsoCode": "EUR",
+                                                "value": "195.10"
+                                            },
+                                            "distanceToKnockout": "3.5",
+                                            "strike": {
+                                                "__typename": "Money",
+                                                "currencyIsoCode": "EUR",
+                                                "value": "190.00"
+                                            },
+                                            "distanceToStrike": "1.2",
+                                            "productSubcategory": "TURBO",
+                                            "premiumAbsolute": {
+                                                "currencyIsoCode": "EUR",
+                                                "value": "7.40"
+                                            },
+                                            "strategy": "LONG"
+                                        },
+                                        {
+                                            "__typename": "KnockoutSearchResult",
+                                            "id": "derivative-2",
+                                            "isin": "DE000HSBC124",
+                                            "underlyingIsin": "US0378331005",
+                                            "issuer": "HSBC",
+                                            "premiumPercentage": "0.0515",
+                                            "expiryDate": {
+                                                "date": {
+                                                    "date": "2026-12-31",
+                                                    "epochDay": 20818
+                                                },
+                                                "isOpenEnd": false
+                                            },
+                                            "leverage": "3.9",
+                                            "knockoutBarrier": {
+                                                "__typename": "Point",
+                                                "value": "18000"
+                                            },
+                                            "distanceToKnockout": "120",
+                                            "strike": {
+                                                "__typename": "Point",
+                                                "value": "17500"
+                                            },
+                                            "distanceToStrike": "80",
+                                            "productSubcategory": "MINI_FUTURE",
+                                            "premiumAbsolute": {
+                                                "currencyIsoCode": "EUR",
+                                                "value": "8.10"
+                                            },
+                                            "strategy": "SHORT"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_derivatives_search(
+            sample_derivatives_search_args(),
+            &config,
+            &mut session_manager,
+        )
+        .expect("derivatives payload");
+
+        assert_eq!(
+            payload.get("account_id").and_then(Value::as_str),
+            Some("person-1")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/derivative_type")
+                .and_then(Value::as_str),
+            Some("knockout")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/underlying_isin")
+                .and_then(Value::as_str),
+            Some("US0378331005")
+        );
+        assert_eq!(payload.pointer("/result/offset"), Some(&json!(50)));
+        assert_eq!(payload.pointer("/result/limit"), Some(&json!(25)));
+        assert_eq!(payload.pointer("/result/total_available"), Some(&json!(2)));
+        assert_eq!(payload.pointer("/result/count"), Some(&json!(2)));
+        assert_eq!(
+            payload
+                .pointer("/result/items/0/strike/kind")
+                .and_then(Value::as_str),
+            Some("money")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/items/1/knockout_barrier/kind")
+                .and_then(Value::as_str),
+            Some("point")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/items/1/expiry_is_open_end")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        search_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_quote_accepts_derivative_isin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let quote_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerQuote".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "includeYearToDate": false,
+                    "isin": "DE000HSBC123"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "security": {
+                                    "id": "security-derivative-1",
+                                    "isin": "DE000HSBC123",
+                                    "name": "Apple Turbo Long",
+                                    "type": "WARRANT",
+                                    "quoteTick": {
+                                        "id": "tick-1",
+                                        "midPrice": 12.34,
+                                        "bidPrice": 12.30,
+                                        "askPrice": 12.38,
+                                        "currency": "EUR",
+                                        "timestampUtc": {
+                                            "time": "2026-03-11T08:00:00Z"
+                                        },
+                                        "isOutdated": false,
+                                        "performanceDate": {
+                                            "date": "2026-03-11"
+                                        },
+                                        "performancesByTimeframe": []
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_quote(
+            crate::cli::BrokerQuoteArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                isin: "DE000HSBC123".to_string(),
+                include_year_to_date: false,
+                quote_source: None,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("quote payload");
+
+        assert_eq!(
+            payload.pointer("/result/isin").and_then(Value::as_str),
+            Some("DE000HSBC123")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/security_type")
+                .and_then(Value::as_str),
+            Some("WARRANT")
+        );
+        quote_mock.assert();
     }
 
     #[test]

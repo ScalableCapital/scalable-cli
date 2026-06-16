@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::dpop::{DPOP_SESSION_KEY_RELOGIN_MESSAGE, DpopKeyMaterial, DpopRuntimeOptions};
+use crate::session::SessionMode;
 use crate::transport_security::{
     RUNTIME_HTTP_TIMEOUT, build_blocking_client_https_only_with_timeout, validate_https_url,
 };
@@ -41,6 +42,17 @@ struct GraphqlResponse {
     errors: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphqlAccessContext {
+    pub session_mode: Option<SessionMode>,
+}
+
+impl GraphqlAccessContext {
+    pub const fn with_session_mode(session_mode: Option<SessionMode>) -> Self {
+        Self { session_mode }
+    }
+}
+
 struct GraphqlDpopContext {
     key_material: DpopKeyMaterial,
 }
@@ -64,12 +76,15 @@ impl GraphqlDpopContext {
     }
 }
 
+pub(crate) const LOCAL_READ_ONLY_ERROR_PREFIX: &str = "LOCAL_READ_ONLY:";
+
 pub fn execute_graphql<T: Serialize>(
     endpoint: &str,
     token: &str,
     query: &str,
     variables: &T,
     operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<Value> {
     execute_graphql_with_headers(
@@ -78,17 +93,20 @@ pub fn execute_graphql<T: Serialize>(
         query,
         variables,
         operation_name,
+        access_context,
         &[],
         dpop_options,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_graphql_with_headers<T: Serialize>(
     endpoint: &str,
     token: &str,
     query: &str,
     variables: &T,
     operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
     headers: &[(&str, &str)],
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<Value> {
@@ -99,20 +117,24 @@ pub fn execute_graphql_with_headers<T: Serialize>(
         query,
         variables,
         operation_name,
+        access_context,
         headers,
         &dpop,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_graphql_with_headers_with_context<T: Serialize>(
     endpoint: &str,
     token: &str,
     query: &str,
     variables: &T,
     operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
     headers: &[(&str, &str)],
     dpop: &GraphqlDpopContext,
 ) -> Result<Value> {
+    enforce_graphql_access_policy(query, operation_name, access_context)?;
     let validated_endpoint = validate_https_url(endpoint, "graphql_url")
         .with_context(|| format!("Invalid GraphQL endpoint URL: {endpoint}"))?
         .to_string();
@@ -187,6 +209,46 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
     }
 
     unreachable!("GraphQL retry loop should always return");
+}
+
+fn enforce_graphql_access_policy(
+    query: &str,
+    operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
+) -> Result<()> {
+    if access_context.session_mode != Some(SessionMode::LocalReadOnly) {
+        return Ok(());
+    }
+
+    if !is_graphql_mutation(query) {
+        return Ok(());
+    }
+
+    let operation_name = operation_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "{LOCAL_READ_ONLY_ERROR_PREFIX} local read-only mode blocks write operations without an explicit allowlisted operation name"
+        ))?;
+
+    if is_local_read_only_allowed_mutation(operation_name) {
+        return Ok(());
+    }
+
+    bail!(
+        "{LOCAL_READ_ONLY_ERROR_PREFIX} local read-only mode blocks write operation '{operation_name}'. Re-login without --local-read-only to perform write operations."
+    );
+}
+
+fn is_graphql_mutation(query: &str) -> bool {
+    query.trim_start().starts_with("mutation")
+}
+
+fn is_local_read_only_allowed_mutation(operation_name: &str) -> bool {
+    matches!(
+        operation_name,
+        "Start2faOnLogin" | "Validate2faOnLogin" | "revokeAuthAccessToken"
+    )
 }
 
 fn graphql_rate_limited_message(operation_name: Option<&str>, headers: &HeaderMap) -> String {
@@ -299,6 +361,7 @@ pub fn run_whoami_query(
         WHOAMI_QUERY,
         &json!({ "id": person_id }),
         Some("WhoAmI"),
+        GraphqlAccessContext::default(),
         dpop_options,
     )
 }
@@ -324,6 +387,7 @@ query Is2faOnLoginEnabled($input: Is2faOnLoginEnabledInput!) {
         query,
         &json!({ "input": { "userId": user_id } }),
         Some("Is2faOnLoginEnabled"),
+        GraphqlAccessContext::default(),
         dpop_options,
     )?;
 
@@ -361,6 +425,7 @@ mutation Start2faOnLogin($input: Start2faOnLoginInput!) {
         mutation,
         &json!({ "input": { "userId": user_id, "deviceName": "CLI", "deviceType": "CLI" } }),
         Some("Start2faOnLogin"),
+        GraphqlAccessContext::default(),
         dpop_options,
     )?;
 
@@ -394,6 +459,7 @@ mutation Validate2faOnLogin($input: Validate2faOnLoginInput!) {
         mutation,
         &json!({ "input": { "userId": user_id, "mfaSessionId": mfa_session_id } }),
         Some("Validate2faOnLogin"),
+        GraphqlAccessContext::default(),
         dpop_options,
     )?;
 
@@ -456,6 +522,94 @@ mod tests {
     }
 
     #[test]
+    fn local_read_only_allows_queries() {
+        let result = enforce_graphql_access_policy(
+            "query BrokerOverview { ok }",
+            Some("BrokerOverview"),
+            GraphqlAccessContext::with_session_mode(Some(
+                crate::session::SessionMode::LocalReadOnly,
+            )),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn local_read_only_allows_explicit_allowlisted_mutations() {
+        for operation_name in [
+            "Start2faOnLogin",
+            "Validate2faOnLogin",
+            "revokeAuthAccessToken",
+        ] {
+            let result = enforce_graphql_access_policy(
+                "mutation AllowedMutation { ok }",
+                Some(operation_name),
+                GraphqlAccessContext::with_session_mode(Some(
+                    crate::session::SessionMode::LocalReadOnly,
+                )),
+            );
+
+            assert!(result.is_ok(), "{operation_name} should be allowlisted");
+        }
+    }
+
+    #[test]
+    fn local_read_only_blocks_non_allowlisted_mutations() {
+        let err = enforce_graphql_access_policy(
+            "mutation BrokerAddToWatchlist { ok }",
+            Some("BrokerAddToWatchlist"),
+            GraphqlAccessContext::with_session_mode(Some(
+                crate::session::SessionMode::LocalReadOnly,
+            )),
+        )
+        .expect_err("mutation should be blocked");
+
+        assert!(err.to_string().contains(LOCAL_READ_ONLY_ERROR_PREFIX));
+        assert!(err.to_string().contains("BrokerAddToWatchlist"));
+    }
+
+    #[test]
+    fn local_read_only_blocks_mutations_without_operation_name() {
+        let err = enforce_graphql_access_policy(
+            "mutation { ok }",
+            None,
+            GraphqlAccessContext::with_session_mode(Some(
+                crate::session::SessionMode::LocalReadOnly,
+            )),
+        )
+        .expect_err("unnamed mutation should be blocked");
+
+        assert!(err.to_string().contains(LOCAL_READ_ONLY_ERROR_PREFIX));
+        assert!(
+            err.to_string()
+                .contains("explicit allowlisted operation name")
+        );
+    }
+
+    #[test]
+    fn local_read_only_guard_runs_before_endpoint_validation_or_http() {
+        let dpop = GraphqlDpopContext::with_key_material_for_tests(
+            DpopKeyMaterial::from_private_scalar_bytes([3_u8; 32]).expect("fixed dpop key"),
+        );
+        let err = execute_graphql_with_headers_with_context(
+            "not-a-valid-url",
+            "token-1",
+            "mutation BrokerAddToWatchlist { ok }",
+            &json!({}),
+            Some("BrokerAddToWatchlist"),
+            GraphqlAccessContext::with_session_mode(Some(
+                crate::session::SessionMode::LocalReadOnly,
+            )),
+            &[],
+            &dpop,
+        )
+        .expect_err("local read-only should block before endpoint validation");
+
+        assert!(err.to_string().contains(LOCAL_READ_ONLY_ERROR_PREFIX));
+        assert!(!err.to_string().contains("Invalid GraphQL endpoint URL"));
+    }
+
+    #[test]
     fn execute_graphql_with_headers_includes_custom_header() {
         let mut server = Server::new();
         let mock = server
@@ -476,6 +630,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[("x-sc-idempotency-id", "idem-123")],
             &dpop,
         )
@@ -505,6 +660,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[],
             &dpop,
         )
@@ -544,6 +700,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[("x-sc-idempotency-id", "idem-123")],
             &dpop,
         )
@@ -575,6 +732,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[],
             &dpop,
         )
@@ -598,6 +756,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[],
             &test_dpop_options(),
         )
@@ -628,6 +787,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("Q"),
+            GraphqlAccessContext::default(),
             &[],
             &test_dpop_options(),
         )
@@ -660,6 +820,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("BrokerOverview"),
+            GraphqlAccessContext::default(),
             &[],
             &test_dpop_options(),
         )
@@ -697,6 +858,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             None,
+            GraphqlAccessContext::default(),
             &[],
             &test_dpop_options(),
         )
@@ -732,6 +894,7 @@ mod tests {
             "query Q { ok }",
             &json!({}),
             Some("WhoAmI"),
+            GraphqlAccessContext::default(),
             &[],
             &test_dpop_options(),
         )

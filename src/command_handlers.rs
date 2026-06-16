@@ -299,6 +299,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 0),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
             })
             .expect("save active session");
 
@@ -341,6 +342,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 0),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
             })
             .expect("save active session");
 
@@ -395,6 +397,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 9_999_999_999),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
             })
             .expect("save active session");
 
@@ -469,6 +472,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 0),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+                mode: None,
             })
             .expect("save active session");
 
@@ -505,6 +509,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 9_999_999_999),
                 dpop_jwk_thumbprint: None,
+                mode: None,
             })
             .expect("save active session");
 

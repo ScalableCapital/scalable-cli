@@ -1,6 +1,12 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
+
+use crate::cli::{
+    BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField,
+    BrokerDerivativeSortOrder, BrokerDerivativeStrategy, BrokerDerivativeType,
+};
 
 const VALID_BROKER_TRANSACTION_TYPE_FILTERS: &[&str] = &[
     "BUY",
@@ -52,6 +58,49 @@ pub(crate) struct NormalizedBrokerTransactionsQueryInput {
     pub(crate) to_time_seconds: Option<i64>,
     pub(crate) isin: Option<String>,
     pub(crate) include_reinvestment_subtypes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedBrokerDerivativesSearchQueryInput {
+    pub(crate) derivative_type: BrokerDerivativeType,
+    pub(crate) underlying_isin: String,
+    pub(crate) limit: u16,
+    pub(crate) offset: u32,
+    pub(crate) issuers: Option<Vec<String>>,
+    pub(crate) strategy: String,
+    pub(crate) product_subcategories: Option<Vec<String>>,
+    pub(crate) leverage_range: Option<NormalizedDecimalRange>,
+    pub(crate) knockout_barrier_range: Option<NormalizedDecimalRange>,
+    pub(crate) strike_range: Option<NormalizedDecimalRange>,
+    pub(crate) omega_range: Option<NormalizedDecimalRange>,
+    pub(crate) delta_range: Option<NormalizedSignedDecimalRange>,
+    pub(crate) factor_range: Option<NormalizedDecimalRange>,
+    pub(crate) expiry_date_range: Option<NormalizedDateRange>,
+    pub(crate) sort_by: Option<NormalizedDerivativeSort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedDecimalRange {
+    pub(crate) min: Option<String>,
+    pub(crate) max: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedSignedDecimalRange {
+    pub(crate) min: Option<String>,
+    pub(crate) max: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedDateRange {
+    pub(crate) start_date: Option<String>,
+    pub(crate) end_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedDerivativeSort {
+    pub(crate) field: String,
+    pub(crate) order: String,
 }
 
 pub(crate) fn broker_transactions_type_filter_help() -> String {
@@ -694,6 +743,103 @@ query BrokerSecuritySearch(
 }
 "#;
 
+pub const BROKER_DERIVATIVES_SEARCH_QUERY: &str = r#"
+query BrokerDerivativesSearch(
+  $accountId: ID!
+  $portfolioId: ID!
+  $input: DerivativeSearchInput!
+) {
+  account(id: $accountId) {
+    brokerPortfolio(id: $portfolioId) {
+      derivativesSearch(input: $input) {
+        pagination {
+          offset
+          limit
+          totalAvailable
+        }
+        results {
+          __typename
+          id
+          isin
+          underlyingIsin
+          issuer
+          ... on KnockoutSearchResult {
+            premiumPercentage
+            expiryDate {
+              date {
+                date
+                epochDay
+              }
+              isOpenEnd
+            }
+            leverage
+            knockoutBarrier {
+              __typename
+              ... on Money {
+                currencyIsoCode
+                value
+              }
+              ... on Point {
+                value
+              }
+            }
+            distanceToKnockout
+            strike {
+              __typename
+              ... on Money {
+                currencyIsoCode
+                value
+              }
+              ... on Point {
+                value
+              }
+            }
+            distanceToStrike
+            productSubcategory
+            premiumAbsolute {
+              currencyIsoCode
+              value
+            }
+            strategy
+          }
+          ... on WarrantSearchResult {
+            expiryDate {
+              epochDay
+            }
+            strike {
+              __typename
+              ... on Money {
+                currencyIsoCode
+                value
+              }
+              ... on Point {
+                value
+              }
+            }
+            distanceToStrike
+            strategy
+            omega
+            delta
+            impliedVolatility
+          }
+          ... on FactorCertificateSearchResult {
+            expiryDate {
+              date {
+                date
+                epochDay
+              }
+              isOpenEnd
+            }
+            strategy
+            factor
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
 pub const BROKER_QUOTE_QUERY: &str = r#"
 query BrokerQuote(
   $accountId: ID!
@@ -1101,22 +1247,8 @@ fn normalize_positive_decimal(raw: &str) -> Result<String> {
 
 fn normalize_positive_decimal_with_field(raw: &str, field: &str) -> Result<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field '{field}' must be a positive decimal"
-        ));
-    }
-    let dot_count = trimmed.chars().filter(|c| *c == '.').count();
-    let has_only_decimal_chars = trimmed.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if !has_only_decimal_chars || dot_count > 1 {
-        return Err(anyhow!(
-            "Broker input invalid: field '{field}' must be a positive decimal"
-        ));
-    }
-    let parsed = trimmed
-        .parse::<f64>()
-        .map_err(|_| anyhow!("Broker input invalid: field '{field}' must be a positive decimal"))?;
-    if !parsed.is_finite() || parsed <= 0.0 {
+    let (sign, _, _) = parse_decimal_components(trimmed, field, false, "positive decimal")?;
+    if sign <= 0 {
         return Err(anyhow!(
             "Broker input invalid: field '{field}' must be a positive decimal"
         ));
@@ -1126,26 +1258,10 @@ fn normalize_positive_decimal_with_field(raw: &str, field: &str) -> Result<Strin
 
 fn normalize_non_negative_decimal_with_field(raw: &str, field: &str) -> Result<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field '{field}' must be a non-negative decimal"
-        ));
-    }
-    let dot_count = trimmed.chars().filter(|c| *c == '.').count();
-    let has_only_decimal_chars = trimmed.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if !has_only_decimal_chars || dot_count > 1 {
-        return Err(anyhow!(
-            "Broker input invalid: field '{field}' must be a non-negative decimal"
-        ));
-    }
-    let parsed = trimmed.parse::<f64>().map_err(|_| {
-        anyhow!("Broker input invalid: field '{field}' must be a non-negative decimal")
-    })?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err(anyhow!(
-            "Broker input invalid: field '{field}' must be a non-negative decimal"
-        ));
-    }
+    let _ =
+        parse_decimal_components(trimmed, field, false, "non-negative decimal").map_err(|_| {
+            anyhow!("Broker input invalid: field '{field}' must be a non-negative decimal")
+        })?;
     Ok(trimmed.to_string())
 }
 
@@ -1343,6 +1459,299 @@ pub fn broker_search_variables(input: &BrokerInput, search_term: &str) -> Result
     Ok(Value::Object(vars))
 }
 
+pub(crate) fn normalize_broker_derivatives_search_query_input(
+    args: &crate::cli::BrokerDerivativesSearchArgs,
+) -> Result<NormalizedBrokerDerivativesSearchQueryInput> {
+    let underlying_isin = args.underlying.trim();
+    if underlying_isin.is_empty() {
+        return Err(anyhow!(
+            "Broker input invalid: field 'underlying' must be a non-empty string"
+        ));
+    }
+    if args.offset > i32::MAX as u32 {
+        return Err(anyhow!(
+            "Broker input invalid: field 'offset' must be between 0 and {}",
+            i32::MAX
+        ));
+    }
+
+    let strategy = args.strategy;
+    validate_derivative_strategy(args.derivative_type, strategy)?;
+
+    let product_subcategories =
+        normalize_derivative_product_subcategories(&args.product_subcategory);
+    let leverage_range = normalize_positive_decimal_range(
+        args.leverage_min.as_deref(),
+        args.leverage_max.as_deref(),
+        "leverage_min",
+        "leverage_max",
+    )?;
+    let knockout_barrier_range = normalize_positive_decimal_range(
+        args.knockout_barrier_min.as_deref(),
+        args.knockout_barrier_max.as_deref(),
+        "knockout_barrier_min",
+        "knockout_barrier_max",
+    )?;
+    let strike_range = normalize_positive_decimal_range(
+        args.strike_min.as_deref(),
+        args.strike_max.as_deref(),
+        "strike_min",
+        "strike_max",
+    )?;
+    let omega_range = normalize_positive_decimal_range(
+        args.omega_min.as_deref(),
+        args.omega_max.as_deref(),
+        "omega_min",
+        "omega_max",
+    )?;
+    let delta_range = normalize_signed_decimal_range(
+        args.delta_min.as_deref(),
+        args.delta_max.as_deref(),
+        "delta_min",
+        "delta_max",
+    )?;
+    let factor_range = normalize_positive_decimal_range(
+        args.factor_min.as_deref(),
+        args.factor_max.as_deref(),
+        "factor_min",
+        "factor_max",
+    )?;
+    let expiry_date_range = normalize_date_range(
+        args.expiry_from.as_deref(),
+        args.expiry_to.as_deref(),
+        "expiry_from",
+        "expiry_to",
+    )?;
+    let sort_by = normalize_derivative_sort(args.sort_field, args.sort_order)?;
+
+    match args.derivative_type {
+        BrokerDerivativeType::Knockout => {
+            reject_derivative_field_present(
+                args.omega_min.is_some(),
+                "omega_min",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.omega_max.is_some(),
+                "omega_max",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.delta_min.is_some(),
+                "delta_min",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.delta_max.is_some(),
+                "delta_max",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.factor_min.is_some(),
+                "factor_min",
+                BrokerDerivativeType::Factor,
+            )?;
+            reject_derivative_field_present(
+                args.factor_max.is_some(),
+                "factor_max",
+                BrokerDerivativeType::Factor,
+            )?;
+            validate_derivative_sort_field(
+                args.derivative_type,
+                args.sort_field,
+                &[
+                    BrokerDerivativeSortField::Strike,
+                    BrokerDerivativeSortField::Leverage,
+                    BrokerDerivativeSortField::ExpiryDate,
+                    BrokerDerivativeSortField::KnockoutBarrier,
+                    BrokerDerivativeSortField::DistanceToKnockout,
+                    BrokerDerivativeSortField::PremiumAbsolute,
+                    BrokerDerivativeSortField::PremiumRelative,
+                ],
+            )?;
+        }
+        BrokerDerivativeType::Warrant => {
+            reject_derivative_field_present(
+                !args.product_subcategory.is_empty(),
+                "product_subcategory",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.leverage_min.is_some(),
+                "leverage_min",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.leverage_max.is_some(),
+                "leverage_max",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.knockout_barrier_min.is_some(),
+                "knockout_barrier_min",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.knockout_barrier_max.is_some(),
+                "knockout_barrier_max",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.factor_min.is_some(),
+                "factor_min",
+                BrokerDerivativeType::Factor,
+            )?;
+            reject_derivative_field_present(
+                args.factor_max.is_some(),
+                "factor_max",
+                BrokerDerivativeType::Factor,
+            )?;
+            validate_derivative_sort_field(
+                args.derivative_type,
+                args.sort_field,
+                &[
+                    BrokerDerivativeSortField::Strike,
+                    BrokerDerivativeSortField::DistanceToStrike,
+                    BrokerDerivativeSortField::Omega,
+                    BrokerDerivativeSortField::Delta,
+                    BrokerDerivativeSortField::ExpiryDate,
+                    BrokerDerivativeSortField::ImpliedVolatility,
+                ],
+            )?;
+        }
+        BrokerDerivativeType::Factor => {
+            reject_derivative_field_present(
+                !args.product_subcategory.is_empty(),
+                "product_subcategory",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.leverage_min.is_some(),
+                "leverage_min",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.leverage_max.is_some(),
+                "leverage_max",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.knockout_barrier_min.is_some(),
+                "knockout_barrier_min",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.knockout_barrier_max.is_some(),
+                "knockout_barrier_max",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.omega_min.is_some(),
+                "omega_min",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.omega_max.is_some(),
+                "omega_max",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.delta_min.is_some(),
+                "delta_min",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.delta_max.is_some(),
+                "delta_max",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.expiry_from.is_some(),
+                "expiry_from",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.expiry_to.is_some(),
+                "expiry_to",
+                BrokerDerivativeType::Warrant,
+            )?;
+            reject_derivative_field_present(
+                args.strike_min.is_some(),
+                "strike_min",
+                BrokerDerivativeType::Knockout,
+            )?;
+            reject_derivative_field_present(
+                args.strike_max.is_some(),
+                "strike_max",
+                BrokerDerivativeType::Knockout,
+            )?;
+            validate_derivative_sort_field(
+                args.derivative_type,
+                args.sort_field,
+                &[
+                    BrokerDerivativeSortField::Factor,
+                    BrokerDerivativeSortField::ExpiryDate,
+                ],
+            )?;
+        }
+    }
+
+    Ok(NormalizedBrokerDerivativesSearchQueryInput {
+        derivative_type: args.derivative_type,
+        underlying_isin: underlying_isin.to_string(),
+        limit: args.limit,
+        offset: args.offset,
+        issuers: normalize_derivative_issuers(&args.issuer),
+        strategy: strategy.as_graphql().to_string(),
+        product_subcategories,
+        leverage_range,
+        knockout_barrier_range,
+        strike_range,
+        omega_range,
+        delta_range,
+        factor_range,
+        expiry_date_range,
+        sort_by,
+    })
+}
+
+pub fn broker_derivatives_search_variables(
+    input: &BrokerInput,
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+) -> Result<Value> {
+    let mut derivatives_input = serde_json::Map::new();
+    derivatives_input.insert("knockoutInput".to_string(), Value::Null);
+    derivatives_input.insert("warrantInput".to_string(), Value::Null);
+    derivatives_input.insert("factorCertificateInput".to_string(), Value::Null);
+
+    match query.derivative_type {
+        BrokerDerivativeType::Knockout => {
+            derivatives_input.insert(
+                "knockoutInput".to_string(),
+                Value::Object(build_knockout_derivatives_input(query)),
+            );
+        }
+        BrokerDerivativeType::Warrant => {
+            derivatives_input.insert(
+                "warrantInput".to_string(),
+                Value::Object(build_warrant_derivatives_input(query)),
+            );
+        }
+        BrokerDerivativeType::Factor => {
+            derivatives_input.insert(
+                "factorCertificateInput".to_string(),
+                Value::Object(build_factor_derivatives_input(query)),
+            );
+        }
+    }
+
+    Ok(json!({
+        "accountId": input.account_id,
+        "portfolioId": input.portfolio_id,
+        "input": Value::Object(derivatives_input),
+    }))
+}
+
 pub fn broker_quote_variables(input: &BrokerInput, isin: &str) -> Result<Value> {
     let isin = isin.trim();
     if isin.is_empty() {
@@ -1538,6 +1947,508 @@ fn broker_watchlist_mutation_variables(portfolio_id: &str, isin: &str) -> Result
             "isin": isin,
         }
     }))
+}
+
+fn build_knockout_derivatives_input(
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+) -> serde_json::Map<String, Value> {
+    let mut input = derivative_input_base(query);
+    input.insert(
+        "strategy".to_string(),
+        Value::String(query.strategy.clone()),
+    );
+    insert_optional_string_array(&mut input, "issuers", query.issuers.as_ref());
+    insert_optional_string_array(
+        &mut input,
+        "productSubcategories",
+        query.product_subcategories.as_ref(),
+    );
+    insert_optional_range(&mut input, "leverageRange", query.leverage_range.as_ref());
+    insert_optional_range(
+        &mut input,
+        "knockoutBarrier",
+        query.knockout_barrier_range.as_ref(),
+    );
+    insert_optional_range(&mut input, "strike", query.strike_range.as_ref());
+    insert_optional_knockout_expiry_date(&mut input, query.expiry_date_range.as_ref());
+    insert_optional_sort(&mut input, query.sort_by.as_ref());
+    input
+}
+
+fn build_warrant_derivatives_input(
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+) -> serde_json::Map<String, Value> {
+    let mut input = derivative_input_base(query);
+    input.insert(
+        "strategy".to_string(),
+        Value::String(query.strategy.clone()),
+    );
+    insert_optional_string_array(&mut input, "issuers", query.issuers.as_ref());
+    insert_optional_range(&mut input, "strikeRange", query.strike_range.as_ref());
+    insert_optional_range(&mut input, "omegaRange", query.omega_range.as_ref());
+    insert_optional_signed_range(&mut input, "deltaRange", query.delta_range.as_ref());
+    insert_optional_warrant_expiry_date(&mut input, query.expiry_date_range.as_ref());
+    insert_optional_sort(&mut input, query.sort_by.as_ref());
+    input
+}
+
+fn build_factor_derivatives_input(
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+) -> serde_json::Map<String, Value> {
+    let mut input = derivative_input_base(query);
+    input.insert(
+        "strategy".to_string(),
+        Value::String(query.strategy.clone()),
+    );
+    insert_optional_string_array(&mut input, "issuers", query.issuers.as_ref());
+    insert_optional_range(&mut input, "factorRange", query.factor_range.as_ref());
+    insert_optional_sort(&mut input, query.sort_by.as_ref());
+    input
+}
+
+fn derivative_input_base(
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+) -> serde_json::Map<String, Value> {
+    let mut input = serde_json::Map::new();
+    input.insert(
+        "underlyingIsin".to_string(),
+        Value::String(query.underlying_isin.clone()),
+    );
+    input.insert(
+        "pagination".to_string(),
+        json!({
+            "offset": query.offset,
+            "limit": query.limit,
+        }),
+    );
+    input
+}
+
+fn insert_optional_string_array(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    values: Option<&Vec<String>>,
+) {
+    if let Some(values) = values {
+        object.insert(
+            key.to_string(),
+            Value::Array(values.iter().cloned().map(Value::String).collect()),
+        );
+    }
+}
+
+fn insert_optional_range(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    range: Option<&NormalizedDecimalRange>,
+) {
+    if let Some(range) = range {
+        object.insert(
+            key.to_string(),
+            json!({
+                "min": range.min,
+                "max": range.max,
+            }),
+        );
+    }
+}
+
+fn insert_optional_signed_range(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    range: Option<&NormalizedSignedDecimalRange>,
+) {
+    if let Some(range) = range {
+        object.insert(
+            key.to_string(),
+            json!({
+                "min": range.min,
+                "max": range.max,
+            }),
+        );
+    }
+}
+
+fn insert_optional_warrant_expiry_date(
+    object: &mut serde_json::Map<String, Value>,
+    range: Option<&NormalizedDateRange>,
+) {
+    if let Some(range) = range {
+        object.insert(
+            "expiryDate".to_string(),
+            json!({
+                "startDate": range.start_date,
+                "endDate": range.end_date,
+            }),
+        );
+    }
+}
+
+fn insert_optional_knockout_expiry_date(
+    object: &mut serde_json::Map<String, Value>,
+    range: Option<&NormalizedDateRange>,
+) {
+    if let Some(range) = range {
+        object.insert(
+            "expiryDate".to_string(),
+            json!({
+                "startDate": range.start_date,
+                "endDate": range.end_date,
+                "isOpenEnd": false,
+            }),
+        );
+    }
+}
+
+fn insert_optional_sort(
+    object: &mut serde_json::Map<String, Value>,
+    sort: Option<&NormalizedDerivativeSort>,
+) {
+    if let Some(sort) = sort {
+        object.insert(
+            "sortBy".to_string(),
+            json!({
+                "field": sort.field,
+                "order": sort.order,
+            }),
+        );
+    }
+}
+
+fn normalize_derivative_issuers(values: &[BrokerDerivativeIssuer]) -> Option<Vec<String>> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut normalized = values
+        .iter()
+        .map(|value| value.as_graphql().to_string())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    Some(normalized)
+}
+
+fn normalize_derivative_product_subcategories(
+    values: &[BrokerDerivativeKnockoutSubcategory],
+) -> Option<Vec<String>> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut normalized = values
+        .iter()
+        .map(|value| value.as_graphql().to_string())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    Some(normalized)
+}
+
+fn normalize_positive_decimal_range(
+    min: Option<&str>,
+    max: Option<&str>,
+    min_field: &str,
+    max_field: &str,
+) -> Result<Option<NormalizedDecimalRange>> {
+    let min = min
+        .map(|value| normalize_positive_decimal_with_field(value, min_field))
+        .transpose()?;
+    let max = max
+        .map(|value| normalize_positive_decimal_with_field(value, max_field))
+        .transpose()?;
+
+    validate_decimal_range_order(min.as_deref(), max.as_deref(), min_field, max_field)?;
+
+    if min.is_none() && max.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(NormalizedDecimalRange { min, max }))
+    }
+}
+
+fn normalize_signed_decimal_range(
+    min: Option<&str>,
+    max: Option<&str>,
+    min_field: &str,
+    max_field: &str,
+) -> Result<Option<NormalizedSignedDecimalRange>> {
+    let min = min
+        .map(|value| normalize_decimal_with_field(value, min_field))
+        .transpose()?;
+    let max = max
+        .map(|value| normalize_decimal_with_field(value, max_field))
+        .transpose()?;
+
+    validate_decimal_range_order(min.as_deref(), max.as_deref(), min_field, max_field)?;
+
+    if min.is_none() && max.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(NormalizedSignedDecimalRange { min, max }))
+    }
+}
+
+fn normalize_date_range(
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    start_field: &str,
+    end_field: &str,
+) -> Result<Option<NormalizedDateRange>> {
+    let start_date = start_date
+        .map(|value| normalize_local_date(value, start_field))
+        .transpose()?;
+    let end_date = end_date
+        .map(|value| normalize_local_date(value, end_field))
+        .transpose()?;
+
+    if let (Some(start_date), Some(end_date)) = (start_date.as_deref(), end_date.as_deref()) {
+        let start = NaiveDate::parse_from_str(start_date, "%Y-%m-%d").map_err(|_| {
+            anyhow!("Broker input invalid: field '{start_field}' must use YYYY-MM-DD format")
+        })?;
+        let end = NaiveDate::parse_from_str(end_date, "%Y-%m-%d").map_err(|_| {
+            anyhow!("Broker input invalid: field '{end_field}' must use YYYY-MM-DD format")
+        })?;
+        if start > end {
+            return Err(anyhow!(
+                "Broker input invalid: fields '{start_field}' and '{end_field}' must define a valid range"
+            ));
+        }
+    }
+
+    if start_date.is_none() && end_date.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(NormalizedDateRange {
+            start_date,
+            end_date,
+        }))
+    }
+}
+
+fn normalize_derivative_sort(
+    field: Option<BrokerDerivativeSortField>,
+    order: Option<BrokerDerivativeSortOrder>,
+) -> Result<Option<NormalizedDerivativeSort>> {
+    match (field, order) {
+        (None, None) => Ok(None),
+        (Some(field), Some(order)) => Ok(Some(NormalizedDerivativeSort {
+            field: field.as_graphql().to_string(),
+            order: order.as_graphql().to_string(),
+        })),
+        (Some(_), None) => Err(anyhow!(
+            "Broker input invalid: field 'sort_order' is required when 'sort_field' is set"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "Broker input invalid: field 'sort_field' is required when 'sort_order' is set"
+        )),
+    }
+}
+
+fn validate_derivative_strategy(
+    derivative_type: BrokerDerivativeType,
+    strategy: BrokerDerivativeStrategy,
+) -> Result<()> {
+    let valid = match derivative_type {
+        BrokerDerivativeType::Knockout | BrokerDerivativeType::Factor => {
+            matches!(
+                strategy,
+                BrokerDerivativeStrategy::Long | BrokerDerivativeStrategy::Short
+            )
+        }
+        BrokerDerivativeType::Warrant => {
+            matches!(
+                strategy,
+                BrokerDerivativeStrategy::Call | BrokerDerivativeStrategy::Put
+            )
+        }
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Broker input invalid: strategy '{:?}' is not supported for derivative type '{}'",
+            strategy,
+            derivative_type.as_label()
+        ))
+    }
+}
+
+fn validate_derivative_sort_field(
+    derivative_type: BrokerDerivativeType,
+    field: Option<BrokerDerivativeSortField>,
+    allowed: &[BrokerDerivativeSortField],
+) -> Result<()> {
+    let Some(field) = field else {
+        return Ok(());
+    };
+
+    if allowed.contains(&field) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Broker input invalid: sort field '{}' is not supported for derivative type '{}'",
+            field.as_graphql(),
+            derivative_type.as_label()
+        ))
+    }
+}
+
+fn reject_derivative_field_present(
+    is_present: bool,
+    field: &str,
+    _supported_type: BrokerDerivativeType,
+) -> Result<()> {
+    if is_present {
+        Err(anyhow!(
+            "Broker input invalid: field '{field}' is not supported for the selected derivative type"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_decimal_with_field(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let _ = parse_decimal_components(trimmed, field, true, "decimal")?;
+    Ok(trimmed.to_string())
+}
+
+fn validate_decimal_range_order(
+    min: Option<&str>,
+    max: Option<&str>,
+    min_field: &str,
+    max_field: &str,
+) -> Result<()> {
+    let (Some(min), Some(max)) = (min, max) else {
+        return Ok(());
+    };
+    let min_value = parse_decimal_components(min, min_field, true, "decimal")?;
+    let max_value = parse_decimal_components(max, max_field, true, "decimal")?;
+    if compare_decimal_components(&min_value, &max_value) == Ordering::Greater {
+        return Err(anyhow!(
+            "Broker input invalid: fields '{min_field}' and '{max_field}' must define a valid range"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_local_date(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Broker input invalid: field '{field}' must use YYYY-MM-DD format"
+        ));
+    }
+    NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+        .map_err(|_| anyhow!("Broker input invalid: field '{field}' must use YYYY-MM-DD format"))?;
+    Ok(trimmed.to_string())
+}
+
+fn parse_decimal_components(
+    raw: &str,
+    field: &str,
+    allow_negative: bool,
+    kind: &str,
+) -> Result<(i8, String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Broker input invalid: field '{field}' must be a {kind}"
+        ));
+    }
+
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) if allow_negative => (true, rest),
+        Some(_) => {
+            return Err(anyhow!(
+                "Broker input invalid: field '{field}' must be a {kind}"
+            ));
+        }
+        None => match trimmed.strip_prefix('+') {
+            Some(rest) => (false, rest),
+            None => (false, trimmed),
+        },
+    };
+
+    let mut parts = unsigned.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !fraction.chars().all(|c| c.is_ascii_digit())
+        || (whole.is_empty() && fraction.is_empty())
+    {
+        return Err(anyhow!(
+            "Broker input invalid: field '{field}' must be a {kind}"
+        ));
+    }
+
+    let normalized_whole = {
+        let stripped = whole.trim_start_matches('0');
+        if stripped.is_empty() {
+            "0".to_string()
+        } else {
+            stripped.to_string()
+        }
+    };
+    let normalized_fraction = fraction.trim_end_matches('0').to_string();
+    let sign = if normalized_whole == "0" && normalized_fraction.is_empty() {
+        0
+    } else if negative {
+        -1
+    } else {
+        1
+    };
+
+    Ok((sign, normalized_whole, normalized_fraction))
+}
+
+fn compare_decimal_components(
+    left: &(i8, String, String),
+    right: &(i8, String, String),
+) -> Ordering {
+    if left.0 != right.0 {
+        return left.0.cmp(&right.0);
+    }
+    if left.0 == 0 {
+        return Ordering::Equal;
+    }
+
+    let abs = compare_decimal_abs(&left.1, &left.2, &right.1, &right.2);
+    if left.0 > 0 { abs } else { abs.reverse() }
+}
+
+fn compare_decimal_abs(
+    left_whole: &str,
+    left_fraction: &str,
+    right_whole: &str,
+    right_fraction: &str,
+) -> Ordering {
+    match left_whole.len().cmp(&right_whole.len()) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+    match left_whole.cmp(right_whole) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+
+    let max_fraction_len = left_fraction.len().max(right_fraction.len());
+    for index in 0..max_fraction_len {
+        let left_digit = left_fraction.as_bytes().get(index).copied().unwrap_or(b'0');
+        let right_digit = right_fraction
+            .as_bytes()
+            .get(index)
+            .copied()
+            .unwrap_or(b'0');
+        match left_digit.cmp(&right_digit) {
+            Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
 }
 
 fn normalize_optional_non_empty_string(raw: Option<&str>) -> Option<String> {

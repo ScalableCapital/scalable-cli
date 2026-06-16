@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::broker_queries::{BrokerInput, timestamp_value_or_null};
+use crate::broker_queries::{
+    BrokerInput, NormalizedBrokerDerivativesSearchQueryInput, timestamp_value_or_null,
+};
 
 pub fn project_broker_overview_response(input: &BrokerInput, response: &Value) -> Result<Value> {
     let valuation = response
@@ -353,6 +355,44 @@ pub fn project_broker_search_response(
     }))
 }
 
+pub fn project_broker_derivatives_search_response(
+    input: &BrokerInput,
+    query: &NormalizedBrokerDerivativesSearchQueryInput,
+    response: &Value,
+) -> Result<Value> {
+    let derivatives_search = response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("derivativesSearch"))
+        .ok_or_else(|| {
+            anyhow!("Broker response invalid: missing account.brokerPortfolio.derivativesSearch")
+        })?;
+    let pagination = derivatives_search
+        .get("pagination")
+        .ok_or_else(|| anyhow!("Broker response invalid: missing derivatives search pagination"))?;
+    let items = derivatives_search
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Broker response invalid: missing derivatives search results"))?;
+
+    let projected = items
+        .iter()
+        .map(map_derivative_search_result)
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "account_id": input.account_id_value(),
+        "portfolio_id": input.portfolio_id_value(),
+        "derivative_type": query.derivative_type.as_label(),
+        "underlying_isin": query.underlying_isin,
+        "offset": pagination.get("offset").cloned().unwrap_or_else(|| json!(query.offset)),
+        "limit": pagination.get("limit").cloned().unwrap_or_else(|| json!(query.limit)),
+        "total_available": pagination.get("totalAvailable").cloned().unwrap_or(Value::Null),
+        "count": projected.len(),
+        "items": projected,
+    }))
+}
+
 pub fn project_broker_quote_response(
     input: &BrokerInput,
     requested_isin: &str,
@@ -542,6 +582,89 @@ pub fn project_broker_price_alerts_response(
         "count": items.len(),
         "items": items,
     }))
+}
+
+fn map_derivative_search_result(item: &Value) -> Value {
+    let expiry = map_derivative_expiry(item.get("expiryDate"));
+    json!({
+        "isin": item.get("isin").cloned().unwrap_or(Value::Null),
+        "underlying_isin": item.get("underlyingIsin").cloned().unwrap_or(Value::Null),
+        "issuer": item.get("issuer").cloned().unwrap_or(Value::Null),
+        "strategy": item.get("strategy").cloned().unwrap_or(Value::Null),
+        "product_subcategory": item.get("productSubcategory").cloned().unwrap_or(Value::Null),
+        "leverage": item.get("leverage").cloned().unwrap_or(Value::Null),
+        "factor": item.get("factor").cloned().unwrap_or(Value::Null),
+        "omega": item.get("omega").cloned().unwrap_or(Value::Null),
+        "delta": item.get("delta").cloned().unwrap_or(Value::Null),
+        "implied_volatility": item.get("impliedVolatility").cloned().unwrap_or(Value::Null),
+        "distance_to_knockout": item.get("distanceToKnockout").cloned().unwrap_or(Value::Null),
+        "distance_to_strike": item.get("distanceToStrike").cloned().unwrap_or(Value::Null),
+        "strike": map_derivative_price(item.get("strike")),
+        "knockout_barrier": map_derivative_price(item.get("knockoutBarrier")),
+        "premium_absolute": map_money_value(item.get("premiumAbsolute")),
+        "premium_percentage": item.get("premiumPercentage").cloned().unwrap_or(Value::Null),
+        "expiry_date": expiry.get("date").cloned().unwrap_or(Value::Null),
+        "expiry_is_open_end": expiry.get("is_open_end").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn map_derivative_price(raw: Option<&Value>) -> Value {
+    let Some(raw) = raw else {
+        return Value::Null;
+    };
+
+    let kind = match raw.get("__typename").and_then(Value::as_str) {
+        Some("Money") => "money",
+        Some("Point") => "point",
+        _ if raw.get("currencyIsoCode").is_some() => "money",
+        _ => "point",
+    };
+
+    json!({
+        "kind": kind,
+        "currency_iso_code": raw.get("currencyIsoCode").cloned().unwrap_or(Value::Null),
+        "value": raw.get("value").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn map_money_value(raw: Option<&Value>) -> Value {
+    match raw {
+        Some(raw) => json!({
+            "currency_iso_code": raw.get("currencyIsoCode").cloned().unwrap_or(Value::Null),
+            "value": raw.get("value").cloned().unwrap_or(Value::Null),
+        }),
+        None => Value::Null,
+    }
+}
+
+fn map_derivative_expiry(raw: Option<&Value>) -> Value {
+    let Some(raw) = raw else {
+        return json!({
+            "date": Value::Null,
+            "is_open_end": Value::Null,
+        });
+    };
+
+    let date = match raw.get("date") {
+        Some(Value::Object(date)) => json!({
+            "date": date.get("date").cloned().unwrap_or(Value::Null),
+            "epoch_day": date.get("epochDay").cloned().unwrap_or(Value::Null),
+        }),
+        Some(Value::String(_)) | Some(Value::Number(_)) => json!({
+            "date": raw.get("date").cloned().unwrap_or(Value::Null),
+            "epoch_day": raw.get("epochDay").cloned().unwrap_or(Value::Null),
+        }),
+        _ if raw.get("epochDay").is_some() => json!({
+            "date": Value::Null,
+            "epoch_day": raw.get("epochDay").cloned().unwrap_or(Value::Null),
+        }),
+        _ => Value::Null,
+    };
+
+    json!({
+        "date": date,
+        "is_open_end": raw.get("isOpenEnd").cloned().unwrap_or(Value::Null),
+    })
 }
 
 pub fn project_broker_crypto_price_alerts_response(

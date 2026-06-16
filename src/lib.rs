@@ -42,16 +42,16 @@ use crate::broker_commands::{
 };
 use crate::broker_context::delete_context as delete_broker_context;
 use crate::cli::{
-    BrokerCommand, BrokerContextCommand, BrokerPriceAlertsCommand, BrokerSavingsPlansCommand,
-    BrokerTradeCommand, BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands,
-    InstallationCodeArgs,
+    BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand, BrokerPriceAlertsCommand,
+    BrokerSavingsPlansCommand, BrokerTradeCommand, BrokerTransactionCommand,
+    BrokerWatchlistCommand, Cli, Commands, InstallationCodeArgs,
 };
 use crate::command_handlers::{run_human_whoami_command, run_machine_whoami_command};
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
 use crate::installation_code::load_or_create_installation_code;
 use crate::machine::{print_error, print_success};
-use crate::session::{Session, SessionManager, StoredSession};
+use crate::session::{Session, SessionManager, SessionMode, StoredSession};
 use crate::trade::TradeSide;
 use crate::trade_attempt::delete_attempt_store;
 use crate::trade_confirmation::delete_confirmation_store;
@@ -128,6 +128,9 @@ fn raw_broker_command_requests_json(command: &BrokerCommand) -> bool {
             Some(BrokerPriceAlertsCommand::Add(add_args)) => args.json || add_args.json,
             Some(BrokerPriceAlertsCommand::Remove(remove_args)) => args.json || remove_args.json,
             None => args.json,
+        },
+        BrokerCommand::Derivatives(args) => match &args.command {
+            BrokerDerivativesCommand::Search(search_args) => search_args.json,
         },
         BrokerCommand::SavingsPlans(args) => match &args.command {
             Some(BrokerSavingsPlansCommand::Add(add_args)) => args.json || add_args.json,
@@ -366,6 +369,9 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             None => args.json,
         },
         BrokerCommand::Search(args) => args.json,
+        BrokerCommand::Derivatives(args) => match &args.command {
+            BrokerDerivativesCommand::Search(search_args) => search_args.json,
+        },
         BrokerCommand::Quote(args) => args.json,
         BrokerCommand::SecurityNews(args) => args.json,
         BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -402,13 +408,20 @@ fn run_human_command(
             unreachable!("installation-code is handled before config and session initialization")
         }
         Commands::Login(args) => {
-            let _ = args;
             let env = crate::channel::current_env();
             let env_cfg = crate::channel::current_env_config();
             let dpop_options = crate::channel::current_dpop_runtime_options(config);
+            let session_mode = args.local_read_only.then_some(SessionMode::LocalReadOnly);
             validate_env_transport_security(&env_cfg)?;
-            login_with_device_code(session_manager, env, &env_cfg, &dpop_options)?;
-            finalize_login_human(session_manager, env, &env_cfg, &dpop_options, "device code")?;
+            login_with_device_code(session_manager, env, &env_cfg, session_mode, &dpop_options)?;
+            finalize_login_human(
+                session_manager,
+                env,
+                &env_cfg,
+                &dpop_options,
+                "device code",
+                session_mode,
+            )?;
         }
         Commands::Logout(_) => {
             cleanup_local_artifacts_on_logout_best_effort();
@@ -416,7 +429,12 @@ fn run_human_command(
                 if stored.env == crate::channel::current_env() {
                     let env_cfg = crate::channel::current_env_config();
                     let dpop_options = crate::channel::current_dpop_runtime_options(config);
-                    revoke_tokens_on_logout_best_effort(&env_cfg, &stored.session, &dpop_options);
+                    revoke_tokens_on_logout_best_effort(
+                        &env_cfg,
+                        &stored.session,
+                        stored.mode,
+                        &dpop_options,
+                    );
                 }
                 session_manager.delete_active()?;
                 println!("Logged out.");
@@ -471,7 +489,12 @@ fn run_machine_command(
                 if stored.env == crate::channel::current_env() {
                     let env_cfg = crate::channel::current_env_config();
                     let dpop_options = crate::channel::current_dpop_runtime_options(config);
-                    revoke_tokens_on_logout_best_effort(&env_cfg, &stored.session, &dpop_options);
+                    revoke_tokens_on_logout_best_effort(
+                        &env_cfg,
+                        &stored.session,
+                        stored.mode,
+                        &dpop_options,
+                    );
                 }
                 session_manager.delete_active()?;
                 return Ok(json!({"logged_out": true}));
@@ -500,8 +523,12 @@ fn finalize_login_human(
     env_cfg: &EnvConfig,
     dpop_options: &DpopRuntimeOptions,
     mode_label: &str,
+    session_mode: Option<SessionMode>,
 ) -> Result<()> {
     println!("Logged in via {mode_label}.");
+    if session_mode == Some(SessionMode::LocalReadOnly) {
+        println!("Local read-only mode is active for this session.");
+    }
     cleanup_broker_context_best_effort();
     match bootstrap_broker_context_after_login(session_manager, env, env_cfg, dpop_options) {
         Ok(context) => {
@@ -542,6 +569,7 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
             "broker.watchlist.add",
             "broker.watchlist.remove",
             "broker.search",
+            "broker.derivatives.search",
             "broker.quote",
             "broker.security-news",
             "broker.price-alerts",
@@ -642,6 +670,9 @@ fn machine_command_name(command: &Commands) -> &'static str {
                 None => "broker.watchlist",
             },
             BrokerCommand::Search(_) => "broker.search",
+            BrokerCommand::Derivatives(args) => match &args.command {
+                BrokerDerivativesCommand::Search(_) => "broker.derivatives.search",
+            },
             BrokerCommand::Quote(_) => "broker.quote",
             BrokerCommand::SecurityNews(_) => "broker.security-news",
             BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -706,8 +737,14 @@ pub(crate) fn refresh_loaded_session_if_needed(
         refresh_session_if_needed_with_dpop(env_cfg, &stored_session.session, &dpop)
             .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?
     {
-        save_active_session(session_manager, env, &refreshed, dpop.jwk_thumbprint())
-            .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?;
+        save_active_session(
+            session_manager,
+            env,
+            &refreshed,
+            stored_session.mode,
+            dpop.jwk_thumbprint(),
+        )
+        .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?;
         return Ok(refreshed);
     }
 
@@ -737,9 +774,15 @@ where
                 .map_err(|err| {
                     clear_active_session_on_refresh_relogin_failure(session_manager, err)
                 })?;
-            save_active_session(session_manager, env, &refreshed, dpop.jwk_thumbprint()).map_err(
-                |err| clear_active_session_on_refresh_relogin_failure(session_manager, err),
-            )?;
+            let session_mode = session_manager.load_required_active()?.mode;
+            save_active_session(
+                session_manager,
+                env,
+                &refreshed,
+                session_mode,
+                dpop.jwk_thumbprint(),
+            )
+            .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?;
             *session = refreshed;
 
             action(&session.access_token)
@@ -771,6 +814,7 @@ fn save_active_session(
     session_manager: &mut SessionManager,
     env: TargetEnv,
     session: &Session,
+    session_mode: Option<SessionMode>,
     dpop_jwk_thumbprint: &str,
 ) -> Result<()> {
     session_manager
@@ -778,6 +822,7 @@ fn save_active_session(
             env,
             session: session.clone(),
             dpop_jwk_thumbprint: Some(dpop_jwk_thumbprint.to_string()),
+            mode: session_mode,
         })
         .map_err(|_err| {
             anyhow::anyhow!(
@@ -895,7 +940,7 @@ mod tests {
         AppConfig, AuthConfig, DpopKeyBackend, EnvConfig, RuntimeAuthConfig,
         SessionBackendPreference,
     };
-    use crate::session::{FileStore, LoginSource, StorageBackend, StoredSession};
+    use crate::session::{FileStore, LoginSource, SessionMode, StorageBackend, StoredSession};
     use mockito::Server;
     use tempfile::tempdir;
 
@@ -1015,6 +1060,37 @@ mod tests {
     }
 
     #[test]
+    fn save_active_session_preserves_session_mode() {
+        let tmp = tempdir().expect("tempdir");
+        let store =
+            StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
+        let mut session_manager = SessionManager::with_store(store);
+        let session = Session {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            id_token: None,
+            expires_at: Some(9_999_999_999),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        };
+
+        save_active_session(
+            &mut session_manager,
+            crate::channel::current_env(),
+            &session,
+            Some(SessionMode::LocalReadOnly),
+            "thumbprint-1",
+        )
+        .expect("save refreshed session");
+
+        let stored = session_manager
+            .load_active()
+            .expect("load active")
+            .expect("stored session");
+        assert_eq!(stored.mode, Some(SessionMode::LocalReadOnly));
+    }
+
+    #[test]
     fn machine_logout_deletes_local_session_when_dpop_key_is_missing() {
         let _lock = crate::lock_test_env();
         let tmp = tempdir().expect("tempdir");
@@ -1051,6 +1127,7 @@ mod tests {
                     source: LoginSource::DeviceCode,
                 },
                 dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
+                mode: None,
             })
             .expect("save session");
 

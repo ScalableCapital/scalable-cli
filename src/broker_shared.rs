@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::broker_context::load_context as load_broker_context;
 use crate::config::{EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
-use crate::graphql::execute_graphql;
+use crate::graphql::{GraphqlAccessContext, execute_graphql};
 use crate::helpers::BrokerInput;
 use crate::session::{Session, SessionManager};
 use crate::transport_security::validate_env_transport_security;
@@ -27,6 +27,11 @@ pub(crate) struct ResolvedBrokerIds {
     pub(crate) portfolio_id: String,
     pub(crate) account_source: &'static str,
     pub(crate) portfolio_source: &'static str,
+}
+
+pub(crate) struct LoadedActiveSession {
+    pub(crate) session: Session,
+    pub(crate) access_context: GraphqlAccessContext,
 }
 
 pub(crate) fn fingerprint_payload_for_transactions_input(normalized_input: &Value) -> Value {
@@ -72,7 +77,7 @@ pub(crate) fn load_active_session(
     env: TargetEnv,
     env_cfg: &EnvConfig,
     dpop_options: &DpopRuntimeOptions,
-) -> Result<Session> {
+) -> Result<LoadedActiveSession> {
     validate_env_transport_security(env_cfg)?;
     let stored = session_manager.load_required_active()?;
     if stored.env != env {
@@ -81,7 +86,13 @@ pub(crate) fn load_active_session(
             stored.env
         );
     }
-    refresh_loaded_session_if_needed(session_manager, env, env_cfg, stored, dpop_options)
+    let access_context = GraphqlAccessContext::with_session_mode(stored.mode);
+    let session =
+        refresh_loaded_session_if_needed(session_manager, env, env_cfg, stored, dpop_options)?;
+    Ok(LoadedActiveSession {
+        session,
+        access_context,
+    })
 }
 
 pub(crate) fn validated_broker_input(
@@ -153,6 +164,7 @@ pub(crate) fn resolve_broker_ids(
                 RESOLVE_BROKER_IDS_QUERY,
                 &json!({ "id": account_id }),
                 Some("ResolveBrokerIds"),
+                GraphqlAccessContext::default(),
                 dpop_options,
             )
         },

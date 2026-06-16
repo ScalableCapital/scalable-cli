@@ -5,6 +5,7 @@ use std::borrow::Cow;
 
 use crate::auth::REFRESH_RELOGIN_REQUIRED_PREFIX;
 use crate::dpop::DPOP_SESSION_KEY_RELOGIN_MESSAGE;
+use crate::graphql::LOCAL_READ_ONLY_ERROR_PREFIX;
 
 #[derive(Debug, Serialize)]
 struct MachineEnvelope {
@@ -84,14 +85,23 @@ fn concise_error_message(message: &str) -> String {
 }
 
 fn sanitize_error_message(message: &str) -> Cow<'_, str> {
-    if !message.contains(REFRESH_RELOGIN_REQUIRED_PREFIX) {
+    if !message.contains(REFRESH_RELOGIN_REQUIRED_PREFIX)
+        && !message.contains(LOCAL_READ_ONLY_ERROR_PREFIX)
+    {
         return Cow::Borrowed(message);
     }
 
-    let mut parts = message.split(REFRESH_RELOGIN_REQUIRED_PREFIX);
-    let mut sanitized = parts.next().unwrap_or_default().to_string();
-    for part in parts {
-        sanitized.push_str(part.trim_start());
+    let mut sanitized = message.to_string();
+    for prefix in [
+        REFRESH_RELOGIN_REQUIRED_PREFIX,
+        LOCAL_READ_ONLY_ERROR_PREFIX,
+    ] {
+        let mut parts = sanitized.split(prefix);
+        let mut rebuilt = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            rebuilt.push_str(part.trim_start());
+        }
+        sanitized = rebuilt;
     }
     Cow::Owned(sanitized)
 }
@@ -234,6 +244,17 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             exit_code: 10,
             hints: vec![
                 "Use exactly the phase-1 trade inputs (isin/amount-or-shares/venue/order-type/limit-price/stop-price), or rerun phase 1 if market data changed."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if text.contains(LOCAL_READ_ONLY_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "local_read_only",
+            exit_code: 10,
+            hints: vec![
+                "Run `sc login` without `--local-read-only` to perform write operations."
                     .to_string(),
             ],
         };
@@ -494,6 +515,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_local_read_only_error() {
+        let err = anyhow!(
+            "{LOCAL_READ_ONLY_ERROR_PREFIX} local read-only mode blocks write operation 'BrokerAddToWatchlist'. Re-login without --local-read-only to perform write operations."
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "local_read_only");
+        assert_eq!(c.exit_code, 10);
+        assert_eq!(
+            c.hints,
+            vec!["Run `sc login` without `--local-read-only` to perform write operations."]
+        );
+    }
+
+    #[test]
     fn classify_dpop_session_key_relogin_error() {
         let err = anyhow!(crate::dpop::DPOP_SESSION_KEY_RELOGIN_MESSAGE);
         let c = classify_error(&err);
@@ -662,6 +697,17 @@ mod tests {
         assert_eq!(
             concise_error_message(&text),
             "Token refresh requires a new login."
+        );
+    }
+
+    #[test]
+    fn concise_error_message_strips_local_read_only_prefix() {
+        let text = format!(
+            "{LOCAL_READ_ONLY_ERROR_PREFIX} local read-only mode blocks write operation 'BrokerAddToWatchlist'."
+        );
+        assert_eq!(
+            concise_error_message(&text),
+            "local read-only mode blocks write operation 'BrokerAddToWatchlist'."
         );
     }
 

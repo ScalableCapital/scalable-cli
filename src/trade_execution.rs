@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::broker_shared::{checksum_for_payload, load_active_session, resolve_broker_ids};
 use crate::config::{AppConfig, TargetEnv};
-use crate::graphql::{execute_graphql, execute_graphql_with_headers};
+use crate::graphql::{LOCAL_READ_ONLY_ERROR_PREFIX, execute_graphql, execute_graphql_with_headers};
 use crate::session::SessionManager;
 use crate::trade::{
     PlaceOrderFields, SecurityTick, SingleExAnteFields, TRADE_APPROPRIATENESS_RESULT_QUERY,
@@ -197,7 +197,9 @@ pub(crate) fn execute_broker_trade_cancel(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -220,6 +222,7 @@ pub(crate) fn execute_broker_trade_cancel(
                 TRADE_CANCEL_ORDER_MUTATION,
                 &variables,
                 Some("BrokerCancelOrder"),
+                access_context,
                 dpop_options,
             )
         },
@@ -838,7 +841,9 @@ fn prepare_trade(
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
     let ids = resolve_broker_ids(
         session_manager,
         env,
@@ -863,6 +868,7 @@ fn prepare_trade(
                 TRADE_TRADABILITY_QUERY,
                 &tradability_variables,
                 Some("getTradingTradability"),
+                access_context,
                 dpop_options,
             )
         },
@@ -913,6 +919,7 @@ fn prepare_trade(
                     TRADE_APPROPRIATENESS_RESULT_QUERY,
                     &appropriateness_variables,
                     Some("getAppropriatenessResult"),
+                    access_context,
                     dpop_options,
                 )
             },
@@ -953,6 +960,7 @@ fn prepare_trade(
                         TRADE_APPROPRIATENESS_WARNING_QUERY,
                         &warning_variables,
                         Some("getBrokerAppropriatenessWarning"),
+                        access_context,
                         dpop_options,
                     )
                 },
@@ -983,6 +991,7 @@ fn prepare_trade(
                 TRADE_SECURITY_TICK_QUERY,
                 &quote_variables,
                 Some("getSecurityTick"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1020,6 +1029,7 @@ fn prepare_trade(
                 TRADE_SINGLE_EX_ANTE_COSTS_QUERY,
                 &ex_ante_variables,
                 Some("getSingleTradeExAnteCost"),
+                access_context,
                 dpop_options,
             )
         },
@@ -1235,7 +1245,9 @@ fn submit_order(
     let dpop_options = &dpop_options;
     crate::channel::require_current_channel(prepared.env)?;
     let env_cfg = crate::channel::current_env_config();
-    let mut session = load_active_session(session_manager, prepared.env, &env_cfg, dpop_options)?;
+    let loaded = load_active_session(session_manager, prepared.env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
 
     let intent_hash = trade_intent_hash(TradeIntentHashInput {
         env: prepared.env,
@@ -1303,6 +1315,7 @@ fn submit_order(
                 TRADE_PLACE_ORDER_MUTATION,
                 &place_order_variables,
                 Some("placeOrder"),
+                access_context,
                 &[("X-SC-Idempotency-Id", attempt.idempotency_key.as_str())],
                 dpop_options,
             )
@@ -1328,18 +1341,33 @@ fn submit_order(
             }))
         }
         Err(err) => {
+            let error_message = err.to_string();
             let _ = mark_trade_attempt_failed(
                 prepared.env,
                 &attempt.idempotency_key,
-                &err.to_string(),
+                &error_message,
                 current_epoch_seconds(),
             );
-            Err(anyhow!(
-                "ORDER_SUBMISSION_FAILED: {err}. Retry command to reuse idempotency key {}.",
-                attempt.idempotency_key
-            ))
+            if should_passthrough_order_submission_error(&error_message) {
+                return Err(err);
+            }
+            Err(anyhow!(format_order_submission_failed_message(
+                &error_message,
+                &attempt.idempotency_key
+            )))
         }
     }
+}
+
+fn should_passthrough_order_submission_error(error_message: &str) -> bool {
+    error_message.contains(LOCAL_READ_ONLY_ERROR_PREFIX)
+}
+
+fn format_order_submission_failed_message(error_message: &str, idempotency_key: &str) -> String {
+    let error_message = error_message.trim_end_matches(['.', '!', '?']);
+    format!(
+        "ORDER_SUBMISSION_FAILED: {error_message}. Retry command to reuse idempotency key {idempotency_key}."
+    )
 }
 
 fn required_flag_value<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str> {
@@ -1770,7 +1798,8 @@ fn current_epoch_seconds() -> i64 {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -1835,6 +1864,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn order_submission_failed_message_avoids_double_periods() {
+        assert_eq!(
+            format_order_submission_failed_message(
+                "local read-only mode blocks write operation 'placeOrder'. Re-login without --local-read-only to perform write operations.",
+                "4251d813-d33b-49c9-9a9c-f93fca0b501b",
+            ),
+            "ORDER_SUBMISSION_FAILED: local read-only mode blocks write operation 'placeOrder'. Re-login without --local-read-only to perform write operations. Retry command to reuse idempotency key 4251d813-d33b-49c9-9a9c-f93fca0b501b."
+        );
+    }
+
+    #[test]
+    fn local_read_only_order_submission_errors_are_not_wrapped() {
+        assert!(should_passthrough_order_submission_error(
+            "ORDER_SUBMISSION_FAILED: ignored prefix LOCAL_READ_ONLY: local read-only mode blocks write operation 'placeOrder'."
+        ));
+        assert!(should_passthrough_order_submission_error(
+            "LOCAL_READ_ONLY: local read-only mode blocks write operation 'placeOrder'."
+        ));
+        assert!(!should_passthrough_order_submission_error("timeout"));
+    }
+
     fn sample_session() -> Session {
         Session {
             access_token: "test-token".to_string(),
@@ -1851,6 +1902,7 @@ mod tests {
             env,
             session: sample_session(),
             dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint()),
+            mode: None,
         }
     }
 
@@ -3387,6 +3439,29 @@ mod tests {
         .expect("limit prices should validate");
         assert_eq!(prices.limit_price.as_deref(), Some("123.45"));
         assert_eq!(prices.stop_price, None);
+    }
+
+    #[test]
+    fn parse_phase1_intent_buy_accepts_derivative_isin() {
+        let args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            amount: Some("500".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: Some("gettex".to_string()),
+            confirm: None,
+            accept_unsuitable: false,
+            json: true,
+        };
+
+        let intent = parse_phase1_intent_buy(&args).expect("phase 1 intent");
+        let confirmation =
+            parse_phase1_input_for_confirmation_buy(&args).expect("phase 1 confirmation input");
+
+        assert_eq!(intent.isin, "DE000HSBC123");
+        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
+        assert_eq!(confirmation.isin, "DE000HSBC123");
     }
 
     #[test]

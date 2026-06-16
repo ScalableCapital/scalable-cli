@@ -13,11 +13,12 @@ use serde_json::json;
 use crate::config::{EnvConfig, TargetEnv};
 use crate::dpop::{DPOP_SESSION_KEY_RELOGIN_MESSAGE, DpopKeyMaterial, DpopRuntimeOptions};
 use crate::graphql::{
-    execute_graphql, fetch_login_2fa_state, start_2fa_on_login, validate_2fa_on_login,
+    GraphqlAccessContext, execute_graphql, fetch_login_2fa_state, start_2fa_on_login,
+    validate_2fa_on_login,
 };
 use crate::session::{
-    LoginSource, SecretWriteBackend, Session, SessionManager, StorageBackendDiagnostics,
-    StoredSession,
+    LoginSource, SecretWriteBackend, Session, SessionManager, SessionMode,
+    StorageBackendDiagnostics, StoredSession,
 };
 use crate::token_verifier::{verify_access_token_allow_expired, verify_access_token_strict};
 use crate::transport_security::{
@@ -434,6 +435,7 @@ pub fn login_with_device_code(
     session_manager: &mut SessionManager,
     env: TargetEnv,
     env_cfg: &EnvConfig,
+    session_mode: Option<SessionMode>,
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<SecretWriteBackend> {
     validate_env_transport_security(env_cfg)?;
@@ -485,6 +487,7 @@ pub fn login_with_device_code(
                     env,
                     session,
                     dpop_jwk_thumbprint: Some(dpop.jwk_thumbprint.clone()),
+                    mode: session_mode,
                 });
             }
             DevicePollState::Pending => {
@@ -537,12 +540,14 @@ pub(crate) fn refresh_session_with_dpop(
 pub fn revoke_tokens_on_logout_best_effort(
     env_cfg: &EnvConfig,
     session: &Session,
+    session_mode: Option<SessionMode>,
     dpop_options: &DpopRuntimeOptions,
 ) {
     if let Some(refresh_token) = session.refresh_token.as_deref() {
         let _ = revoke_refresh_token_on_logout(env_cfg, refresh_token, dpop_options);
     }
-    let _ = revoke_access_token_on_logout(env_cfg, &session.access_token, dpop_options);
+    let _ =
+        revoke_access_token_on_logout(env_cfg, &session.access_token, session_mode, dpop_options);
 }
 
 fn refresh_session_if_needed_at(
@@ -756,6 +761,7 @@ fn revoke_refresh_token_on_logout(
 fn revoke_access_token_on_logout(
     env_cfg: &EnvConfig,
     access_token: &str,
+    session_mode: Option<SessionMode>,
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<()> {
     execute_graphql(
@@ -768,6 +774,7 @@ fn revoke_access_token_on_logout(
             }
         }),
         Some("revokeAuthAccessToken"),
+        GraphqlAccessContext::with_session_mode(session_mode),
         dpop_options,
     )?;
     Ok(())
@@ -1180,6 +1187,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
             env: TargetEnv::Prod,
             session: sample_session(env_cfg, expires_at, refresh_token),
             dpop_jwk_thumbprint: dpop_jwk_thumbprint.map(ToString::to_string),
+            mode: None,
         }
     }
 
@@ -1573,7 +1581,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
             graphql_url: server.url(),
             auth: env_cfg.auth,
         };
-        revoke_access_token_on_logout(&env_cfg, access_token, &runtime_dpop_options())
+        revoke_access_token_on_logout(&env_cfg, access_token, None, &runtime_dpop_options())
             .expect("access revoke mutation should succeed");
 
         revoke.assert();
@@ -1604,7 +1612,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
             graphql_url: server.url(),
             auth: env_cfg.auth,
         };
-        revoke_tokens_on_logout_best_effort(&env_cfg, &session, &runtime_dpop_options());
+        revoke_tokens_on_logout_best_effort(&env_cfg, &session, None, &runtime_dpop_options());
 
         gql_revoke.assert();
         oauth_revoke.assert();
@@ -1643,7 +1651,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
             graphql_url: server.url(),
             auth: env_cfg.auth,
         };
-        revoke_tokens_on_logout_best_effort(&env_cfg, &session, &runtime_dpop_options());
+        revoke_tokens_on_logout_best_effort(&env_cfg, &session, None, &runtime_dpop_options());
 
         oauth_revoke.assert();
         gql_revoke.assert();
@@ -2114,8 +2122,13 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
         );
         let mut session_manager = SessionManager::with_store(store);
 
-        let _backend =
-            login_with_device_code(&mut session_manager, env, &env_cfg, &runtime_dpop_options())?;
+        let _backend = login_with_device_code(
+            &mut session_manager,
+            env,
+            &env_cfg,
+            None,
+            &runtime_dpop_options(),
+        )?;
         Ok((session_manager, tmp))
     }
 
@@ -2188,6 +2201,7 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
 
     fn login_with_existing_approved_trusted_device_session(
         env: TargetEnv,
+        session_mode: Option<SessionMode>,
     ) -> Result<(SessionManager, tempfile::TempDir)> {
         let _lock = crate::lock_test_env();
         let mut server = Server::new();
@@ -2271,8 +2285,13 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
         );
         let mut session_manager = SessionManager::with_store(store);
 
-        let _backend =
-            login_with_device_code(&mut session_manager, env, &env_cfg, &runtime_dpop_options())?;
+        let _backend = login_with_device_code(
+            &mut session_manager,
+            env,
+            &env_cfg,
+            session_mode,
+            &runtime_dpop_options(),
+        )?;
         Ok((session_manager, tmp))
     }
 
@@ -2316,7 +2335,7 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
     #[test]
     fn login_with_device_code_skips_trusted_device_challenge_for_approved_session() {
         let (session_manager, _tmp) =
-            login_with_existing_approved_trusted_device_session(TargetEnv::Prod)
+            login_with_existing_approved_trusted_device_session(TargetEnv::Prod, None)
                 .expect("login should succeed");
 
         assert!(
@@ -2330,5 +2349,21 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
             .expect("load session")
             .expect("stored session");
         assert!(stored.dpop_jwk_thumbprint.is_some());
+        assert_eq!(stored.mode, None);
+    }
+
+    #[test]
+    fn login_with_device_code_persists_local_read_only_mode() {
+        let (session_manager, _tmp) = login_with_existing_approved_trusted_device_session(
+            TargetEnv::Prod,
+            Some(SessionMode::LocalReadOnly),
+        )
+        .expect("login should succeed");
+
+        let stored = session_manager
+            .load_active()
+            .expect("load session")
+            .expect("stored session");
+        assert_eq!(stored.mode, Some(SessionMode::LocalReadOnly));
     }
 }

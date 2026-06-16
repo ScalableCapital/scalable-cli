@@ -295,6 +295,127 @@ fn project_broker_search_includes_query() {
 }
 
 #[test]
+fn project_broker_derivatives_search_maps_price_and_expiry_shapes() {
+    let input = broker_input(false, None);
+    let query = crate::broker_queries::NormalizedBrokerDerivativesSearchQueryInput {
+        derivative_type: crate::cli::BrokerDerivativeType::Knockout,
+        underlying_isin: "US0378331005".to_string(),
+        limit: 25,
+        offset: 50,
+        issuers: Some(vec!["HSBC".to_string()]),
+        strategy: "LONG".to_string(),
+        product_subcategories: Some(vec!["TURBO".to_string()]),
+        leverage_range: None,
+        knockout_barrier_range: None,
+        strike_range: None,
+        omega_range: None,
+        delta_range: None,
+        factor_range: None,
+        expiry_date_range: None,
+        sort_by: None,
+    };
+    let response = json!({
+        "account": {
+            "brokerPortfolio": {
+                "derivativesSearch": {
+                    "pagination": {
+                        "offset": 50,
+                        "limit": 25,
+                        "totalAvailable": 2
+                    },
+                    "results": [
+                        {
+                            "__typename": "KnockoutSearchResult",
+                            "isin": "DE000HSBC123",
+                            "underlyingIsin": "US0378331005",
+                            "issuer": "HSBC",
+                            "strategy": "LONG",
+                            "productSubcategory": "TURBO",
+                            "leverage": "4.2",
+                            "distanceToKnockout": "3.5",
+                            "distanceToStrike": "1.2",
+                            "strike": {
+                                "__typename": "Money",
+                                "currencyIsoCode": "EUR",
+                                "value": "190.00"
+                            },
+                            "knockoutBarrier": {
+                                "__typename": "Point",
+                                "value": "18000"
+                            },
+                            "premiumAbsolute": {
+                                "currencyIsoCode": "EUR",
+                                "value": "7.40"
+                            },
+                            "premiumPercentage": "0.0415",
+                            "expiryDate": {
+                                "date": {
+                                    "date": "2026-12-31",
+                                    "epochDay": 20818
+                                },
+                                "isOpenEnd": false
+                            }
+                        },
+                        {
+                            "__typename": "WarrantSearchResult",
+                            "isin": "DE000WARRANT1",
+                            "underlyingIsin": "US0378331005",
+                            "issuer": "BNP",
+                            "strategy": "CALL",
+                            "omega": "8.5",
+                            "delta": "0.40",
+                            "impliedVolatility": "0.25",
+                            "distanceToStrike": "4.2",
+                            "strike": {
+                                "__typename": "Money",
+                                "currencyIsoCode": "USD",
+                                "value": "210.00"
+                            },
+                            "expiryDate": {
+                                "epochDay": 20714
+                            }
+                        },
+                        {
+                            "__typename": "FactorCertificateSearchResult",
+                            "isin": "DE000FACTOR1",
+                            "underlyingIsin": "US0378331005",
+                            "issuer": "SOC_GEN",
+                            "strategy": "SHORT",
+                            "factor": "5",
+                            "expiryDate": {
+                                "date": {
+                                    "date": "2027-01-15",
+                                    "epochDay": 20833
+                                },
+                                "isOpenEnd": false
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let projected =
+        project_broker_derivatives_search_response(&input, &query, &response).expect("project");
+    assert_eq!(projected["derivative_type"], "knockout");
+    assert_eq!(projected["underlying_isin"], "US0378331005");
+    assert_eq!(projected["total_available"], 2);
+    assert_eq!(projected["items"][0]["strike"]["kind"], "money");
+    assert_eq!(projected["items"][0]["knockout_barrier"]["kind"], "point");
+    assert_eq!(projected["items"][0]["expiry_is_open_end"], false);
+    assert_eq!(projected["items"][0]["expiry_date"]["date"], "2026-12-31");
+    assert_eq!(projected["items"][1]["omega"], "8.5");
+    assert_eq!(projected["items"][1]["implied_volatility"], "0.25");
+    assert_eq!(projected["items"][1]["expiry_date"]["epoch_day"], 20714);
+    assert_eq!(projected["items"][1]["expiry_date"]["date"], json!(null));
+    assert_eq!(projected["items"][1]["expiry_is_open_end"], json!(null));
+    assert_eq!(projected["items"][2]["factor"], "5");
+    assert_eq!(projected["items"][2]["expiry_date"]["epoch_day"], 20833);
+    assert_eq!(projected["items"][2]["expiry_is_open_end"], false);
+}
+
+#[test]
 fn project_broker_quote_response_maps_quote_fields() {
     let input = broker_input(true, Some("CONSOLIDATED"));
     let response = json!({

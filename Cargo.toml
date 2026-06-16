@@ -1,7 +1,8 @@
 [package]
 name = "scalable-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.95"
 
 [[bin]]
 name = "sc"
@@ -11,7 +12,7 @@ path = "src/main.rs"
 channel-prod = []
 
 [build-dependencies]
-toml = "0.8"
+toml = "1.0"
 
 [profile.release]
 strip = "symbols"
@@ -23,15 +24,15 @@ clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
-rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3.14"
-toml = "0.8"
+toml = "1.0"
 url = "2.5"
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
