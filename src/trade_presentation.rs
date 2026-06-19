@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
-use crate::trade::{TradeSide, evaluate_suitability};
+use crate::trade::TradeSide;
 use crate::trade_confirmation::ConfirmationPhase1Input;
 use crate::trade_execution::{
     ORDER_SIDE_BUY, ORDER_SIDE_SELL, PreparedTrade, VENUE_GETTEX, VENUE_LABEL_GETTEX,
@@ -82,12 +82,11 @@ const OPTIONAL_EX_ANTE_FIELD_POLICIES: [OptionalExAnteFieldPolicy; 3] = [
     },
 ];
 
-const PHASE1_REQUIRED_JSON_PATHS_BASE: [&str; 12] = [
+const PHASE1_REQUIRED_JSON_PATHS_BASE: [&str; 11] = [
     "/result/intent",
     "/result/market_quote",
     "/result/calculation",
     "/result/tradability",
-    "/result/appropriateness",
     "/result/warning",
     "/result/price_warnings",
     "/result/ex_ante_costs",
@@ -97,7 +96,7 @@ const PHASE1_REQUIRED_JSON_PATHS_BASE: [&str; 12] = [
     "/confirmation/expires_at_epoch",
 ];
 
-const PHASE1_PRESENTATION_SECTIONS_BASE: [PresentationSectionSpec; 11] = [
+const PHASE1_PRESENTATION_SECTIONS_BASE: [PresentationSectionSpec; 10] = [
     PresentationSectionSpec {
         key: "trade_intent",
         title: "Trade intent",
@@ -113,10 +112,6 @@ const PHASE1_PRESENTATION_SECTIONS_BASE: [PresentationSectionSpec; 11] = [
     PresentationSectionSpec {
         key: "tradability",
         title: "Tradability",
-    },
-    PresentationSectionSpec {
-        key: "appropriateness",
-        title: "Appropriateness",
     },
     PresentationSectionSpec {
         key: "warning",
@@ -150,7 +145,7 @@ const PHASE1_PRESENTATION_SECTION_REGULATORY_DISCLOSURES: PresentationSectionSpe
         title: "Regulatory disclosures",
     };
 
-const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 30] = [
+const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 27] = [
     PresentationFieldSpec {
         section_key: "trade_intent",
         path: "/result/intent/isin",
@@ -278,33 +273,15 @@ const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 30] = [
         nullable: false,
     },
     PresentationFieldSpec {
-        section_key: "appropriateness",
-        path: "/result/appropriateness/status",
-        label: "Status",
-        nullable: false,
+        section_key: "warning",
+        path: "/result/warning/kind",
+        label: "Kind",
+        nullable: true,
     },
     PresentationFieldSpec {
-        section_key: "appropriateness",
-        path: "/result/appropriateness/requires_warning_ack",
-        label: "Requires warning acknowledgement",
-        nullable: false,
-    },
-    PresentationFieldSpec {
-        section_key: "appropriateness",
-        path: "/result/appropriateness/requires_questionnaire",
-        label: "Requires questionnaire",
-        nullable: false,
-    },
-    PresentationFieldSpec {
-        section_key: "appropriateness",
-        path: "/result/appropriateness/passed",
-        label: "Passed",
-        nullable: false,
-    },
-    PresentationFieldSpec {
-        section_key: "appropriateness",
-        path: "/result/appropriateness/appropriateness_id",
-        label: "Appropriateness id",
+        section_key: "warning",
+        path: "/result/warning/title",
+        label: "Title",
         nullable: true,
     },
     PresentationFieldSpec {
@@ -321,8 +298,8 @@ const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 30] = [
     },
     PresentationFieldSpec {
         section_key: "warning",
-        path: "/result/warning/prompt_text",
-        label: "Prompt text",
+        path: "/result/warning/body",
+        label: "Body",
         nullable: true,
     },
     PresentationFieldSpec {
@@ -550,7 +527,19 @@ const PHASE1_PRESENTATION_FIELDS_CONFIRMATION: [PresentationFieldSpec; 2] = [
     },
 ];
 
-const PHASE1_PRESENTATION_FIELDS_SUITABILITY: [PresentationFieldSpec; 4] = [
+const PHASE1_PRESENTATION_FIELDS_SUITABILITY: [PresentationFieldSpec; 7] = [
+    PresentationFieldSpec {
+        section_key: "suitability",
+        path: "/result/suitability/source",
+        label: "Source",
+        nullable: false,
+    },
+    PresentationFieldSpec {
+        section_key: "suitability",
+        path: "/result/suitability/type",
+        label: "Type",
+        nullable: true,
+    },
     PresentationFieldSpec {
         section_key: "suitability",
         path: "/result/suitability/status",
@@ -559,21 +548,27 @@ const PHASE1_PRESENTATION_FIELDS_SUITABILITY: [PresentationFieldSpec; 4] = [
     },
     PresentationFieldSpec {
         section_key: "suitability",
-        path: "/result/suitability/is_suitable",
-        label: "Suitable",
+        path: "/result/suitability/action_when_unsuitable",
+        label: "Action when unsuitable",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "suitability",
+        path: "/result/suitability/questionnaire_required",
+        label: "Questionnaire required",
         nullable: false,
+    },
+    PresentationFieldSpec {
+        section_key: "suitability",
+        path: "/result/suitability/questionnaire_reason",
+        label: "Questionnaire reason",
+        nullable: true,
     },
     PresentationFieldSpec {
         section_key: "suitability",
         path: "/result/suitability/requires_accept_unsuitable",
         label: "Requires unsuitable acknowledgement",
         nullable: false,
-    },
-    PresentationFieldSpec {
-        section_key: "suitability",
-        path: "/result/suitability/accept_flag",
-        label: "Phase 2 acknowledgement flag",
-        nullable: true,
     },
 ];
 
@@ -904,20 +899,22 @@ pub(crate) fn build_result_payload(
             "reason": "phase_1_preview_only"
         })
     });
-    let suitability = {
-        let review = evaluate_suitability(
-            prepared
-                .appropriateness_json
-                .get("status")
-                .and_then(Value::as_str),
-        );
-        json!({
-            "status": review.status,
-            "is_suitable": review.is_suitable,
-            "requires_accept_unsuitable": review.requires_accept_unsuitable,
-            "accept_flag": review.requires_accept_unsuitable.then_some("--accept-unsuitable"),
-        })
-    };
+    let suitability = json!({
+        "source": prepared.compliance_decision.source_kind.as_str(),
+        "type": prepared.compliance_decision.suitability_type.map(|value| value.as_str()),
+        "status": prepared.compliance_decision.status.as_str(),
+        "action_when_unsuitable": prepared
+            .compliance_decision
+            .action_when_unsuitable
+            .map(|value| value.as_str()),
+        "questionnaire_required": prepared.compliance_decision.questionnaire_required,
+        "questionnaire_reason": prepared.compliance_decision.questionnaire_reason,
+        "requires_accept_unsuitable": prepared.compliance_decision.requires_accept_unsuitable,
+        "accept_flag": prepared
+            .compliance_decision
+            .requires_accept_unsuitable
+            .then_some("--accept-unsuitable"),
+    });
     let mut result = json!({
         "intent": {
             "side": prepared.intent.side_label(),
@@ -958,7 +955,6 @@ pub(crate) fn build_result_payload(
             "tradable": prepared.tradability_gate.tradable,
             "selected_venue_sellable": prepared.tradability_gate.selected_venue_sellable,
         },
-        "appropriateness": &prepared.appropriateness_json,
         "warning": &prepared.warning_json,
         "price_warnings": price_warnings.unwrap_or_else(|| json!({ "items": [] })),
         "ex_ante_costs": &prepared.ex_ante_costs,
@@ -1168,17 +1164,90 @@ fn render_ex_ante_costs_block(payload: &Value) -> Vec<String> {
     lines
 }
 
+fn render_warning_block(payload: &Value) -> Vec<String> {
+    let kind = payload
+        .pointer("/result/warning/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if kind == "none" {
+        return Vec::new();
+    }
+
+    let mut lines = vec!["Warning".to_string(), format!("kind: {kind}")];
+    if let Some(title) = payload
+        .pointer("/result/warning/title")
+        .and_then(Value::as_str)
+    {
+        lines.push(format!("title: {title}"));
+    }
+    if let Some(body) = payload
+        .pointer("/result/warning/body")
+        .and_then(Value::as_str)
+    {
+        lines.push(format!("body: {body}"));
+    }
+    if let Some(locale) = payload
+        .pointer("/result/warning/locale")
+        .and_then(Value::as_str)
+    {
+        lines.push(format!("locale: {locale}"));
+    }
+    if let Some(version) = payload
+        .pointer("/result/warning/version")
+        .and_then(Value::as_str)
+    {
+        lines.push(format!("version: {version}"));
+    }
+    if let Some(acknowledgement_text) = payload
+        .pointer("/result/warning/acknowledgement_text")
+        .and_then(Value::as_str)
+    {
+        lines.push(format!("acknowledgement_text: {acknowledgement_text}"));
+    }
+
+    lines
+}
+
 fn render_suitability_block(payload: &Value) -> Vec<String> {
     let mut lines = vec!["Suitability".to_string()];
 
+    let source = payload
+        .pointer("/result/suitability/source")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let suitability_type = match payload.pointer("/result/suitability/type") {
+        Some(value) if value.is_null() => "null".to_string(),
+        Some(value) => value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string()),
+        None => "<missing>".to_string(),
+    };
     let status = payload
         .pointer("/result/suitability/status")
         .and_then(Value::as_str)
         .unwrap_or("<missing>");
-    let is_suitable = payload
-        .pointer("/result/suitability/is_suitable")
+    let action_when_unsuitable = match payload.pointer("/result/suitability/action_when_unsuitable")
+    {
+        Some(value) if value.is_null() => "null".to_string(),
+        Some(value) => value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string()),
+        None => "<missing>".to_string(),
+    };
+    let questionnaire_required = payload
+        .pointer("/result/suitability/questionnaire_required")
         .map(|value| value.to_string())
         .unwrap_or_else(|| "<missing>".to_string());
+    let questionnaire_reason = match payload.pointer("/result/suitability/questionnaire_reason") {
+        Some(value) if value.is_null() => "null".to_string(),
+        Some(value) => value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string()),
+        None => "<missing>".to_string(),
+    };
     let requires_accept_unsuitable = payload
         .pointer("/result/suitability/requires_accept_unsuitable")
         .map(|value| value.to_string())
@@ -1192,8 +1261,12 @@ fn render_suitability_block(payload: &Value) -> Vec<String> {
         None => "<missing>".to_string(),
     };
 
+    lines.push(format!("source: {source}"));
+    lines.push(format!("type: {suitability_type}"));
     lines.push(format!("status: {status}"));
-    lines.push(format!("is_suitable: {is_suitable}"));
+    lines.push(format!("action_when_unsuitable: {action_when_unsuitable}"));
+    lines.push(format!("questionnaire_required: {questionnaire_required}"));
+    lines.push(format!("questionnaire_reason: {questionnaire_reason}"));
     lines.push(format!(
         "requires_accept_unsuitable: {requires_accept_unsuitable}"
     ));
@@ -1527,6 +1600,11 @@ fn render_trade_prefix_lines(payload: &Value, buy: bool) -> Vec<String> {
     }
 
     if should_render_preview_block {
+        let warning = render_warning_block(payload);
+        if !warning.is_empty() {
+            push_section_blank_line(&mut lines);
+            lines.extend(warning);
+        }
         let price_warnings = render_price_warnings_block(payload);
         if !price_warnings.is_empty() {
             push_section_blank_line(&mut lines);
@@ -1661,20 +1739,9 @@ mod tests {
                 selected_venue_unavailability_reason: None,
                 selected_venue_sellable: Some(9.0),
             },
-            appropriateness_json: json!({
-                "status": "NOT_REQUIRED",
-                "requires_warning_ack": false,
-                "requires_questionnaire": false,
-                "passed": true,
-                "appropriateness_id": Value::Null
-            }),
-            warning_json: json!({
-                "version": "v1",
-                "locale": "en_DE",
-                "prompt_text": "Prompt",
-                "acknowledgement_text": "Ack"
-            }),
-            warning_version_for_order: Some("v1".to_string()),
+            compliance_decision: crate::trade::TradeComplianceDecision::not_required(),
+            warning_json: Value::Null,
+            warning_version_for_order: None,
             appropriateness_id_for_order: None,
             quote_mid_price_value: 50.4561,
             quote_ask_price_value: Some(50.5000),
@@ -1866,9 +1933,21 @@ mod tests {
             Some("NOT_REQUIRED")
         );
         assert_eq!(
-            payload.pointer("/suitability/is_suitable"),
-            Some(&Value::Bool(true))
+            payload
+                .pointer("/suitability/source")
+                .and_then(Value::as_str),
+            Some("not_required")
         );
+        assert_eq!(
+            payload.pointer("/suitability/questionnaire_required"),
+            Some(&Value::Bool(false))
+        );
+        assert!(
+            payload
+                .pointer("/suitability/submission_appropriateness_id")
+                .is_none()
+        );
+        assert!(payload.pointer("/appropriateness").is_none());
         assert_eq!(
             payload
                 .pointer("/calculation/sizing_price_basis")
@@ -1994,8 +2073,12 @@ mod tests {
                     "incidentalCosts": {"amount": 0, "percentage": 0}
                 },
                 "suitability": {
+                    "source": "not_required",
+                    "type": Value::Null,
                     "status": "NOT_REQUIRED",
-                    "is_suitable": true,
+                    "action_when_unsuitable": Value::Null,
+                    "questionnaire_required": false,
+                    "questionnaire_reason": Value::Null,
                     "requires_accept_unsuitable": false,
                     "accept_flag": Value::Null
                 }
@@ -2069,8 +2152,12 @@ mod tests {
                     "incidentalCosts": {"amount": 0, "percentage": 0}
                 },
                 "suitability": {
+                    "source": "not_required",
+                    "type": Value::Null,
                     "status": "NOT_REQUIRED",
-                    "is_suitable": true,
+                    "action_when_unsuitable": Value::Null,
+                    "questionnaire_required": false,
+                    "questionnaire_reason": Value::Null,
                     "requires_accept_unsuitable": false,
                     "accept_flag": Value::Null
                 }

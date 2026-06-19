@@ -278,7 +278,7 @@ sc broker trade buy --isin US0378331005 --amount 500 --order-type market \
   --confirm <CONFIRMATION_ID>
 ```
 
-If phase 1 marks the instrument as not suitable, add `--accept-unsuitable` to the phase 2 command.
+If phase 1 explicitly requires unsuitable acknowledgement for the buy order, `--accept-unsuitable` confirms that you are aware of the risks and still want to proceed.
 
 The same confirmation model applies to sell orders:
 

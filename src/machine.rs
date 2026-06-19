@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use crate::auth::REFRESH_RELOGIN_REQUIRED_PREFIX;
 use crate::dpop::DPOP_SESSION_KEY_RELOGIN_MESSAGE;
 use crate::graphql::LOCAL_READ_ONLY_ERROR_PREFIX;
+use crate::session::SessionStorageError;
 
 #[derive(Debug, Serialize)]
 struct MachineEnvelope {
@@ -107,6 +108,18 @@ fn sanitize_error_message(message: &str) -> Cow<'_, str> {
 }
 
 pub fn classify_error(err: &Error) -> ClassifiedError {
+    if let Some(storage_error) = session_storage_error_in_chain(err) {
+        return match storage_error {
+            SessionStorageError::SecretServiceUnavailable { .. } => ClassifiedError {
+                code: "secret_storage_unavailable",
+                exit_code: 20,
+                hints: vec![
+                    "Set `session_backend = \"file\"` under `[auth]` in the scalable-cli config.toml, then run 'sc login' again.".to_string(),
+                ],
+            },
+        };
+    }
+
     let text = full_error_text(err);
     let lower = text.to_lowercase();
 
@@ -276,6 +289,36 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
+    if text.contains("SUITABILITY_QUESTIONNAIRE_REQUIRED:") {
+        return ClassifiedError {
+            code: "suitability_questionnaire_required",
+            exit_code: 10,
+            hints: vec![
+                "Complete the required suitability questionnaire in web or mobile, then rerun phase 1."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if text.contains("UNSUPPORTED_TRADE_SUITABILITY_TYPE:") {
+        return ClassifiedError {
+            code: "unsupported_trade_suitability_type",
+            exit_code: 10,
+            hints: vec!["Use web or mobile for this product flow.".to_string()],
+        };
+    }
+
+    if text.contains("SUITABILITY_ID_MISSING:") {
+        return ClassifiedError {
+            code: "suitability_id_missing",
+            exit_code: 30,
+            hints: vec![
+                "The backend omitted the suitability id needed for order submission; retry later or investigate the response contract."
+                    .to_string(),
+            ],
+        };
+    }
+
     if text.contains("PRESENTATION_MAPPING_INCOMPLETE:") {
         return ClassifiedError {
             code: "presentation_mapping_incomplete",
@@ -338,7 +381,7 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             code: "order_submission_failed",
             exit_code: 30,
             hints: vec![
-                "Retry the command; idempotency key reuse protects against duplicate submit."
+                "Check the error details before retrying; if the outcome may be ambiguous, check transactions or order status first. Idempotency key reuse still protects an intentional retry."
                     .to_string(),
             ],
         };
@@ -463,6 +506,11 @@ fn format_error_chain_for_display(err: &Error) -> String {
     formatted
 }
 
+fn session_storage_error_in_chain(err: &Error) -> Option<&SessionStorageError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SessionStorageError>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +574,20 @@ mod tests {
             c.hints,
             vec!["Run `sc login` without `--local-read-only` to perform write operations."]
         );
+    }
+
+    #[test]
+    fn classify_secret_storage_unavailable_error() {
+        let err = anyhow::Error::new(SessionStorageError::secret_service_unavailable(
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "DBus error: org.freedesktop.secrets",
+            ))),
+        ))
+        .context("outer context");
+        let c = classify_error(&err);
+        assert_eq!(c.code, "secret_storage_unavailable");
+        assert_eq!(c.exit_code, 20);
+        assert!(c.hints[0].contains("session_backend = \"file\""));
     }
 
     #[test]
@@ -606,6 +668,11 @@ mod tests {
         let c = classify_error(&err);
         assert_eq!(c.code, "order_submission_failed");
         assert_eq!(c.exit_code, 30);
+        assert!(
+            c.hints
+                .iter()
+                .any(|hint| hint.contains("check transactions or order status first"))
+        );
     }
 
     #[test]
@@ -621,6 +688,37 @@ mod tests {
                 .iter()
                 .any(|hint| hint.contains("--accept-unsuitable"))
         );
+    }
+
+    #[test]
+    fn classify_suitability_questionnaire_required_error() {
+        let err = anyhow!(
+            "SUITABILITY_QUESTIONNAIRE_REQUIRED: complete the required KNOCKOUT questionnaire outside the CLI before trading"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "suitability_questionnaire_required");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_unsupported_trade_suitability_type_error() {
+        let err = anyhow!(
+            "UNSUPPORTED_TRADE_SUITABILITY_TYPE: ELTIF suitability is not supported in sc broker trade; use web or mobile for this product flow."
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "unsupported_trade_suitability_type");
+        assert_eq!(c.exit_code, 10);
+        assert!(c.hints.iter().any(|hint| hint.contains("web or mobile")));
+    }
+
+    #[test]
+    fn classify_suitability_id_missing_error() {
+        let err = anyhow!(
+            "SUITABILITY_ID_MISSING: suitabilityId is missing for proceedable KNOCKOUT trade"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "suitability_id_missing");
+        assert_eq!(c.exit_code, 30);
     }
 
     #[test]

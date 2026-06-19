@@ -8,8 +8,26 @@ query getTradingTradability($personId: ID!, $isin: ID!, $portfolioId: ID!) {
     id
     brokerPortfolio(id: $portfolioId) {
       id
+      appropriatenessInfo {
+        id
+        appropriatenessId
+        result
+      }
+      suitabilityStatuses {
+        id
+        suitabilityType
+        result
+        suitabilityId
+      }
+      featureFlags {
+        knockoutWarnings
+      }
       security(isin: $isin) {
         id
+        requiredSuitability {
+          suitabilityType
+          actionWhenUnsuitable
+        }
         buyTradabilityForTrading {
           id
           tradabilityStatus
@@ -252,6 +270,9 @@ mutation BrokerCancelOrder($portfolioId: ID!, $orderId: ID!) {
 }
 "#;
 
+pub const KNOCKOUT_RISK_WARNING_TITLE: &str = "Risk warning";
+pub const KNOCKOUT_RISK_WARNING_BODY: &str = "On average, 7 out of 10 retail investors incur losses when trading turbo certificates. Turbo certificates are high-risk products and are not suitable for long-term investment strategies.";
+
 pub(crate) fn required_non_empty(value: &str, field: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -326,13 +347,6 @@ pub struct AppropriatenessGate {
     pub requires_questionnaire: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SuitabilityReview {
-    pub status: String,
-    pub is_suitable: bool,
-    pub requires_accept_unsuitable: bool,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppropriatenessWarning {
     pub version: String,
@@ -367,6 +381,172 @@ pub struct SecurityIssuerDocumentLinks {
 pub struct PlaceOrderResult {
     pub order_id: String,
     pub is_marketable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeComplianceSourceKind {
+    NotRequired,
+    SuitabilityService,
+    LegacyAppropriatenessFallback,
+}
+
+impl TradeComplianceSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::SuitabilityService => "suitability_service",
+            Self::LegacyAppropriatenessFallback => "legacy_appropriateness_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeSuitabilityType {
+    Knockout,
+    ComplexInstrument,
+    Eltif,
+    Wealth,
+    LegacyFallback,
+}
+
+impl TradeSuitabilityType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Knockout => "KNOCKOUT",
+            Self::ComplexInstrument => "COMPLEX_INSTRUMENT",
+            Self::Eltif => "ELTIF",
+            Self::Wealth => "WEALTH",
+            Self::LegacyFallback => "LEGACY_FALLBACK",
+        }
+    }
+
+    fn supported_in_broker_trade(self) -> bool {
+        matches!(self, Self::Knockout | Self::ComplexInstrument)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeSuitabilityStatus {
+    NotRequired,
+    Suitable,
+    Unsuitable,
+    NotEvaluated,
+    NotCompleted,
+}
+
+impl TradeSuitabilityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "NOT_REQUIRED",
+            Self::Suitable => "SUITABLE",
+            Self::Unsuitable => "UNSUITABLE",
+            Self::NotEvaluated => "NOT_EVALUATED",
+            Self::NotCompleted => "NOT_COMPLETED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeActionWhenUnsuitable {
+    ProceedToOrderFlow,
+    ReopenQuestionnaire,
+}
+
+impl TradeActionWhenUnsuitable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProceedToOrderFlow => "PROCEED_TO_ORDER_FLOW",
+            Self::ReopenQuestionnaire => "REOPEN_QUESTIONNAIRE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeWarningKind {
+    None,
+    LegacyAppropriatenessWarning,
+    KnockoutRiskWarning,
+}
+
+impl TradeWarningKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LegacyAppropriatenessWarning => "legacy_appropriateness_warning",
+            Self::KnockoutRiskWarning => "knockout_risk_warning",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeWarningDecision {
+    pub kind: TradeWarningKind,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub locale: Option<String>,
+    pub version_for_order: Option<String>,
+    pub acknowledgement_text: Option<String>,
+}
+
+impl TradeWarningDecision {
+    fn none() -> Self {
+        Self {
+            kind: TradeWarningKind::None,
+            title: None,
+            body: None,
+            locale: None,
+            version_for_order: None,
+            acknowledgement_text: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeComplianceDecision {
+    pub source_kind: TradeComplianceSourceKind,
+    pub suitability_type: Option<TradeSuitabilityType>,
+    pub status: TradeSuitabilityStatus,
+    pub action_when_unsuitable: Option<TradeActionWhenUnsuitable>,
+    pub questionnaire_required: bool,
+    pub questionnaire_reason: Option<&'static str>,
+    pub requires_accept_unsuitable: bool,
+    pub submission_appropriateness_id: Option<String>,
+    pub warning: TradeWarningDecision,
+}
+
+impl TradeComplianceDecision {
+    pub(crate) fn not_required() -> Self {
+        Self {
+            source_kind: TradeComplianceSourceKind::NotRequired,
+            suitability_type: None,
+            status: TradeSuitabilityStatus::NotRequired,
+            action_when_unsuitable: None,
+            questionnaire_required: false,
+            questionnaire_reason: None,
+            requires_accept_unsuitable: false,
+            submission_appropriateness_id: None,
+            warning: TradeWarningDecision::none(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredSuitability {
+    suitability_type: TradeSuitabilityType,
+    action_when_unsuitable: TradeActionWhenUnsuitable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuitabilityStatusEntry {
+    suitability_type: TradeSuitabilityType,
+    status: TradeSuitabilityStatus,
+    suitability_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyAppropriatenessInfo {
+    status: TradeSuitabilityStatus,
+    appropriateness_id: Option<String>,
 }
 
 pub fn parse_tradability_gate(
@@ -562,17 +742,379 @@ pub fn parse_appropriateness_warning(response: &Value) -> Result<Appropriateness
     })
 }
 
-pub fn evaluate_suitability(status: Option<&str>) -> SuitabilityReview {
-    let status = status.unwrap_or("UNKNOWN").to_string();
-    let (is_suitable, requires_accept_unsuitable) = match status.as_str() {
-        "APPROPRIATE" | "NOT_REQUIRED" => (true, false),
-        _ => (false, true),
+pub fn evaluate_trade_compliance(
+    response: &Value,
+    side: TradeSide,
+    appropriateness_required: bool,
+) -> Result<TradeComplianceDecision> {
+    if !side.is_buy() {
+        return Ok(TradeComplianceDecision::not_required());
+    }
+
+    let required_suitability = parse_required_suitability(response)?;
+    let suitability_statuses = parse_suitability_statuses(
+        response,
+        required_suitability
+            .as_ref()
+            .map(|required| required.suitability_type),
+    )?;
+    if let Some(required_suitability) = required_suitability {
+        return evaluate_required_suitability(
+            response,
+            required_suitability,
+            &suitability_statuses,
+        );
+    }
+
+    if appropriateness_required || suitability_statuses.is_empty() {
+        return evaluate_legacy_appropriateness_fallback(response, appropriateness_required);
+    }
+
+    Ok(TradeComplianceDecision::not_required())
+}
+
+fn evaluate_required_suitability(
+    response: &Value,
+    required: RequiredSuitability,
+    suitability_statuses: &[SuitabilityStatusEntry],
+) -> Result<TradeComplianceDecision> {
+    if !required.suitability_type.supported_in_broker_trade() {
+        bail!(
+            "UNSUPPORTED_TRADE_SUITABILITY_TYPE: {} suitability is not supported in sc broker trade; use web or mobile for this product flow.",
+            required.suitability_type.as_str()
+        );
+    }
+
+    let status_entry = suitability_statuses
+        .iter()
+        .find(|status| status.suitability_type == required.suitability_type);
+    let status = status_entry
+        .map(|status| status.status)
+        .unwrap_or(TradeSuitabilityStatus::NotEvaluated);
+    let questionnaire_reason = match status {
+        TradeSuitabilityStatus::NotEvaluated => Some("not_evaluated"),
+        TradeSuitabilityStatus::NotCompleted => Some("not_completed"),
+        TradeSuitabilityStatus::Unsuitable
+            if required.action_when_unsuitable
+                == TradeActionWhenUnsuitable::ReopenQuestionnaire =>
+        {
+            Some("unsuitable_reopens_questionnaire")
+        }
+        _ => None,
+    };
+    let questionnaire_required = questionnaire_reason.is_some();
+    let requires_accept_unsuitable = matches!(
+        (
+            required.suitability_type,
+            status,
+            required.action_when_unsuitable
+        ),
+        (
+            TradeSuitabilityType::ComplexInstrument,
+            TradeSuitabilityStatus::Unsuitable,
+            TradeActionWhenUnsuitable::ProceedToOrderFlow
+        )
+    );
+    let submission_appropriateness_id = if questionnaire_required {
+        None
+    } else {
+        match (status, required.action_when_unsuitable) {
+            (TradeSuitabilityStatus::Suitable, _)
+            | (TradeSuitabilityStatus::Unsuitable, TradeActionWhenUnsuitable::ProceedToOrderFlow) =>
+            {
+                let suitability_id = status_entry
+                    .and_then(|status| status.suitability_id.as_deref())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "SUITABILITY_ID_MISSING: suitabilityId is missing for proceedable {} trade (status={})",
+                            required.suitability_type.as_str(),
+                            status.as_str(),
+                        )
+                    })?;
+                Some(suitability_id.to_string())
+            }
+            _ => None,
+        }
+    };
+    let warning = if questionnaire_required {
+        TradeWarningDecision::none()
+    } else if required.suitability_type == TradeSuitabilityType::Knockout
+        && knockout_warning_enabled(response)
+    {
+        TradeWarningDecision {
+            kind: TradeWarningKind::KnockoutRiskWarning,
+            title: Some(KNOCKOUT_RISK_WARNING_TITLE.to_string()),
+            body: Some(KNOCKOUT_RISK_WARNING_BODY.to_string()),
+            locale: Some("en_DE".to_string()),
+            version_for_order: None,
+            acknowledgement_text: None,
+        }
+    } else if requires_accept_unsuitable {
+        TradeWarningDecision {
+            kind: TradeWarningKind::LegacyAppropriatenessWarning,
+            title: None,
+            body: None,
+            locale: None,
+            version_for_order: None,
+            acknowledgement_text: None,
+        }
+    } else {
+        TradeWarningDecision::none()
     };
 
-    SuitabilityReview {
+    Ok(TradeComplianceDecision {
+        source_kind: TradeComplianceSourceKind::SuitabilityService,
+        suitability_type: Some(required.suitability_type),
         status,
-        is_suitable,
+        action_when_unsuitable: Some(required.action_when_unsuitable),
+        questionnaire_required,
+        questionnaire_reason,
         requires_accept_unsuitable,
+        submission_appropriateness_id,
+        warning,
+    })
+}
+
+fn evaluate_legacy_appropriateness_fallback(
+    response: &Value,
+    appropriateness_required: bool,
+) -> Result<TradeComplianceDecision> {
+    if !appropriateness_required {
+        return Ok(TradeComplianceDecision::not_required());
+    }
+
+    let info = parse_legacy_appropriateness_info(response)?
+        .ok_or_else(|| anyhow!("Trade response invalid: missing appropriateness info"))?;
+    let questionnaire_reason = match info.status {
+        TradeSuitabilityStatus::NotEvaluated => Some("not_evaluated"),
+        TradeSuitabilityStatus::NotCompleted => Some("not_completed"),
+        _ => None,
+    };
+    let questionnaire_required = questionnaire_reason.is_some();
+    let requires_accept_unsuitable = info.status == TradeSuitabilityStatus::Unsuitable;
+    let submission_appropriateness_id = if questionnaire_required {
+        None
+    } else {
+        match info.status {
+            TradeSuitabilityStatus::Suitable | TradeSuitabilityStatus::Unsuitable => {
+                Some(
+                    info.appropriateness_id
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "APPROPRIATENESS_REQUIRED: appropriateness id is missing for appropriateness-required trade."
+                            )
+                        })?,
+                )
+            }
+            _ => None,
+        }
+    };
+    let warning = if requires_accept_unsuitable {
+        TradeWarningDecision {
+            kind: TradeWarningKind::LegacyAppropriatenessWarning,
+            title: None,
+            body: None,
+            locale: None,
+            version_for_order: None,
+            acknowledgement_text: None,
+        }
+    } else {
+        TradeWarningDecision::none()
+    };
+
+    Ok(TradeComplianceDecision {
+        source_kind: TradeComplianceSourceKind::LegacyAppropriatenessFallback,
+        suitability_type: Some(TradeSuitabilityType::LegacyFallback),
+        status: info.status,
+        action_when_unsuitable: requires_accept_unsuitable
+            .then_some(TradeActionWhenUnsuitable::ProceedToOrderFlow),
+        questionnaire_required,
+        questionnaire_reason,
+        requires_accept_unsuitable,
+        submission_appropriateness_id,
+        warning,
+    })
+}
+
+fn parse_required_suitability(response: &Value) -> Result<Option<RequiredSuitability>> {
+    let Some(required) = response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("security"))
+        .and_then(|v| v.get("requiredSuitability"))
+    else {
+        return Ok(None);
+    };
+    if required.is_null() {
+        return Ok(None);
+    }
+
+    let suitability_type = parse_required_suitability_type(
+        required
+            .get("suitabilityType")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Trade response invalid: missing requiredSuitability type"))?,
+    )?;
+    let action_when_unsuitable = parse_action_when_unsuitable(
+        required
+            .get("actionWhenUnsuitable")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Trade response invalid: missing actionWhenUnsuitable"))?,
+    )?;
+
+    Ok(Some(RequiredSuitability {
+        suitability_type,
+        action_when_unsuitable,
+    }))
+}
+
+fn parse_suitability_statuses(
+    response: &Value,
+    required_suitability_type: Option<TradeSuitabilityType>,
+) -> Result<Vec<SuitabilityStatusEntry>> {
+    let entries = response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("suitabilityStatuses"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            match parse_suitability_status_entry(entry, required_suitability_type) {
+                Ok(Some(status)) => Some(Ok(status)),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect()
+}
+
+fn parse_suitability_status_entry(
+    entry: Value,
+    required_suitability_type: Option<TradeSuitabilityType>,
+) -> Result<Option<SuitabilityStatusEntry>> {
+    let suitability_type_value = entry
+        .get("suitabilityType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Trade response invalid: missing suitability status type"))?;
+
+    if let Some(required_type) = required_suitability_type
+        && suitability_type_value != required_type.as_str()
+    {
+        return Ok(None);
+    }
+
+    let suitability_type = match parse_required_suitability_type(suitability_type_value) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    Ok(Some(SuitabilityStatusEntry {
+        suitability_type,
+        status: parse_suitability_status(entry.get("result").and_then(Value::as_str).ok_or_else(
+            || anyhow!("Trade response invalid: missing suitability status result"),
+        )?)?,
+        suitability_id: entry
+            .get("suitabilityId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string),
+    }))
+}
+
+fn parse_legacy_appropriateness_info(
+    response: &Value,
+) -> Result<Option<LegacyAppropriatenessInfo>> {
+    let Some(info) = response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("appropriatenessInfo"))
+    else {
+        return Ok(None);
+    };
+    if info.is_null() {
+        return Ok(None);
+    }
+
+    let status = parse_legacy_appropriateness_status(
+        info.get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Trade response invalid: missing appropriateness result"))?,
+    )?;
+
+    Ok(Some(LegacyAppropriatenessInfo {
+        status,
+        appropriateness_id: info
+            .get("appropriatenessId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string),
+    }))
+}
+
+fn knockout_warning_enabled(response: &Value) -> bool {
+    response
+        .get("account")
+        .and_then(|v| v.get("brokerPortfolio"))
+        .and_then(|v| v.get("featureFlags"))
+        .and_then(|v| v.get("knockoutWarnings"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn parse_required_suitability_type(value: &str) -> Result<TradeSuitabilityType> {
+    match value {
+        "KNOCKOUT" => Ok(TradeSuitabilityType::Knockout),
+        "COMPLEX_INSTRUMENT" => Ok(TradeSuitabilityType::ComplexInstrument),
+        "ELTIF" => Ok(TradeSuitabilityType::Eltif),
+        "WEALTH" => Ok(TradeSuitabilityType::Wealth),
+        other => Err(anyhow!(
+            "Trade response invalid: unsupported suitability type '{}'",
+            other
+        )),
+    }
+}
+
+fn parse_action_when_unsuitable(value: &str) -> Result<TradeActionWhenUnsuitable> {
+    match value {
+        "PROCEED_TO_ORDER_FLOW" => Ok(TradeActionWhenUnsuitable::ProceedToOrderFlow),
+        "REOPEN_QUESTIONNAIRE" => Ok(TradeActionWhenUnsuitable::ReopenQuestionnaire),
+        other => Err(anyhow!(
+            "Trade response invalid: unsupported actionWhenUnsuitable '{}'",
+            other
+        )),
+    }
+}
+
+fn parse_suitability_status(value: &str) -> Result<TradeSuitabilityStatus> {
+    match value {
+        "SUITABLE" => Ok(TradeSuitabilityStatus::Suitable),
+        "UNSUITABLE" => Ok(TradeSuitabilityStatus::Unsuitable),
+        "NOT_EVALUATED" => Ok(TradeSuitabilityStatus::NotEvaluated),
+        "NOT_COMPLETED" => Ok(TradeSuitabilityStatus::NotCompleted),
+        other => Err(anyhow!(
+            "Trade response invalid: unsupported suitability result '{}'",
+            other
+        )),
+    }
+}
+
+fn parse_legacy_appropriateness_status(value: &str) -> Result<TradeSuitabilityStatus> {
+    match value {
+        "APPROPRIATE" => Ok(TradeSuitabilityStatus::Suitable),
+        "NOT_APPROPRIATE" => Ok(TradeSuitabilityStatus::Unsuitable),
+        "NOT_EVALUATED" => Ok(TradeSuitabilityStatus::NotEvaluated),
+        "NOT_COMPLETED" => Ok(TradeSuitabilityStatus::NotCompleted),
+        "NOT_REQUIRED" => Ok(TradeSuitabilityStatus::NotRequired),
+        other => Err(anyhow!(
+            "Trade response invalid: unsupported appropriateness result '{}'",
+            other
+        )),
     }
 }
 
@@ -1641,12 +2183,471 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_suitability_is_fail_closed_for_unknown_statuses() {
-        let review = evaluate_suitability(Some("BACKEND_NEW_STATUS"));
+    fn evaluate_trade_compliance_blocks_knockout_when_status_missing() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "REOPEN_QUESTIONNAIRE"
+                        }
+                    }
+                }
+            }
+        });
 
-        assert_eq!(review.status, "BACKEND_NEW_STATUS");
-        assert!(!review.is_suitable);
-        assert!(review.requires_accept_unsuitable);
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("knockout compliance should parse");
+
+        assert_eq!(
+            decision.source_kind,
+            TradeComplianceSourceKind::SuitabilityService
+        );
+        assert_eq!(
+            decision.suitability_type,
+            Some(TradeSuitabilityType::Knockout)
+        );
+        assert_eq!(decision.status, TradeSuitabilityStatus::NotEvaluated);
+        assert!(decision.questionnaire_required);
+        assert_eq!(decision.questionnaire_reason, Some("not_evaluated"));
+        assert_eq!(decision.warning.kind, TradeWarningKind::None);
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_requires_questionnaire_when_status_not_completed() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "KNOCKOUT",
+                            "result": "NOT_COMPLETED",
+                            "suitabilityId": Value::Null
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "REOPEN_QUESTIONNAIRE"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("knockout compliance should parse");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::NotCompleted);
+        assert!(decision.questionnaire_required);
+        assert_eq!(decision.questionnaire_reason, Some("not_completed"));
+        assert!(!decision.requires_accept_unsuitable);
+        assert_eq!(decision.submission_appropriateness_id, None);
+        assert_eq!(decision.warning.kind, TradeWarningKind::None);
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_reopens_questionnaire_for_unsuitable_knockout() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "KNOCKOUT",
+                            "result": "UNSUITABLE",
+                            "suitabilityId": "suit-ko-reopen-1"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "REOPEN_QUESTIONNAIRE"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("knockout compliance should parse");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(decision.questionnaire_required);
+        assert_eq!(
+            decision.questionnaire_reason,
+            Some("unsuitable_reopens_questionnaire")
+        );
+        assert!(!decision.requires_accept_unsuitable);
+        assert_eq!(decision.submission_appropriateness_id, None);
+        assert_eq!(decision.warning.kind, TradeWarningKind::None);
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_adds_knockout_warning_when_proceedable_and_flag_enabled() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "KNOCKOUT",
+                            "result": "SUITABLE",
+                            "suitabilityId": "suit-ko-1"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("knockout compliance should parse");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Suitable);
+        assert!(!decision.questionnaire_required);
+        assert!(!decision.requires_accept_unsuitable);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("suit-ko-1")
+        );
+        assert_eq!(decision.warning.kind, TradeWarningKind::KnockoutRiskWarning);
+        assert_eq!(
+            decision.warning.title.as_deref(),
+            Some(KNOCKOUT_RISK_WARNING_TITLE)
+        );
+        assert_eq!(
+            decision.warning.body.as_deref(),
+            Some(KNOCKOUT_RISK_WARNING_BODY)
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_suppresses_knockout_warning_when_flag_disabled() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "KNOCKOUT",
+                            "result": "UNSUITABLE",
+                            "suitabilityId": "suit-ko-2"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": false
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("knockout compliance should parse");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(!decision.questionnaire_required);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("suit-ko-2")
+        );
+        assert_eq!(decision.warning.kind, TradeWarningKind::None);
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_requires_acceptance_for_complex_unsuitable_proceed_flow() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": {
+                        "appropriatenessId": "legacy-1",
+                        "result": "APPROPRIATE"
+                    },
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "result": "UNSUITABLE",
+                            "suitabilityId": "suit-ci-1"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("complex suitability should parse");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(!decision.questionnaire_required);
+        assert!(decision.requires_accept_unsuitable);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("suit-ci-1")
+        );
+        assert_eq!(
+            decision.warning.kind,
+            TradeWarningKind::LegacyAppropriatenessWarning
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_ignores_unrelated_eltif_and_wealth_statuses() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "ELTIF",
+                            "result": "SUITABLE",
+                            "suitabilityId": "suit-eltif-1"
+                        },
+                        {
+                            "suitabilityType": "WEALTH",
+                            "result": "SUITABLE",
+                            "suitabilityId": "suit-wealth-1"
+                        },
+                        {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "result": "UNSUITABLE",
+                            "suitabilityId": "suit-ci-2"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("complex suitability should ignore unrelated status rows");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(decision.requires_accept_unsuitable);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("suit-ci-2")
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_ignores_unknown_unrelated_suitability_statuses() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "FUTURE_UNRELATED_TYPE",
+                            "result": "SUITABLE",
+                            "suitabilityId": "suit-future-1"
+                        },
+                        {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "result": "UNSUITABLE",
+                            "suitabilityId": "suit-ci-3"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("unknown unrelated status rows should be ignored");
+
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(decision.requires_accept_unsuitable);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("suit-ci-3")
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_rejects_eltif_required_suitability_for_trade_flow() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "ELTIF",
+                            "result": "SUITABLE",
+                            "suitabilityId": "suit-eltif-2"
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "ELTIF",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect_err("eltif suitability should fail closed for broker trade");
+
+        assert!(
+            err.to_string()
+                .contains("UNSUPPORTED_TRADE_SUITABILITY_TYPE: ELTIF")
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_falls_back_to_legacy_appropriateness_when_statuses_are_absent() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": {
+                        "appropriatenessId": "legacy-2",
+                        "result": "NOT_APPROPRIATE"
+                    },
+                    "suitabilityStatuses": [],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": Value::Null
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect("legacy fallback should parse");
+
+        assert_eq!(
+            decision.source_kind,
+            TradeComplianceSourceKind::LegacyAppropriatenessFallback
+        );
+        assert_eq!(
+            decision.suitability_type,
+            Some(TradeSuitabilityType::LegacyFallback)
+        );
+        assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
+        assert!(decision.requires_accept_unsuitable);
+        assert_eq!(
+            decision.submission_appropriateness_id.as_deref(),
+            Some("legacy-2")
+        );
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_ignores_legacy_appropriateness_for_sell_flow() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": {
+                        "appropriatenessId": "legacy-sell-1",
+                        "result": "NOT_APPROPRIATE"
+                    },
+                    "suitabilityStatuses": [],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "COMPLEX_INSTRUMENT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let decision = evaluate_trade_compliance(&response, TradeSide::Sell, true)
+            .expect("sell compliance should ignore suitability and appropriateness");
+
+        assert_eq!(decision, TradeComplianceDecision::not_required());
+    }
+
+    #[test]
+    fn evaluate_trade_compliance_rejects_missing_proceedable_suitability_id() {
+        let response = json!({
+            "account": {
+                "brokerPortfolio": {
+                    "appropriatenessInfo": Value::Null,
+                    "suitabilityStatuses": [
+                        {
+                            "suitabilityType": "KNOCKOUT",
+                            "result": "SUITABLE",
+                            "suitabilityId": Value::Null
+                        }
+                    ],
+                    "featureFlags": {
+                        "knockoutWarnings": true
+                    },
+                    "security": {
+                        "requiredSuitability": {
+                            "suitabilityType": "KNOCKOUT",
+                            "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = evaluate_trade_compliance(&response, TradeSide::Buy, true)
+            .expect_err("missing suitability id should fail closed");
+
+        assert!(err.to_string().contains("SUITABILITY_ID_MISSING"));
     }
 
     #[test]

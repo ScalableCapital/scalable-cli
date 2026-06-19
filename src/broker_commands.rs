@@ -7,6 +7,7 @@ use crate::broker_context::{
 };
 use crate::broker_query_execution::{
     execute_broker_analytics as execute_broker_analytics_query,
+    execute_broker_cash_breakdown as execute_broker_cash_breakdown_query,
     execute_broker_derivatives_search as execute_broker_derivatives_search_query,
     execute_broker_holdings as execute_broker_holdings_query,
     execute_broker_overview as execute_broker_overview_query,
@@ -232,6 +233,18 @@ pub(crate) fn run_broker_command_human(
             let payload = execute_broker_analytics(analytics_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
         }
+        BrokerCommand::CashBreakdown(cash_breakdown_args) => {
+            let compact = cash_breakdown_args.json;
+            let payload =
+                execute_broker_cash_breakdown(cash_breakdown_args, config, session_manager)?;
+            if compact {
+                Ok(HumanBrokerOutput::Json(payload, true))
+            } else {
+                Ok(HumanBrokerOutput::Text(render_broker_cash_breakdown_text(
+                    &payload,
+                )))
+            }
+        }
         BrokerCommand::Transactions(transactions_args) => {
             let compact = transactions_args.json;
             let payload = execute_broker_transactions(transactions_args, config, session_manager)?;
@@ -450,6 +463,9 @@ pub(crate) fn run_broker_command_machine(
         },
         BrokerCommand::Overview(args) => execute_broker_overview(args, config, session_manager),
         BrokerCommand::Analytics(args) => execute_broker_analytics(args, config, session_manager),
+        BrokerCommand::CashBreakdown(args) => {
+            execute_broker_cash_breakdown(args, config, session_manager)
+        }
         BrokerCommand::Transactions(args) => {
             execute_broker_transactions(args, config, session_manager)
         }
@@ -599,6 +615,46 @@ pub(crate) fn execute_broker_holdings(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     execute_broker_holdings_query(args, config, session_manager)
+}
+
+fn render_broker_cash_breakdown_text(payload: &Value) -> Vec<String> {
+    let result = payload.get("result").unwrap_or(payload);
+
+    vec![
+        format!(
+            "cash_balance: {}",
+            display_value(result.get("cash_balance"))
+        ),
+        format!(
+            "buying_power: {}",
+            display_value(result.get("buying_power"))
+        ),
+        format!(
+            "buying_power_without_credit: {}",
+            display_value(result.get("buying_power_without_credit"))
+        ),
+        format!(
+            "available_credit_line: {}",
+            display_value(result.get("available_credit_line"))
+        ),
+        format!("loaned: {}", display_value(result.get("loaned"))),
+        format!(
+            "pending_buy_orders_amount: {}",
+            display_value(result.get("pending_buy_orders_amount"))
+        ),
+        format!(
+            "possible_taxes: {}",
+            display_value(result.get("possible_taxes"))
+        ),
+        format!(
+            "derivatives_buying_power: {}",
+            display_value(result.get("derivatives_buying_power"))
+        ),
+        format!(
+            "available_for_derivatives: {}",
+            display_value(result.get("available_for_derivatives"))
+        ),
+    ]
 }
 
 fn render_broker_transaction_details_text(payload: &Value) -> Vec<String> {
@@ -1514,13 +1570,12 @@ fn find_crypto_price_alert_match(
     }))
 }
 
-#[allow(dead_code)]
-pub(crate) fn execute_broker_limits(
-    args: crate::cli::BrokerLimitsArgs,
+pub(crate) fn execute_broker_cash_breakdown(
+    args: crate::cli::BrokerCashBreakdownArgs,
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
-    crate::broker_query_execution::execute_broker_limits(args, config, session_manager)
+    execute_broker_cash_breakdown_query(args, config, session_manager)
 }
 
 pub(crate) fn execute_broker_savings_plans(
@@ -2663,6 +2718,40 @@ mod tests {
         }
 
         cancel_mock.assert();
+    }
+
+    #[test]
+    fn render_broker_cash_breakdown_text_uses_public_field_names() {
+        let payload = json!({
+            "result": {
+                "cash_balance": "10",
+                "buying_power": "110",
+                "buying_power_without_credit": "120",
+                "available_credit_line": "20",
+                "loaned": "30",
+                "pending_buy_orders_amount": "40",
+                "possible_taxes": "90",
+                "derivatives_buying_power": "130",
+                "available_for_derivatives": "160"
+            }
+        });
+
+        let lines = render_broker_cash_breakdown_text(&payload);
+
+        assert_eq!(
+            lines,
+            vec![
+                "cash_balance: 10",
+                "buying_power: 110",
+                "buying_power_without_credit: 120",
+                "available_credit_line: 20",
+                "loaned: 30",
+                "pending_buy_orders_amount: 40",
+                "possible_taxes: 90",
+                "derivatives_buying_power: 130",
+                "available_for_derivatives: 160",
+            ]
+        );
     }
 
     #[test]

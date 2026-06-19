@@ -158,7 +158,22 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(
         required_leaf_paths
             .iter()
+            .any(|item| item.as_str() == Some("/result/suitability/source"))
+    );
+    assert!(
+        required_leaf_paths
+            .iter()
             .any(|item| item.as_str() == Some("/result/suitability/status"))
+    );
+    assert!(
+        required_leaf_paths
+            .iter()
+            .any(|item| item.as_str() == Some("/result/suitability/questionnaire_required"))
+    );
+    assert!(
+        !required_leaf_paths
+            .iter()
+            .any(|item| { item.as_str() == Some("/result/appropriateness/status") })
     );
     assert!(
         required_leaf_paths

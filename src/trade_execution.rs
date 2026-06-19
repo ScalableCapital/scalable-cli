@@ -9,18 +9,16 @@ use crate::config::{AppConfig, TargetEnv};
 use crate::graphql::{LOCAL_READ_ONLY_ERROR_PREFIX, execute_graphql, execute_graphql_with_headers};
 use crate::session::SessionManager;
 use crate::trade::{
-    PlaceOrderFields, SecurityTick, SingleExAnteFields, TRADE_APPROPRIATENESS_RESULT_QUERY,
-    TRADE_APPROPRIATENESS_WARNING_QUERY, TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION,
-    TRADE_SECURITY_TICK_QUERY, TRADE_SINGLE_EX_ANTE_COSTS_QUERY, TRADE_TRADABILITY_QUERY,
-    TradeSide, TradeTradabilityGate, evaluate_appropriateness_gate, evaluate_suitability,
-    extract_single_trade_ex_ante_costs, market_buy_shares_from_amount,
-    parse_appropriateness_warning, parse_cancel_order_result, parse_place_order_result,
-    parse_security_issuer_document_links, parse_security_tick, parse_tradability_gate,
-    required_non_empty, round_estimated_order_volume_for_ex_ante,
-    trade_appropriateness_result_variables, trade_appropriateness_warning_variables,
-    trade_cancel_order_variables, trade_estimated_order_price, trade_place_order_variables,
-    trade_security_tick_variables, trade_side_quote_price, trade_single_ex_ante_variables,
-    trade_tradability_variables,
+    PlaceOrderFields, SecurityTick, SingleExAnteFields, TRADE_APPROPRIATENESS_WARNING_QUERY,
+    TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION, TRADE_SECURITY_TICK_QUERY,
+    TRADE_SINGLE_EX_ANTE_COSTS_QUERY, TRADE_TRADABILITY_QUERY, TradeComplianceDecision, TradeSide,
+    TradeTradabilityGate, evaluate_trade_compliance, extract_single_trade_ex_ante_costs,
+    market_buy_shares_from_amount, parse_appropriateness_warning, parse_cancel_order_result,
+    parse_place_order_result, parse_security_issuer_document_links, parse_security_tick,
+    parse_tradability_gate, required_non_empty, round_estimated_order_volume_for_ex_ante,
+    trade_appropriateness_warning_variables, trade_cancel_order_variables,
+    trade_estimated_order_price, trade_place_order_variables, trade_security_tick_variables,
+    trade_side_quote_price, trade_single_ex_ante_variables, trade_tradability_variables,
 };
 use crate::trade_attempt::{
     load_recent_submitted_attempt, mark_failed as mark_trade_attempt_failed,
@@ -86,7 +84,7 @@ pub(crate) struct PreparedTrade {
     pub(crate) portfolio_source: &'static str,
     pub(crate) intent: TradeIntent,
     pub(crate) tradability_gate: TradeTradabilityGate,
-    pub(crate) appropriateness_json: Value,
+    pub(crate) compliance_decision: TradeComplianceDecision,
     pub(crate) warning_json: Value,
     pub(crate) warning_version_for_order: Option<String>,
     pub(crate) appropriateness_id_for_order: Option<String>,
@@ -459,7 +457,13 @@ fn execute_trade_phase2(
 
     ensure_phase2_submission_requirements(&prepared, &phase2, &stored)?;
 
-    let order_submission = submit_order(&prepared, config, session_manager)?;
+    let order_submission = submit_order(
+        &prepared,
+        &stored.confirmation_id,
+        stored.expires_at_epoch,
+        config,
+        session_manager,
+    )?;
     mark_confirmation_consumed(&phase2.confirmation_id, current_epoch_seconds())
         .context("Failed to mark confirmation token as consumed")?;
 
@@ -773,7 +777,7 @@ fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Pha
 
     Ok(Phase2Input {
         confirmation_id,
-        accept_unsuitable: args.accept_unsuitable,
+        accept_unsuitable: false,
         isin,
         amount: None,
         amount_value: None,
@@ -892,60 +896,37 @@ fn prepare_trade(
         );
     }
 
-    let mut appropriateness_json = json!({
-        "status": "NOT_REQUIRED",
-        "requires_warning_ack": false,
-        "requires_questionnaire": false,
-        "passed": true,
-        "appropriateness_id": null
-    });
+    let mut compliance_decision = TradeComplianceDecision::not_required();
     let mut warning_json = Value::Null;
     let mut warning_version_for_order = None::<String>;
     let mut appropriateness_id_for_order = None::<String>;
 
-    if tradability_gate.requires_appropriateness {
-        let appropriateness_variables =
-            trade_appropriateness_result_variables(&ids.account_id, &ids.portfolio_id)?;
-        let appropriateness_response = execute_with_refresh_retry(
-            session_manager,
-            env,
-            &env_cfg,
-            &mut session,
-            dpop_options,
-            |token| {
-                execute_graphql(
-                    &env_cfg.graphql_url,
-                    token,
-                    TRADE_APPROPRIATENESS_RESULT_QUERY,
-                    &appropriateness_variables,
-                    Some("getAppropriatenessResult"),
-                    access_context,
-                    dpop_options,
-                )
-            },
+    if intent.side.is_buy() {
+        compliance_decision = evaluate_trade_compliance(
+            &tradability_response,
+            intent.side,
+            tradability_gate.requires_appropriateness,
         )?;
-        let appropriateness_gate = evaluate_appropriateness_gate(&appropriateness_response, true)?;
-        appropriateness_json = json!({
-            "status": appropriateness_gate.status,
-            "requires_warning_ack": appropriateness_gate.requires_warning_ack,
-            "requires_questionnaire": appropriateness_gate.requires_questionnaire,
-            "passed": appropriateness_gate.passed,
-            "appropriateness_id": appropriateness_gate.appropriateness_id,
-        });
-        appropriateness_id_for_order = appropriateness_gate.appropriateness_id.clone();
+        appropriateness_id_for_order = compliance_decision.submission_appropriateness_id.clone();
 
-        if appropriateness_gate.requires_questionnaire {
+        if compliance_decision.questionnaire_required {
+            let suitability_type = questionnaire_name_for_error(&compliance_decision);
+            let status = compliance_decision.status.as_str();
+            let reason = compliance_decision
+                .questionnaire_reason
+                .unwrap_or("unknown");
             bail!(
-                "APPROPRIATENESS_REQUIRED: no valid appropriateness result available. Complete the questionnaire before trading."
-            );
-        }
-        if appropriateness_id_for_order.is_none() {
-            bail!(
-                "APPROPRIATENESS_REQUIRED: appropriateness id is missing for appropriateness-required trade."
+                "SUITABILITY_QUESTIONNAIRE_REQUIRED: complete the required {} questionnaire outside the CLI before trading (status={}, reason={})",
+                suitability_type,
+                status,
+                reason,
             );
         }
 
-        if appropriateness_gate.requires_warning_ack {
+        if matches!(
+            compliance_decision.warning.kind,
+            crate::trade::TradeWarningKind::LegacyAppropriatenessWarning
+        ) {
             let warning_variables = trade_appropriateness_warning_variables(&intent.locale)?;
             let warning_response = execute_with_refresh_retry(
                 session_manager,
@@ -968,11 +949,18 @@ fn prepare_trade(
             let warning = parse_appropriateness_warning(&warning_response)?;
             warning_version_for_order = Some(warning.version.clone());
             warning_json = json!({
-                "version": warning.version,
+                "kind": compliance_decision.warning.kind.as_str(),
+                "title": Value::Null,
+                "body": warning.prompt_text,
                 "locale": warning.locale,
-                "prompt_text": warning.prompt_text,
+                "version": warning.version,
                 "acknowledgement_text": warning.acknowledgement_text,
             });
+        } else if !matches!(
+            compliance_decision.warning.kind,
+            crate::trade::TradeWarningKind::None
+        ) {
+            warning_json = build_warning_payload(&compliance_decision);
         }
     }
 
@@ -1101,8 +1089,7 @@ fn prepare_trade(
             "requires_appropriateness": tradability_gate.requires_appropriateness,
             "tradable": tradability_gate.tradable,
         },
-        "appropriateness": &appropriateness_json,
-        "suitability": build_suitability_payload(&appropriateness_json),
+        "suitability": build_suitability_payload(&compliance_decision),
         "warning": &warning_json,
         "warning_version": &warning_version_for_order,
         "ex_ante_costs": &ex_ante_costs,
@@ -1130,7 +1117,7 @@ fn prepare_trade(
         portfolio_source: ids.portfolio_source,
         intent: intent.clone(),
         tradability_gate,
-        appropriateness_json,
+        compliance_decision,
         warning_json,
         warning_version_for_order,
         appropriateness_id_for_order,
@@ -1238,6 +1225,8 @@ fn pricing_basis_display_name(basis: &str) -> &'static str {
 
 fn submit_order(
     prepared: &PreparedTrade,
+    confirmation_id: &str,
+    confirmation_expires_at_epoch: i64,
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
@@ -1353,7 +1342,9 @@ fn submit_order(
             }
             Err(anyhow!(format_order_submission_failed_message(
                 &error_message,
-                &attempt.idempotency_key
+                &attempt.idempotency_key,
+                confirmation_id,
+                confirmation_expires_at_epoch,
             )))
         }
     }
@@ -1363,11 +1354,60 @@ fn should_passthrough_order_submission_error(error_message: &str) -> bool {
     error_message.contains(LOCAL_READ_ONLY_ERROR_PREFIX)
 }
 
-fn format_order_submission_failed_message(error_message: &str, idempotency_key: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderSubmissionFailureKind {
+    BackendResponse,
+    AmbiguousOutcome,
+}
+
+fn classify_order_submission_failure(error_message: &str) -> OrderSubmissionFailureKind {
+    let lower = error_message.to_lowercase();
+    if parse_graphql_http_error_status(error_message).is_some() {
+        return OrderSubmissionFailureKind::AmbiguousOutcome;
+    }
+
+    if error_message.contains("GraphQL returned errors") {
+        return OrderSubmissionFailureKind::BackendResponse;
+    }
+
+    if error_message.contains("Failed to call GraphQL endpoint")
+        || error_message.contains("Failed to parse GraphQL JSON response")
+        || error_message.contains("GraphQL response missing data")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection")
+    {
+        return OrderSubmissionFailureKind::AmbiguousOutcome;
+    }
+
+    OrderSubmissionFailureKind::AmbiguousOutcome
+}
+
+fn parse_graphql_http_error_status(error_message: &str) -> Option<u16> {
+    error_message
+        .strip_prefix("GraphQL HTTP error ")
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .and_then(|status| status.parse::<u16>().ok())
+}
+
+fn format_order_submission_failed_message(
+    error_message: &str,
+    idempotency_key: &str,
+    confirmation_id: &str,
+    confirmation_expires_at_epoch: i64,
+) -> String {
     let error_message = error_message.trim_end_matches(['.', '!', '?']);
-    format!(
-        "ORDER_SUBMISSION_FAILED: {error_message}. Retry command to reuse idempotency key {idempotency_key}."
-    )
+    let retry_guidance = format!(
+        "confirmation id {confirmation_id} remains valid until epoch {confirmation_expires_at_epoch}; the same idempotency key {idempotency_key} will be reused"
+    );
+    match classify_order_submission_failure(error_message) {
+        OrderSubmissionFailureKind::BackendResponse => format!(
+            "ORDER_SUBMISSION_FAILED: {error_message}. The backend responded with an error, so treat this submit as failed. Do not blindly retry. If you intentionally retry this exact phase-2 submit, reuse the same confirmation while {retry_guidance}. If phase 2 then fails with a confirmation error, rerun phase 1."
+        ),
+        OrderSubmissionFailureKind::AmbiguousOutcome => format!(
+            "ORDER_SUBMISSION_FAILED: {error_message}. The submit outcome may be ambiguous. Check transactions or order status first. If the order is not present, retry this exact phase-2 submit while {retry_guidance}."
+        ),
+    }
 }
 
 fn required_flag_value<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str> {
@@ -1683,24 +1723,46 @@ fn build_result_payload(prepared: &PreparedTrade, order_submission: Option<Value
     build_result_payload_from_module(prepared, order_submission)
 }
 
-fn build_suitability_payload(appropriateness: &Value) -> Value {
-    let review = evaluate_suitability(appropriateness.get("status").and_then(Value::as_str));
+fn build_warning_payload(decision: &TradeComplianceDecision) -> Value {
+    if matches!(decision.warning.kind, crate::trade::TradeWarningKind::None) {
+        return Value::Null;
+    }
+
     json!({
-        "status": review.status,
-        "is_suitable": review.is_suitable,
-        "requires_accept_unsuitable": review.requires_accept_unsuitable,
-        "accept_flag": review.requires_accept_unsuitable.then_some("--accept-unsuitable"),
+        "kind": decision.warning.kind.as_str(),
+        "title": decision.warning.title,
+        "body": decision.warning.body,
+        "locale": decision.warning.locale,
+        "version": decision.warning.version_for_order,
+        "acknowledgement_text": decision.warning.acknowledgement_text,
     })
 }
 
+fn build_suitability_payload(decision: &TradeComplianceDecision) -> Value {
+    json!({
+        "source": decision.source_kind.as_str(),
+        "type": decision.suitability_type.map(|value| value.as_str()),
+        "status": decision.status.as_str(),
+        "action_when_unsuitable": decision.action_when_unsuitable.map(|value| value.as_str()),
+        "questionnaire_required": decision.questionnaire_required,
+        "questionnaire_reason": decision.questionnaire_reason,
+        "requires_accept_unsuitable": decision.requires_accept_unsuitable,
+        "accept_flag": decision.requires_accept_unsuitable.then_some("--accept-unsuitable"),
+    })
+}
+
+fn questionnaire_name_for_error(decision: &TradeComplianceDecision) -> &'static str {
+    match decision.source_kind {
+        crate::trade::TradeComplianceSourceKind::LegacyAppropriatenessFallback => "appropriateness",
+        _ => decision
+            .suitability_type
+            .map(|kind| kind.as_str())
+            .unwrap_or("UNKNOWN"),
+    }
+}
+
 fn phase1_requires_accept_unsuitable(prepared: &PreparedTrade) -> bool {
-    evaluate_suitability(
-        prepared
-            .appropriateness_json
-            .get("status")
-            .and_then(Value::as_str),
-    )
-    .requires_accept_unsuitable
+    prepared.intent.side.is_buy() && prepared.compliance_decision.requires_accept_unsuitable
 }
 
 fn phase1_required_json_paths(side: TradeSide) -> Vec<&'static str> {
@@ -1866,13 +1928,17 @@ mod tests {
 
     #[test]
     fn order_submission_failed_message_avoids_double_periods() {
-        assert_eq!(
-            format_order_submission_failed_message(
-                "local read-only mode blocks write operation 'placeOrder'. Re-login without --local-read-only to perform write operations.",
-                "4251d813-d33b-49c9-9a9c-f93fca0b501b",
-            ),
-            "ORDER_SUBMISSION_FAILED: local read-only mode blocks write operation 'placeOrder'. Re-login without --local-read-only to perform write operations. Retry command to reuse idempotency key 4251d813-d33b-49c9-9a9c-f93fca0b501b."
+        let message = format_order_submission_failed_message(
+            "GraphQL returned errors for placeOrder (code: UNEXPECTED).",
+            "4251d813-d33b-49c9-9a9c-f93fca0b501b",
+            "scb1_test",
+            1_777_777_777,
         );
+
+        assert!(!message.contains(".."));
+        assert!(message.starts_with(
+            "ORDER_SUBMISSION_FAILED: GraphQL returned errors for placeOrder (code: UNEXPECTED)."
+        ));
     }
 
     #[test]
@@ -1884,6 +1950,76 @@ mod tests {
             "LOCAL_READ_ONLY: local read-only mode blocks write operation 'placeOrder'."
         ));
         assert!(!should_passthrough_order_submission_error("timeout"));
+    }
+
+    #[test]
+    fn order_submission_failed_message_treats_graphql_errors_as_backend_responses() {
+        let message = format_order_submission_failed_message(
+            "GraphQL returned errors for placeOrder (code: UNEXPECTED).",
+            "4251d813-d33b-49c9-9a9c-f93fca0b501b",
+            "scb1_test",
+            1_777_777_777,
+        );
+        assert!(message.contains("The backend responded with an error"));
+        assert!(message.contains("Do not blindly retry"));
+        assert!(message.contains("If phase 2 then fails with a confirmation error, rerun phase 1"));
+        assert!(message.contains("confirmation id scb1_test remains valid until epoch 1777777777"));
+    }
+
+    #[test]
+    fn order_submission_failed_message_treats_transport_timeouts_as_ambiguous() {
+        let message = format_order_submission_failed_message(
+            "Failed to call GraphQL endpoint: operation timed out.",
+            "4251d813-d33b-49c9-9a9c-f93fca0b501b",
+            "scb1_test",
+            1_777_777_777,
+        );
+        assert!(message.contains("The submit outcome may be ambiguous"));
+        assert!(message.contains("Check transactions or order status first"));
+    }
+
+    #[test]
+    fn classify_order_submission_failure_detects_backend_response_errors() {
+        assert_eq!(
+            classify_order_submission_failure(
+                "GraphQL returned errors for placeOrder (code: UNEXPECTED)"
+            ),
+            OrderSubmissionFailureKind::BackendResponse
+        );
+    }
+
+    #[test]
+    fn classify_order_submission_failure_detects_ambiguous_outcomes() {
+        assert_eq!(
+            classify_order_submission_failure("GraphQL HTTP error 400 during placeOrder"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure("GraphQL HTTP error 503 during placeOrder"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure("GraphQL HTTP error during placeOrder"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure(
+                "Failed to call GraphQL endpoint: operation timed out"
+            ),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure("Failed to parse GraphQL JSON response"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure("GraphQL response missing data"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
+        assert_eq!(
+            classify_order_submission_failure("connection reset by peer"),
+            OrderSubmissionFailureKind::AmbiguousOutcome
+        );
     }
 
     fn sample_session() -> Session {
@@ -1972,25 +2108,17 @@ mod tests {
                 "requires_appropriateness": false,
                 "tradable": true
             },
-            "appropriateness": {
-                "status": "NOT_REQUIRED",
-                "requires_warning_ack": false,
-                "requires_questionnaire": false,
-                "passed": true,
-                "appropriateness_id": Value::Null
-            },
             "suitability": {
+                "source": "not_required",
+                "type": Value::Null,
                 "status": "NOT_REQUIRED",
-                "is_suitable": true,
+                "action_when_unsuitable": Value::Null,
+                "questionnaire_required": false,
+                "questionnaire_reason": Value::Null,
                 "requires_accept_unsuitable": false,
                 "accept_flag": Value::Null
             },
-            "warning": {
-                "version": "v1",
-                "locale": "en_DE",
-                "prompt_text": "Prompt",
-                "acknowledgement_text": "Ack"
-            },
+            "warning": Value::Null,
             "price_warnings": {
                 "items": []
             },
@@ -2080,25 +2208,17 @@ mod tests {
                 "tradable": true,
                 "selected_venue_sellable": 9.0
             },
-            "appropriateness": {
-                "status": "NOT_REQUIRED",
-                "requires_warning_ack": false,
-                "requires_questionnaire": false,
-                "passed": true,
-                "appropriateness_id": Value::Null
-            },
             "suitability": {
+                "source": "not_required",
+                "type": Value::Null,
                 "status": "NOT_REQUIRED",
-                "is_suitable": true,
+                "action_when_unsuitable": Value::Null,
+                "questionnaire_required": false,
+                "questionnaire_reason": Value::Null,
                 "requires_accept_unsuitable": false,
                 "accept_flag": Value::Null
             },
-            "warning": {
-                "version": "v1",
-                "locale": "en_DE",
-                "prompt_text": "Prompt",
-                "acknowledgement_text": "Ack"
-            },
+            "warning": Value::Null,
             "price_warnings": {
                 "items": []
             },
@@ -2708,8 +2828,12 @@ mod tests {
     fn render_trade_buy_text_shows_unsuitable_acknowledgement_section() {
         let mut result = sample_result_payload();
         result["suitability"] = json!({
-            "status": "NOT_APPROPRIATE",
-            "is_suitable": false,
+            "source": "legacy_appropriateness_fallback",
+            "type": "LEGACY_FALLBACK",
+            "status": "UNSUITABLE",
+            "action_when_unsuitable": "PROCEED_TO_ORDER_FLOW",
+            "questionnaire_required": false,
+            "questionnaire_reason": Value::Null,
             "requires_accept_unsuitable": true,
             "accept_flag": "--accept-unsuitable"
         });
@@ -2728,12 +2852,67 @@ mod tests {
             .position(|line| line == "Suitability")
             .expect("suitability block");
 
-        assert!(lines[suitability_idx + 1] == "status: NOT_APPROPRIATE");
+        assert!(lines[suitability_idx + 1] == "source: legacy_appropriateness_fallback");
+        assert!(lines[suitability_idx + 3] == "status: UNSUITABLE");
         assert!(
             lines
                 .iter()
                 .any(|line| line == "phase_2_acknowledgement_flag: --accept-unsuitable")
         );
+    }
+
+    #[test]
+    fn render_trade_buy_text_shows_knockout_warning_section() {
+        let mut result = sample_result_payload();
+        result["suitability"] = json!({
+            "source": "suitability_service",
+            "type": "KNOCKOUT",
+            "status": "SUITABLE",
+            "action_when_unsuitable": "PROCEED_TO_ORDER_FLOW",
+            "questionnaire_required": false,
+            "questionnaire_reason": Value::Null,
+            "requires_accept_unsuitable": false,
+            "accept_flag": Value::Null
+        });
+        result["warning"] = json!({
+            "kind": "knockout_risk_warning",
+            "title": "Risk warning",
+            "body": "On average, 7 out of 10 retail investors incur losses when trading turbo certificates. Turbo certificates are high-risk products and are not suitable for long-term investment strategies.",
+            "locale": "en_DE",
+            "version": Value::Null,
+            "acknowledgement_text": Value::Null
+        });
+        let payload = json!({
+            "result": result,
+            "confirmation": sample_confirmation_payload(),
+            "compliance": {
+                "instruction": "Present values before phase 2."
+            },
+            "next_step": "confirm_with_id"
+        });
+
+        let lines = render_trade_buy_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "Warning"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "kind: knockout_risk_warning")
+        );
+        assert!(lines.iter().any(|line| line == "title: Risk warning"));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("body: On average, 7 out of 10 retail investors incur losses")
+        }));
+    }
+
+    #[test]
+    fn questionnaire_name_for_error_uses_appropriateness_for_legacy_fallback() {
+        let mut decision = crate::trade::TradeComplianceDecision::not_required();
+        decision.source_kind =
+            crate::trade::TradeComplianceSourceKind::LegacyAppropriatenessFallback;
+        decision.suitability_type = Some(crate::trade::TradeSuitabilityType::LegacyFallback);
+
+        assert_eq!(questionnaire_name_for_error(&decision), "appropriateness");
     }
 
     #[test]
@@ -2845,17 +3024,13 @@ mod tests {
                 selected_venue_unavailability_reason: None,
                 selected_venue_sellable: None,
             },
-            appropriateness_json: json!({
-                "status": "NOT_REQUIRED",
-                "requires_warning_ack": false,
-                "requires_questionnaire": false,
-                "passed": true,
-                "appropriateness_id": Value::Null
-            }),
+            compliance_decision: crate::trade::TradeComplianceDecision::not_required(),
             warning_json: json!({
-                "version": "v1",
+                "kind": "legacy_appropriateness_warning",
+                "title": Value::Null,
+                "body": "Prompt",
                 "locale": "en_DE",
-                "prompt_text": "Prompt",
+                "version": "v1",
                 "acknowledgement_text": "Ack"
             }),
             warning_version_for_order: Some("v1".to_string()),
@@ -3176,7 +3351,8 @@ mod tests {
         let mut prepared = sample_prepared_trade_for_phase2_validation();
         let stored = sample_trade_confirmation_for_phase2_validation(&prepared);
 
-        prepared.appropriateness_json["status"] = json!("NOT_APPROPRIATE");
+        prepared.compliance_decision.requires_accept_unsuitable = true;
+        prepared.compliance_decision.status = crate::trade::TradeSuitabilityStatus::Unsuitable;
 
         let err = ensure_phase2_snapshot_matches(&prepared, &stored)
             .expect_err("suitability drift should fail");

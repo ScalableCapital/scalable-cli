@@ -358,6 +358,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
         },
         BrokerCommand::Overview(args) => args.json,
         BrokerCommand::Analytics(args) => args.json,
+        BrokerCommand::CashBreakdown(args) => args.json,
         BrokerCommand::Transactions(args) => args.json,
         BrokerCommand::Transaction(transaction_args) => match &transaction_args.command {
             BrokerTransactionCommand::Details(args) => args.json,
@@ -562,6 +563,7 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
             "broker.context.select",
             "broker.overview",
             "broker.analytics",
+            "broker.cash-breakdown",
             "broker.transactions",
             "broker.transaction.details",
             "broker.holdings",
@@ -616,10 +618,10 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
             "broker.trade.sell": {
                 "mode": "two_phase_confirmation",
                 "phase_1": "Run trade sell args without --confirm to preview and receive confirmation id.",
-                "phase_2": "Repeat the same trade sell args with --confirm <id> to submit, and add --accept-unsuitable when phase 1 marks the instrument as not suitable.",
+                "phase_2": "Repeat the same trade sell args with --confirm <id> to submit.",
                 "preferred_output": "json",
                 "phase_1_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--accept-unsuitable] --json",
+                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -659,6 +661,7 @@ fn machine_command_name(command: &Commands) -> &'static str {
             },
             BrokerCommand::Overview(_) => "broker.overview",
             BrokerCommand::Analytics(_) => "broker.analytics",
+            BrokerCommand::CashBreakdown(_) => "broker.cash-breakdown",
             BrokerCommand::Transactions(_) => "broker.transactions",
             BrokerCommand::Transaction(transaction_args) => match &transaction_args.command {
                 BrokerTransactionCommand::Details(_) => "broker.transaction.details",

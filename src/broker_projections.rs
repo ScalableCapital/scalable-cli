@@ -751,43 +751,51 @@ fn empty_broker_crypto_price_alerts_projection(input: &BrokerInput) -> Value {
     })
 }
 
-pub fn project_broker_limits_response(input: &BrokerInput, response: &Value) -> Result<Value> {
+pub fn project_broker_cash_breakdown_response(
+    input: &BrokerInput,
+    response: &Value,
+) -> Result<Value> {
     let portfolio = response
         .get("account")
         .and_then(|v| v.get("brokerPortfolio"))
         .ok_or_else(|| anyhow!("Broker response invalid: missing account.brokerPortfolio"))?;
 
-    let deposit_limits = portfolio
-        .get("depositLimits")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let withdrawal_limits = portfolio
-        .get("withdrawalLimits")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let payments = portfolio.get("payments").cloned().unwrap_or(Value::Null);
+    let payments = portfolio.get("payments").unwrap_or(&Value::Null);
+    let buying_power = payments.get("buyingPower").unwrap_or(&Value::Null);
+    let derivatives_buying_power = payments
+        .get("derivativesBuyingPower")
+        .unwrap_or(&Value::Null);
 
     Ok(json!({
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
-        "deposit_limits": {
-            "min": deposit_limits.get("min").cloned().unwrap_or(Value::Null),
-            "max": deposit_limits.get("max").cloned().unwrap_or(Value::Null),
-        },
-        "withdrawal_limits": {
-            "min": withdrawal_limits.get("min").cloned().unwrap_or(Value::Null),
-            "max": withdrawal_limits.get("max").cloned().unwrap_or(Value::Null),
-            "max_excluding_credit": withdrawal_limits
-                .get("maxExcludingCredit")
-                .cloned()
-                .unwrap_or(Value::Null),
-        },
-        "buying_power": payments.get("buyingPower").cloned().unwrap_or(Value::Null),
-        "derivatives_buying_power": payments
-            .get("derivativesBuyingPower")
+        "cash_balance": buying_power.get("cashBalance").cloned().unwrap_or(Value::Null),
+        "buying_power": buying_power
+            .get("cashAvailableToInvest")
             .cloned()
             .unwrap_or(Value::Null),
-        "withdrawal_power": payments.get("withdrawalPower").cloned().unwrap_or(Value::Null),
+        "buying_power_without_credit": buying_power
+            .get("cashAvailableToInvestWithoutCredit")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "available_credit_line": buying_power.get("liveLimit").cloned().unwrap_or(Value::Null),
+        "loaned": buying_power.get("loaned").cloned().unwrap_or(Value::Null),
+        "pending_buy_orders_amount": buying_power
+            .get("pendingBuyOrdersAmount")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "possible_taxes": buying_power
+            .get("estimatedTaxes")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "derivatives_buying_power": derivatives_buying_power
+            .get("cashAvailableToInvest")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "available_for_derivatives": derivatives_buying_power
+            .get("cashAvailableForDerivatives")
+            .cloned()
+            .unwrap_or(Value::Null),
     }))
 }
 

@@ -439,6 +439,7 @@ pub fn login_with_device_code(
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<SecretWriteBackend> {
     validate_env_transport_security(env_cfg)?;
+    session_manager.validate_login_storage_ready()?;
     let client = build_blocking_client_https_only_with_timeout(RUNTIME_HTTP_TIMEOUT)?;
     let dpop = AuthDpopContext::from_runtime_options_for_login(dpop_options)?;
     let device = request_device_code(&client, env_cfg, &dpop)?;

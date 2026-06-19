@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
 
@@ -5,14 +6,59 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AppConfig, SessionBackendPreference, TargetEnv, config_dir_path, ensure_private_dir,
-    write_private_file_atomic,
+    AppConfig, SessionBackendPreference, TargetEnv, config_dir_path, config_file_display_path,
+    ensure_private_dir, write_private_file_atomic,
 };
 
 const KEYRING_SERVICE: &str = "scalable.capital:scalable-cli";
 const SESSION_ACCOUNT: &str = "session";
 const SESSION_FILENAME: &str = "session.json";
 const KEYRING_PROBE_KEY: &str = "__sc_storage_probe__";
+
+pub const SECRET_STORAGE_UNAVAILABLE_PREFIX: &str =
+    "OS secret storage (keyring/Secret Service) is unavailable.";
+
+#[derive(Debug)]
+pub enum SessionStorageError {
+    SecretServiceUnavailable {
+        config_path: Option<PathBuf>,
+        source: keyring::Error,
+    },
+}
+
+impl SessionStorageError {
+    pub(crate) fn secret_service_unavailable(source: keyring::Error) -> Self {
+        Self::SecretServiceUnavailable {
+            config_path: config_file_display_path().ok(),
+            source,
+        }
+    }
+}
+
+impl Display for SessionStorageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SecretServiceUnavailable { config_path, .. } => {
+                let location = config_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "your scalable-cli config.toml".to_string());
+                write!(
+                    f,
+                    "{SECRET_STORAGE_UNAVAILABLE_PREFIX} Store the session in a local file instead: add `session_backend = \"file\"` under `[auth]` in {location}, then run 'sc login' again.\n\n[auth]\nsession_backend = \"file\""
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SecretServiceUnavailable { source, .. } => Some(source),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -55,38 +101,39 @@ pub trait SecretStore {
 #[derive(Default)]
 pub struct KeyringStore;
 
+impl KeyringStore {
+    fn validate_available(&self) -> Result<()> {
+        let entry =
+            keyring::Entry::new(KEYRING_SERVICE, KEYRING_PROBE_KEY).map_err(map_keyring_error)?;
+        match entry.get_password() {
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(map_keyring_error(err)),
+        }
+    }
+}
+
 impl SecretStore for KeyringStore {
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
-            Err(err) => {
-                if matches!(err, keyring::Error::NoEntry) {
-                    Ok(None)
-                } else {
-                    Err(err.into())
-                }
-            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(map_keyring_error(err)),
         }
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)?;
-        entry.set_password(value)?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
+        entry.set_password(value).map_err(map_keyring_error)?;
         Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(err) => {
-                if matches!(err, keyring::Error::NoEntry) {
-                    Ok(())
-                } else {
-                    Err(err.into())
-                }
-            }
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(map_keyring_error(err)),
         }
     }
 }
@@ -201,6 +248,13 @@ impl StorageBackend {
             }
         }
     }
+
+    fn validate_login_storage_ready(&self) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Keyring(store) => store.validate_available(),
+        }
+    }
 }
 
 impl SecretStore for StorageBackend {
@@ -244,6 +298,10 @@ impl SessionManager<StorageBackend> {
 
     pub fn storage_backend_diagnostics(&self) -> StorageBackendDiagnostics {
         self.store.diagnostics()
+    }
+
+    pub fn validate_login_storage_ready(&self) -> Result<()> {
+        self.store.validate_login_storage_ready()
     }
 }
 
@@ -299,9 +357,38 @@ fn default_session_dir() -> Result<PathBuf> {
 
 fn keyring_probe_error(keyring: &KeyringStore) -> Option<String> {
     keyring
-        .get(KEYRING_PROBE_KEY)
+        .validate_available()
         .err()
         .map(|err| err.to_string())
+}
+
+fn map_keyring_error(err: keyring::Error) -> anyhow::Error {
+    if keyring_error_is_secret_storage_unavailable(&err) {
+        return anyhow::Error::new(SessionStorageError::secret_service_unavailable(err));
+    }
+    err.into()
+}
+
+fn keyring_error_is_secret_storage_unavailable(err: &keyring::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let detail = match err {
+            keyring::Error::PlatformFailure(inner) | keyring::Error::NoStorageAccess(inner) => {
+                inner.to_string()
+            }
+            _ => return false,
+        };
+
+        let lower = detail.to_lowercase();
+        lower.contains("org.freedesktop.secrets")
+            || lower.contains("was not provided by any .service")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +570,66 @@ mod tests {
             .save_active_with_backend(&sample_stored_session())
             .expect("save");
         assert_eq!(backend, SecretWriteBackend::File);
+    }
+
+    #[test]
+    fn validate_login_storage_ready_accepts_file_backend() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = SessionManager {
+            store: StorageBackend::File(
+                FileStore::new(tmp.path().to_path_buf()).expect("file store"),
+            ),
+        };
+
+        manager
+            .validate_login_storage_ready()
+            .expect("file backend should be ready");
+    }
+
+    #[test]
+    fn keyring_error_text_matching_detects_secret_service_unavailable() {
+        let err = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
+        )));
+        #[cfg(target_os = "linux")]
+        assert!(keyring_error_is_secret_storage_unavailable(&err));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!keyring_error_is_secret_storage_unavailable(&err));
+    }
+
+    #[test]
+    fn keyring_error_text_matching_ignores_unrelated_failures() {
+        let err = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("Access denied")));
+        assert!(!keyring_error_is_secret_storage_unavailable(&err));
+    }
+
+    #[test]
+    fn map_keyring_error_adds_actionable_file_backend_guidance() {
+        let err = map_keyring_error(keyring::Error::PlatformFailure(Box::new(
+            std::io::Error::other(
+                "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
+            ),
+        )));
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            err.to_string()
+                .starts_with(SECRET_STORAGE_UNAVAILABLE_PREFIX)
+        );
+        #[cfg(target_os = "linux")]
+        assert!(err.to_string().contains("session_backend = \"file\""));
+        #[cfg(target_os = "linux")]
+        assert!(err.to_string().contains("sc login"));
+        #[cfg(target_os = "linux")]
+        assert!(err.downcast_ref::<SessionStorageError>().is_some());
+
+        #[cfg(not(target_os = "linux"))]
+        assert!(err.downcast_ref::<SessionStorageError>().is_none());
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            err.downcast_ref::<keyring::Error>(),
+            Some(keyring::Error::PlatformFailure(_))
+        ));
     }
 
     #[test]

@@ -1178,7 +1178,7 @@ fn project_broker_crypto_price_alerts_returns_empty_when_crypto_tree_is_absent()
 }
 
 #[test]
-fn project_broker_limits_maps_sections() {
+fn project_broker_cash_breakdown_includes_only_approved_fields() {
     let input = broker_input(false, None);
     let response = json!({
         "account": {
@@ -1186,17 +1186,90 @@ fn project_broker_limits_maps_sections() {
                 "depositLimits": {"min": "1", "max": "2"},
                 "withdrawalLimits": {"min": "3", "max": "4", "maxExcludingCredit": "5"},
                 "payments": {
-                    "buyingPower": {"cashAvailableToInvest": "11"},
-                    "derivativesBuyingPower": {"cashAvailableForDerivatives": "22"},
-                    "withdrawalPower": {"cashAvailableForWithdrawal": "33"}
+                    "buyingPower": {
+                        "cashBalance": "10",
+                        "liveLimit": "20",
+                        "loaned": "30",
+                        "pendingBuyOrdersAmount": "40",
+                        "pendingWithdrawalsAmount": "50",
+                        "pendingSavingsPlanAmount": "60",
+                        "pendingDividendsReinvestmentAmount": "70",
+                        "pendingPocketMoneyAmount": "80",
+                        "estimatedTaxes": "90",
+                        "directDebit": "100",
+                        "cashAvailableToInvest": "110",
+                        "cashAvailableToInvestWithoutCredit": "120"
+                    },
+                    "derivativesBuyingPower": {
+                        "cashAvailableToInvest": "130",
+                        "derivativesDirectDebit": "140",
+                        "pendingELTIFAmount": "150",
+                        "cashAvailableForDerivatives": "160"
+                    },
+                    "withdrawalPower": {
+                        "cashAvailableToInvest": "170",
+                        "sellTradesAmount": "180",
+                        "withdrawalDirectDebit": "190",
+                        "cashAvailableForWithdrawal": "200"
+                    }
                 }
             }
         }
     });
 
-    let projected = project_broker_limits_response(&input, &response).expect("project");
-    assert_eq!(projected["deposit_limits"]["min"], "1");
-    assert_eq!(projected["withdrawal_limits"]["max_excluding_credit"], "5");
+    let projected = project_broker_cash_breakdown_response(&input, &response).expect("project");
+
+    assert_eq!(
+        projected,
+        json!({
+            "account_id": "acc-1",
+            "portfolio_id": "port-1",
+            "cash_balance": "10",
+            "buying_power": "110",
+            "buying_power_without_credit": "120",
+            "available_credit_line": "20",
+            "loaned": "30",
+            "pending_buy_orders_amount": "40",
+            "possible_taxes": "90",
+            "derivatives_buying_power": "130",
+            "available_for_derivatives": "160"
+        })
+    );
+    assert!(projected.get("currency").is_none());
+    assert!(projected.get("deposit_limits").is_none());
+    assert!(projected.get("withdrawal_limits").is_none());
+    assert!(projected.get("withdrawal_power").is_none());
+    assert!(projected.get("pending_withdrawals_amount").is_none());
+    assert!(projected.get("pending_eltif_amount").is_none());
+}
+
+#[test]
+fn project_broker_cash_breakdown_returns_nulls_when_payments_are_missing() {
+    let input = broker_input(false, None);
+    let response = json!({
+        "account": {
+            "brokerPortfolio": {}
+        }
+    });
+
+    let projected = project_broker_cash_breakdown_response(&input, &response).expect("project");
+
+    assert_eq!(
+        projected,
+        json!({
+            "account_id": "acc-1",
+            "portfolio_id": "port-1",
+            "cash_balance": null,
+            "buying_power": null,
+            "buying_power_without_credit": null,
+            "available_credit_line": null,
+            "loaned": null,
+            "pending_buy_orders_amount": null,
+            "possible_taxes": null,
+            "derivatives_buying_power": null,
+            "available_for_derivatives": null
+        })
+    );
 }
 
 #[test]

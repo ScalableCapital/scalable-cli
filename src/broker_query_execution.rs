@@ -18,8 +18,8 @@ use crate::helpers::{
     broker_transaction_details_variables, broker_transactions_variables_from_normalized,
     broker_watchlist_variables, normalize_broker_derivatives_search_query_input,
     normalize_broker_transactions_query_input, project_broker_analytics_response,
-    project_broker_derivatives_search_response, project_broker_holdings_response,
-    project_broker_limits_response, project_broker_overview_response,
+    project_broker_cash_breakdown_response, project_broker_derivatives_search_response,
+    project_broker_holdings_response, project_broker_overview_response,
     project_broker_price_alerts_response, project_broker_quote_response,
     project_broker_savings_plans_response, project_broker_search_response,
     project_broker_security_news_response, project_broker_transaction_details_response,
@@ -575,8 +575,8 @@ pub(crate) fn execute_broker_price_alerts(
     Ok(broker_result_envelope(&ids, projected))
 }
 
-pub(crate) fn execute_broker_limits(
-    args: crate::cli::BrokerLimitsArgs,
+pub(crate) fn execute_broker_cash_breakdown(
+    args: crate::cli::BrokerCashBreakdownArgs,
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
@@ -615,7 +615,7 @@ pub(crate) fn execute_broker_limits(
             )
         },
     )?;
-    let projected = project_broker_limits_response(&input, &response)?;
+    let projected = project_broker_cash_breakdown_response(&input, &response)?;
     Ok(broker_result_envelope(&ids, projected))
 }
 
@@ -675,10 +675,10 @@ mod tests {
     use mockito::{Matcher, Server};
 
     use crate::cli::{
-        BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField,
-        BrokerDerivativeSortOrder, BrokerDerivativeStrategy, BrokerDerivativeType,
-        BrokerDerivativesSearchArgs, BrokerOverviewArgs, BrokerQuoteArgs, BrokerSearchArgs,
-        BrokerTransactionsArgs,
+        BrokerCashBreakdownArgs, BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory,
+        BrokerDerivativeSortField, BrokerDerivativeSortOrder, BrokerDerivativeStrategy,
+        BrokerDerivativeType, BrokerDerivativesSearchArgs, BrokerOverviewArgs, BrokerQuoteArgs,
+        BrokerSearchArgs, BrokerTransactionsArgs,
     };
     use crate::config::TargetEnv;
     use crate::session::{LoginSource, Session, StoredSession};
@@ -782,6 +782,13 @@ mod tests {
             portfolio_id: Some("portfolio-1".to_string()),
             include_year_to_date: true,
             quote_source: Some("CONSOLIDATED".to_string()),
+            json: true,
+        }
+    }
+
+    fn sample_cash_breakdown_args() -> BrokerCashBreakdownArgs {
+        BrokerCashBreakdownArgs {
+            portfolio_id: Some("portfolio-1".to_string()),
             json: true,
         }
     }
@@ -1088,6 +1095,131 @@ mod tests {
             Some(expected_fingerprint.as_str())
         );
         transactions_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_cash_breakdown_happy_path_filters_to_public_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let cash_breakdown_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerLimits".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "depositLimits": {"min": "1", "max": "2"},
+                                "withdrawalLimits": {"min": "3", "max": "4", "maxExcludingCredit": "5"},
+                                "payments": {
+                                    "buyingPower": {
+                                        "cashBalance": "10",
+                                        "liveLimit": "20",
+                                        "loaned": "30",
+                                        "pendingBuyOrdersAmount": "40",
+                                        "pendingWithdrawalsAmount": "50",
+                                        "pendingSavingsPlanAmount": "60",
+                                        "pendingDividendsReinvestmentAmount": "70",
+                                        "pendingPocketMoneyAmount": "80",
+                                        "estimatedTaxes": "90",
+                                        "directDebit": "100",
+                                        "cashAvailableToInvest": "110",
+                                        "cashAvailableToInvestWithoutCredit": "120"
+                                    },
+                                    "derivativesBuyingPower": {
+                                        "cashAvailableToInvest": "130",
+                                        "derivativesDirectDebit": "140",
+                                        "pendingELTIFAmount": "150",
+                                        "cashAvailableForDerivatives": "160"
+                                    },
+                                    "withdrawalPower": {
+                                        "cashAvailableToInvest": "170",
+                                        "sellTradesAmount": "180",
+                                        "withdrawalDirectDebit": "190",
+                                        "cashAvailableForWithdrawal": "200"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_cash_breakdown(
+            sample_cash_breakdown_args(),
+            &config,
+            &mut session_manager,
+        )
+        .expect("cash breakdown payload");
+
+        assert_eq!(
+            payload.get("account_id").and_then(Value::as_str),
+            Some("person-1")
+        );
+        assert_eq!(
+            payload
+                .pointer("/resolution/portfolio")
+                .and_then(Value::as_str),
+            Some("explicit")
+        );
+        assert_eq!(payload.pointer("/result/cash_balance"), Some(&json!("10")));
+        assert_eq!(payload.pointer("/result/buying_power"), Some(&json!("110")));
+        assert_eq!(
+            payload.pointer("/result/buying_power_without_credit"),
+            Some(&json!("120"))
+        );
+        assert_eq!(
+            payload.pointer("/result/available_credit_line"),
+            Some(&json!("20"))
+        );
+        assert_eq!(payload.pointer("/result/loaned"), Some(&json!("30")));
+        assert_eq!(
+            payload.pointer("/result/pending_buy_orders_amount"),
+            Some(&json!("40"))
+        );
+        assert_eq!(
+            payload.pointer("/result/possible_taxes"),
+            Some(&json!("90"))
+        );
+        assert_eq!(
+            payload.pointer("/result/derivatives_buying_power"),
+            Some(&json!("130"))
+        );
+        assert_eq!(
+            payload.pointer("/result/available_for_derivatives"),
+            Some(&json!("160"))
+        );
+        assert!(payload.pointer("/result/currency").is_none());
+        assert!(payload.pointer("/result/deposit_limits").is_none());
+        assert!(payload.pointer("/result/withdrawal_limits").is_none());
+        assert!(payload.pointer("/result/withdrawal_power").is_none());
+        assert!(
+            payload
+                .pointer("/result/pending_withdrawals_amount")
+                .is_none()
+        );
+
+        cash_breakdown_mock.assert();
     }
 
     #[test]

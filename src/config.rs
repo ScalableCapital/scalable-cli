@@ -151,6 +151,10 @@ pub fn config_file_path() -> Result<PathBuf> {
     Ok(config_dir_path()?.join("config.toml"))
 }
 
+pub fn config_file_display_path() -> Result<PathBuf> {
+    Ok(default_config_dir_path()?.join("config.toml"))
+}
+
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("Failed creating dir {}", dir.display()))?;
 
@@ -658,6 +662,19 @@ foo = "bar"
 "#;
         let err = toml::from_str::<AppConfig>(raw).expect_err("unknown keys should fail");
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn config_file_display_path_uses_override_without_creating_dir() {
+        let _lock = crate::lock_test_env();
+        let tmp = temp_config_dir();
+        let override_dir = tmp.path().join("custom-config");
+        let _guard = EnvGuard::set("SC_CONFIG_DIR", override_dir.to_string_lossy().as_ref());
+
+        let path = config_file_display_path().expect("display path");
+
+        assert_eq!(path, override_dir.join("config.toml"));
+        assert!(!override_dir.exists());
     }
 
     #[test]
