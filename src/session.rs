@@ -10,25 +10,28 @@ use crate::config::{
     ensure_private_dir, write_private_file_atomic,
 };
 
+mod keyring_provider;
+
 const KEYRING_SERVICE: &str = "scalable.capital:scalable-cli";
 const SESSION_ACCOUNT: &str = "session";
 const SESSION_FILENAME: &str = "session.json";
 const KEYRING_PROBE_KEY: &str = "__sc_storage_probe__";
+const ACTIVE_SESSION_LOCK_FILENAME: &str = "session.lock";
 
 pub const SECRET_STORAGE_UNAVAILABLE_PREFIX: &str =
     "OS secret storage (keyring/Secret Service) is unavailable.";
 
 #[derive(Debug)]
 pub enum SessionStorageError {
-    SecretServiceUnavailable {
+    SecretStoreUnavailable {
         config_path: Option<PathBuf>,
-        source: keyring::Error,
+        source: keyring_core::Error,
     },
 }
 
 impl SessionStorageError {
-    pub(crate) fn secret_service_unavailable(source: keyring::Error) -> Self {
-        Self::SecretServiceUnavailable {
+    pub(crate) fn secret_store_unavailable(source: keyring_core::Error) -> Self {
+        Self::SecretStoreUnavailable {
             config_path: config_file_display_path().ok(),
             source,
         }
@@ -38,7 +41,7 @@ impl SessionStorageError {
 impl Display for SessionStorageError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SecretServiceUnavailable { config_path, .. } => {
+            Self::SecretStoreUnavailable { config_path, .. } => {
                 let location = config_path
                     .as_ref()
                     .map(|path| path.display().to_string())
@@ -55,7 +58,7 @@ impl Display for SessionStorageError {
 impl std::error::Error for SessionStorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SecretServiceUnavailable { source, .. } => Some(source),
+            Self::SecretStoreUnavailable { source, .. } => Some(source),
         }
     }
 }
@@ -103,10 +106,9 @@ pub struct KeyringStore;
 
 impl KeyringStore {
     fn validate_available(&self) -> Result<()> {
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, KEYRING_PROBE_KEY).map_err(map_keyring_error)?;
+        let entry = keyring_entry(KEYRING_PROBE_KEY)?;
         match entry.get_password() {
-            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(err) => Err(map_keyring_error(err)),
         }
     }
@@ -114,25 +116,25 @@ impl KeyringStore {
 
 impl SecretStore for KeyringStore {
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
+        let entry = keyring_entry(key)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(err) => Err(map_keyring_error(err)),
         }
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
+        let entry = keyring_entry(key)?;
         entry.set_password(value).map_err(map_keyring_error)?;
         Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key).map_err(map_keyring_error)?;
+        let entry = keyring_entry(key)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(err) => Err(map_keyring_error(err)),
         }
     }
@@ -292,8 +294,45 @@ impl SessionManager<StorageBackend> {
         &mut self,
         stored_session: &StoredSession,
     ) -> Result<SecretWriteBackend> {
+        let _lock = ActiveSessionLock::acquire()?;
         let serialized = serde_json::to_string(stored_session)?;
         self.store.set_with_backend(SESSION_ACCOUNT, &serialized)
+    }
+
+    pub fn save_active_locked(&mut self, stored_session: &StoredSession) -> Result<()> {
+        let _lock = ActiveSessionLock::acquire()?;
+        self.save_active_unlocked(stored_session)
+    }
+
+    pub fn save_active_if_matches(
+        &mut self,
+        expected: &StoredSession,
+        replacement: &StoredSession,
+    ) -> Result<bool> {
+        let _lock = ActiveSessionLock::acquire()?;
+        match self.load_active_unlocked()? {
+            Some(current) if current == *expected => {
+                self.save_active_unlocked(replacement)?;
+                Ok(true)
+            }
+            Some(_) | None => Ok(false),
+        }
+    }
+
+    pub fn delete_active_if_matches(&mut self, expected: &StoredSession) -> Result<bool> {
+        let _lock = ActiveSessionLock::acquire()?;
+        match self.load_active_unlocked()? {
+            Some(current) if current == *expected => {
+                self.store.delete(SESSION_ACCOUNT)?;
+                Ok(true)
+            }
+            Some(_) | None => Ok(false),
+        }
+    }
+
+    pub fn delete_active_locked(&mut self) -> Result<()> {
+        let _lock = ActiveSessionLock::acquire()?;
+        self.store.delete(SESSION_ACCOUNT)
     }
 
     pub fn storage_backend_diagnostics(&self) -> StorageBackendDiagnostics {
@@ -311,6 +350,10 @@ impl<S: SecretStore> SessionManager<S> {
     }
 
     pub fn load_active(&self) -> Result<Option<StoredSession>> {
+        self.load_active_unlocked()
+    }
+
+    fn load_active_unlocked(&self) -> Result<Option<StoredSession>> {
         let value = match self.store.get(SESSION_ACCOUNT)? {
             Some(v) => v,
             None => return Ok(None),
@@ -322,6 +365,10 @@ impl<S: SecretStore> SessionManager<S> {
     }
 
     pub fn save_active(&mut self, stored_session: &StoredSession) -> Result<()> {
+        self.save_active_unlocked(stored_session)
+    }
+
+    fn save_active_unlocked(&mut self, stored_session: &StoredSession) -> Result<()> {
         let serialized = serde_json::to_string(stored_session)?;
         self.store.set(SESSION_ACCOUNT, &serialized)
     }
@@ -355,6 +402,55 @@ fn default_session_dir() -> Result<PathBuf> {
     config_dir_path()
 }
 
+struct ActiveSessionLock {
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
+impl ActiveSessionLock {
+    fn acquire() -> Result<Self> {
+        let path = config_dir_path()?.join(ACTIVE_SESSION_LOCK_FILENAME);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed opening session lock {}", path.display()))?;
+        lock_file_exclusive(&file)
+            .with_context(|| format!("Failed locking session state {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+
+        return Err(err).context("flock LOCK_EX failed");
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &fs::File) -> Result<()> {
+    Ok(())
+}
+
+fn keyring_entry(user: &str) -> Result<keyring_core::Entry> {
+    keyring_provider::entry(KEYRING_SERVICE, user).map_err(map_keyring_error)
+}
+
 fn keyring_probe_error(keyring: &KeyringStore) -> Option<String> {
     keyring
         .validate_available()
@@ -362,20 +458,25 @@ fn keyring_probe_error(keyring: &KeyringStore) -> Option<String> {
         .map(|err| err.to_string())
 }
 
-fn map_keyring_error(err: keyring::Error) -> anyhow::Error {
+fn map_keyring_error(err: keyring_core::Error) -> anyhow::Error {
     if keyring_error_is_secret_storage_unavailable(&err) {
-        return anyhow::Error::new(SessionStorageError::secret_service_unavailable(err));
+        return anyhow::Error::new(SessionStorageError::secret_store_unavailable(err));
     }
     err.into()
 }
 
-fn keyring_error_is_secret_storage_unavailable(err: &keyring::Error) -> bool {
+fn keyring_error_is_secret_storage_unavailable(err: &keyring_core::Error) -> bool {
+    if matches!(
+        err,
+        keyring_core::Error::NoStorageAccess(_) | keyring_core::Error::NoDefaultStore
+    ) {
+        return true;
+    }
+
     #[cfg(target_os = "linux")]
     {
         let detail = match err {
-            keyring::Error::PlatformFailure(inner) | keyring::Error::NoStorageAccess(inner) => {
-                inner.to_string()
-            }
+            keyring_core::Error::PlatformFailure(inner) => inner.to_string(),
             _ => return false,
         };
 
@@ -588,7 +689,7 @@ mod tests {
 
     #[test]
     fn keyring_error_text_matching_detects_secret_service_unavailable() {
-        let err = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+        let err = keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
             "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
         )));
         #[cfg(target_os = "linux")]
@@ -599,13 +700,14 @@ mod tests {
 
     #[test]
     fn keyring_error_text_matching_ignores_unrelated_failures() {
-        let err = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("Access denied")));
+        let err =
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("Access denied")));
         assert!(!keyring_error_is_secret_storage_unavailable(&err));
     }
 
     #[test]
     fn map_keyring_error_adds_actionable_file_backend_guidance() {
-        let err = map_keyring_error(keyring::Error::PlatformFailure(Box::new(
+        let err = map_keyring_error(keyring_core::Error::PlatformFailure(Box::new(
             std::io::Error::other(
                 "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
             ),
@@ -627,9 +729,19 @@ mod tests {
         assert!(err.downcast_ref::<SessionStorageError>().is_none());
         #[cfg(not(target_os = "linux"))]
         assert!(matches!(
-            err.downcast_ref::<keyring::Error>(),
-            Some(keyring::Error::PlatformFailure(_))
+            err.downcast_ref::<keyring_core::Error>(),
+            Some(keyring_core::Error::PlatformFailure(_))
         ));
+    }
+
+    #[test]
+    fn keyring_no_default_store_is_treated_as_secret_storage_unavailable() {
+        let err = map_keyring_error(keyring_core::Error::NoDefaultStore);
+        assert!(
+            err.to_string()
+                .starts_with(SECRET_STORAGE_UNAVAILABLE_PREFIX)
+        );
+        assert!(err.downcast_ref::<SessionStorageError>().is_some());
     }
 
     #[test]

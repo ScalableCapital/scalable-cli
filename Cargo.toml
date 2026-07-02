@@ -1,8 +1,8 @@
 [package]
 name = "scalable-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 
 [[bin]]
 name = "sc"
@@ -22,7 +22,7 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+keyring-core = "1.0"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
@@ -38,12 +38,14 @@ jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0", default-features = false, features = ["keychain"] }
 core-foundation = "0.10"
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
 security-framework-sys = "2.17"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cryptoki = "0.12"
+dbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust", "vendored"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

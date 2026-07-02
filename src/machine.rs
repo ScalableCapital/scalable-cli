@@ -5,8 +5,12 @@ use std::borrow::Cow;
 
 use crate::auth::REFRESH_RELOGIN_REQUIRED_PREFIX;
 use crate::dpop::DPOP_SESSION_KEY_RELOGIN_MESSAGE;
-use crate::graphql::LOCAL_READ_ONLY_ERROR_PREFIX;
+use crate::graphql::{BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX, LOCAL_READ_ONLY_ERROR_PREFIX};
 use crate::session::SessionStorageError;
+use crate::trade_controls::{
+    LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX, LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX,
+    LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX,
+};
 
 #[derive(Debug, Serialize)]
 struct MachineEnvelope {
@@ -88,6 +92,9 @@ fn concise_error_message(message: &str) -> String {
 fn sanitize_error_message(message: &str) -> Cow<'_, str> {
     if !message.contains(REFRESH_RELOGIN_REQUIRED_PREFIX)
         && !message.contains(LOCAL_READ_ONLY_ERROR_PREFIX)
+        && !message.contains(LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX)
+        && !message.contains(LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX)
+        && !message.contains(LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX)
     {
         return Cow::Borrowed(message);
     }
@@ -96,6 +103,9 @@ fn sanitize_error_message(message: &str) -> Cow<'_, str> {
     for prefix in [
         REFRESH_RELOGIN_REQUIRED_PREFIX,
         LOCAL_READ_ONLY_ERROR_PREFIX,
+        LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX,
+        LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX,
+        LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX,
     ] {
         let mut parts = sanitized.split(prefix);
         let mut rebuilt = parts.next().unwrap_or_default().to_string();
@@ -110,7 +120,7 @@ fn sanitize_error_message(message: &str) -> Cow<'_, str> {
 pub fn classify_error(err: &Error) -> ClassifiedError {
     if let Some(storage_error) = session_storage_error_in_chain(err) {
         return match storage_error {
-            SessionStorageError::SecretServiceUnavailable { .. } => ClassifiedError {
+            SessionStorageError::SecretStoreUnavailable { .. } => ClassifiedError {
                 code: "secret_storage_unavailable",
                 exit_code: 20,
                 hints: vec![
@@ -156,11 +166,40 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
+    if lower.contains("unable to resolve overnight savings account id") {
+        return ClassifiedError {
+            code: "overnight_selection_required",
+            exit_code: 10,
+            hints: vec![
+                "If multiple overnight accounts exist, rerun with `--savings-account-id <ID>`."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if lower.contains("overnight input invalid:") {
+        return ClassifiedError {
+            code: "overnight_input_invalid",
+            exit_code: 10,
+            hints: vec!["Check overnight command inputs and retry.".to_string()],
+        };
+    }
+
     if lower.contains("broker input invalid:") {
         return ClassifiedError {
             code: "broker_input_invalid",
             exit_code: 10,
             hints: vec!["Check broker command inputs and retry.".to_string()],
+        };
+    }
+
+    if text.contains(BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX) {
+        return ClassifiedError {
+            code: "broker_transaction_not_found",
+            exit_code: 10,
+            hints: vec![
+                "Check the transaction id and selected broker portfolio, then retry.".to_string(),
+            ],
         };
     }
 
@@ -189,6 +228,16 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             exit_code: 30,
             hints: vec![
                 "Backend response shape did not match expected broker contract.".to_string(),
+            ],
+        };
+    }
+
+    if lower.contains("overnight response invalid:") {
+        return ClassifiedError {
+            code: "overnight_response_invalid",
+            exit_code: 30,
+            hints: vec![
+                "Backend response shape did not match expected overnight contract.".to_string(),
             ],
         };
     }
@@ -257,6 +306,38 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             exit_code: 10,
             hints: vec![
                 "Use exactly the phase-1 trade inputs (isin/amount-or-shares/venue/order-type/limit-price/stop-price), or rerun phase 1 if market data changed."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if text.contains(LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX) {
+        return ClassifiedError {
+            code: "trade_control_isin_not_allowed",
+            exit_code: 10,
+            hints: vec![
+                "Choose an ISIN listed in local trade_controls.allowed_isins or update the local config."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if text.contains(LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX) {
+        return ClassifiedError {
+            code: "trade_control_isin_denied",
+            exit_code: 10,
+            hints: vec![
+                "Choose another ISIN or update local trade_controls.denied_isins.".to_string(),
+            ],
+        };
+    }
+
+    if text.contains(LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX) {
+        return ClassifiedError {
+            code: "trade_control_order_notional_exceeded",
+            exit_code: 10,
+            hints: vec![
+                "Reduce the order size or raise local trade_controls.max_order_notional, then rerun phase 1."
                     .to_string(),
             ],
         };
@@ -543,6 +624,19 @@ mod tests {
     }
 
     #[test]
+    fn classify_broker_transaction_not_found_error() {
+        let err = anyhow!("Broker transaction not found: field 'transaction_id' was not found");
+        let c = classify_error(&err);
+        assert_eq!(c.code, "broker_transaction_not_found");
+        assert_eq!(c.exit_code, 10);
+        assert!(
+            c.hints
+                .iter()
+                .any(|hint| hint.contains("selected broker portfolio"))
+        );
+    }
+
+    #[test]
     fn classify_installation_code_invalid_state_error() {
         let err = anyhow!(
             "Invalid installation code state at /tmp/sc-installation_code.json: invalid JSON. Delete /tmp/sc-installation_code.json and rerun `sc installation-code`."
@@ -577,9 +671,39 @@ mod tests {
     }
 
     #[test]
+    fn classify_trade_control_isin_not_allowed_error() {
+        let err = anyhow!(
+            "{LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX} local trade controls require ISIN 'US0378331005' to be present in allowed_isins"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "trade_control_isin_not_allowed");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_trade_control_isin_denied_error() {
+        let err = anyhow!(
+            "{LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX} local trade controls deny ISIN 'US0378331005' via denied_isins"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "trade_control_isin_denied");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
+    fn classify_trade_control_order_notional_exceeded_error() {
+        let err = anyhow!(
+            "{LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX} local trade controls block estimated order notional '1200' because it exceeds max_order_notional '1000'"
+        );
+        let c = classify_error(&err);
+        assert_eq!(c.code, "trade_control_order_notional_exceeded");
+        assert_eq!(c.exit_code, 10);
+    }
+
+    #[test]
     fn classify_secret_storage_unavailable_error() {
-        let err = anyhow::Error::new(SessionStorageError::secret_service_unavailable(
-            keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+        let err = anyhow::Error::new(SessionStorageError::secret_store_unavailable(
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
                 "DBus error: org.freedesktop.secrets",
             ))),
         ))
@@ -806,6 +930,17 @@ mod tests {
         assert_eq!(
             concise_error_message(&text),
             "local read-only mode blocks write operation 'BrokerAddToWatchlist'."
+        );
+    }
+
+    #[test]
+    fn concise_error_message_strips_trade_control_prefix_and_reason_token() {
+        let text = format!(
+            "{LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX} local trade controls deny ISIN 'US0378331005' via denied_isins"
+        );
+        assert_eq!(
+            concise_error_message(&text),
+            "local trade controls deny ISIN 'US0378331005' via denied_isins"
         );
     }
 

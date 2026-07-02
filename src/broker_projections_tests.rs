@@ -508,6 +508,149 @@ fn project_broker_quote_response_requires_security_node() {
 }
 
 #[test]
+fn project_broker_chart_response_maps_series_fields() {
+    let response = json!({
+        "timeSeriesBySecurity": [
+            {
+                "isin": "US0378331005",
+                "timeFrame": "ONE_MONTH",
+                "currency": "EUR",
+                "source": "CONSOLIDATED",
+                "closingReferencePoint": {
+                    "midPrice": 184.12,
+                    "timestampUtc": {
+                        "time": "2026-05-22T21:59:59Z"
+                    }
+                },
+                "dataPoints": [
+                    {
+                        "midPrice": 185.01,
+                        "timestampUtc": {
+                            "time": "2026-05-23T09:00:00Z"
+                        }
+                    },
+                    {
+                        "midPrice": 183.50,
+                        "timestampUtc": {
+                            "time": "2026-05-24T09:00:00Z"
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    let projected = project_broker_chart_response(
+        "US0378331005",
+        crate::cli::BrokerChartTimeframe::OneMonth,
+        &response,
+    )
+    .expect("project");
+
+    assert_eq!(projected["isin"], "US0378331005");
+    assert_eq!(projected["timeframe"], "1m");
+    assert_eq!(projected["currency"], "EUR");
+    assert_eq!(projected["source"], "CONSOLIDATED");
+    assert_eq!(projected["closing_reference_point"]["mid_price"], 184.12);
+    assert_eq!(
+        projected["closing_reference_point"]["timestamp_utc"],
+        "2026-05-22T21:59:59Z"
+    );
+    assert_eq!(projected["data_points"][0]["mid_price"], 185.01);
+    assert_eq!(
+        projected["data_points"][0]["timestamp_utc"],
+        "2026-05-23T09:00:00Z"
+    );
+    assert_eq!(projected["data_points"][1]["mid_price"], 183.50);
+    assert_eq!(
+        projected["data_points"][1]["timestamp_utc"],
+        "2026-05-24T09:00:00Z"
+    );
+    assert_eq!(projected["point_count"], 2);
+}
+
+#[test]
+fn project_broker_chart_response_returns_empty_data_points_successfully() {
+    let response = json!({
+        "timeSeriesBySecurity": [
+            {
+                "isin": "US0378331005",
+                "timeFrame": "YEAR_TO_DATE",
+                "currency": "EUR",
+                "source": "CONSOLIDATED",
+                "closingReferencePoint": {
+                    "midPrice": 184.12,
+                    "timestampUtc": {
+                        "time": "2026-05-22T21:59:59Z"
+                    }
+                },
+                "dataPoints": []
+            }
+        ]
+    });
+
+    let projected = project_broker_chart_response(
+        "US0378331005",
+        crate::cli::BrokerChartTimeframe::YearToDate,
+        &response,
+    )
+    .expect("project");
+
+    assert_eq!(projected["data_points"], json!([]));
+    assert_eq!(projected["point_count"], 0);
+}
+
+#[test]
+fn project_broker_chart_response_requires_requested_timeframe() {
+    let response = json!({
+        "timeSeriesBySecurity": [
+            {
+                "isin": "US0378331005",
+                "timeFrame": "ONE_MONTH",
+                "currency": "EUR",
+                "source": "CONSOLIDATED",
+                "closingReferencePoint": {},
+                "dataPoints": []
+            }
+        ]
+    });
+
+    let err = project_broker_chart_response(
+        "US0378331005",
+        crate::cli::BrokerChartTimeframe::YearToDate,
+        &response,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("requested timeframe 'ytd'"));
+}
+
+#[test]
+fn project_broker_chart_response_requires_matching_returned_isin() {
+    let response = json!({
+        "timeSeriesBySecurity": [
+            {
+                "isin": "DE000BASF111",
+                "timeFrame": "ONE_MONTH",
+                "currency": "EUR",
+                "source": "CONSOLIDATED",
+                "closingReferencePoint": {},
+                "dataPoints": []
+            }
+        ]
+    });
+
+    let err = project_broker_chart_response(
+        "US0378331005",
+        crate::cli::BrokerChartTimeframe::OneMonth,
+        &response,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("requested isin 'US0378331005'"));
+}
+
+#[test]
 fn project_broker_watchlist_add_maps_minimal_ack() {
     let response = json!({
         "addToWatchlist": {

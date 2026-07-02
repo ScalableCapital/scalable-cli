@@ -77,6 +77,7 @@ impl GraphqlDpopContext {
 }
 
 pub(crate) const LOCAL_READ_ONLY_ERROR_PREFIX: &str = "LOCAL_READ_ONLY:";
+pub(crate) const BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX: &str = "Broker transaction not found:";
 
 pub fn execute_graphql<T: Serialize>(
     endpoint: &str,
@@ -285,6 +286,10 @@ fn graphql_http_error_code(body: &str) -> Option<String> {
 }
 
 fn graphql_application_error_message(operation_name: Option<&str>, errors: &Value) -> String {
+    if let Some(message) = broker_graphql_application_error_message(operation_name, errors) {
+        return message;
+    }
+
     let mut message = String::from("GraphQL returned errors");
     if let Some(name) = operation_name {
         message.push_str(&format!(" for {name}"));
@@ -295,6 +300,27 @@ fn graphql_application_error_message(operation_name: Option<&str>, errors: &Valu
     message
 }
 
+fn broker_graphql_application_error_message(
+    operation_name: Option<&str>,
+    errors: &Value,
+) -> Option<String> {
+    match operation_name {
+        Some("BrokerQuote")
+            if graphql_error_code(errors).as_deref() == Some("BAD_USER_INPUT")
+                && graphql_error_message_text(errors).as_deref()
+                    == Some("Invalid ISIN provided") =>
+        {
+            Some("Broker input invalid: field 'isin' must be a valid ISIN".to_string())
+        }
+        Some("BrokerTransactionDetails")
+            if graphql_validation_error_code(errors).as_deref() == Some("TransactionNotFound") =>
+        {
+            Some("Broker transaction not found: field 'transaction_id' was not found".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn graphql_error_code(errors: &Value) -> Option<String> {
     errors
         .as_array()
@@ -303,6 +329,40 @@ fn graphql_error_code(errors: &Value) -> Option<String> {
         .and_then(|ext| ext.get("code"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+fn graphql_error_message_text(errors: &Value) -> Option<String> {
+    errors
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|first| first.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn graphql_validation_error_code(errors: &Value) -> Option<String> {
+    let first = errors.as_array().and_then(|items| items.first())?;
+    extract_validation_error_code(first.get("validationErrors")).or_else(|| {
+        first
+            .get("extensions")
+            .and_then(|extensions| extensions.get("validationErrors"))
+            .and_then(|value| extract_validation_error_code(Some(value)))
+    })
+}
+
+fn extract_validation_error_code(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::Object(map) => map
+            .get("errorCode")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        Value::Array(items) => items.iter().find_map(|item| {
+            item.get("errorCode")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+        _ => None,
+    }
 }
 
 fn dpop_nonce_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -904,6 +964,82 @@ mod tests {
         assert!(msg.contains("GraphQL returned errors"));
         assert!(msg.contains("code: UNAUTHENTICATED"));
         assert!(!msg.contains(marker));
+    }
+
+    #[test]
+    fn graphql_application_error_message_maps_broker_quote_bad_user_input() {
+        let message = graphql_application_error_message(
+            Some("BrokerQuote"),
+            &json!([{
+                "message": "Invalid ISIN provided",
+                "extensions": {
+                    "code": "BAD_USER_INPUT"
+                }
+            }]),
+        );
+
+        assert_eq!(
+            message,
+            "Broker input invalid: field 'isin' must be a valid ISIN"
+        );
+    }
+
+    #[test]
+    fn graphql_application_error_message_preserves_generic_broker_quote_bad_user_input_without_isin_marker()
+     {
+        let message = graphql_application_error_message(
+            Some("BrokerQuote"),
+            &json!([{
+                "message": "Some other quote validation failure",
+                "extensions": {
+                    "code": "BAD_USER_INPUT"
+                }
+            }]),
+        );
+
+        assert_eq!(
+            message,
+            "GraphQL returned errors for BrokerQuote (code: BAD_USER_INPUT)"
+        );
+    }
+
+    #[test]
+    fn graphql_application_error_message_maps_transaction_not_found_marker() {
+        let message = graphql_application_error_message(
+            Some("BrokerTransactionDetails"),
+            &json!([{
+                "message": "Transaction with ID tx-1 not found",
+                "extensions": {
+                    "code": "BAD_REQUEST"
+                },
+                "validationErrors": {
+                    "errorCode": "TransactionNotFound"
+                }
+            }]),
+        );
+
+        assert_eq!(
+            message,
+            "Broker transaction not found: field 'transaction_id' was not found"
+        );
+    }
+
+    #[test]
+    fn graphql_application_error_message_preserves_generic_bad_request_for_other_broker_queries() {
+        let message = graphql_application_error_message(
+            Some("BrokerTransactions"),
+            &json!([{
+                "message": "Some other bad request",
+                "extensions": {
+                    "code": "BAD_REQUEST"
+                }
+            }]),
+        );
+
+        assert_eq!(
+            message,
+            "GraphQL returned errors for BrokerTransactions (code: BAD_REQUEST)"
+        );
     }
 
     #[test]

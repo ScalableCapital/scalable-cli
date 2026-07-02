@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+mod active_session;
 mod auth;
 mod broker_commands;
 mod broker_context;
@@ -16,12 +17,19 @@ mod graphql;
 mod helpers;
 mod installation_code;
 mod machine;
+mod overnight_commands;
+mod overnight_projections;
+mod overnight_queries;
+mod overnight_query_execution;
+mod overnight_shared;
 pub mod session;
+mod session_refresh;
 pub mod token;
 mod token_verifier;
 pub mod trade;
 mod trade_attempt;
 mod trade_confirmation;
+mod trade_controls;
 mod trade_execution;
 mod trade_presentation;
 pub mod transport_security;
@@ -31,11 +39,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use crate::auth::{
-    REFRESH_RELOGIN_REQUIRED_PREFIX, load_authenticated_session_dpop_context,
-    login_with_device_code, refresh_session_if_needed_with_dpop, refresh_session_with_dpop,
-    revoke_tokens_on_logout_best_effort,
-};
+use crate::auth::{login_with_device_code, revoke_tokens_on_logout_best_effort};
 use crate::broker_commands::{
     HumanBrokerOutput, bootstrap_broker_context_after_login, run_broker_command_human,
     run_broker_command_machine,
@@ -51,10 +55,14 @@ use crate::config::{AppConfig, EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
 use crate::installation_code::load_or_create_installation_code;
 use crate::machine::{print_error, print_success};
-use crate::session::{Session, SessionManager, SessionMode, StoredSession};
+use crate::overnight_commands::{
+    HumanOvernightOutput, run_overnight_command_human, run_overnight_command_machine,
+};
+use crate::session::{SessionManager, SessionMode};
 use crate::trade::TradeSide;
 use crate::trade_attempt::delete_attempt_store;
 use crate::trade_confirmation::delete_confirmation_store;
+use crate::trade_controls::TradeControlsPolicy;
 use crate::trade_presentation::{
     presentation_required_leaf_paths as trade_presentation_required_leaf_paths,
     presentation_section_order_keys as trade_presentation_section_order_keys,
@@ -104,6 +112,7 @@ fn command_requests_json_envelope(command: &Commands) -> bool {
         Commands::Login(_) => false,
         Commands::Logout(args) => args.json,
         Commands::Whoami(args) => args.json,
+        Commands::Overnight(args) => args.json,
         Commands::Broker(args) => broker_command_requests_json(&args.command),
         Commands::Capabilities(args) => args.json,
     }
@@ -373,6 +382,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
         BrokerCommand::Derivatives(args) => match &args.command {
             BrokerDerivativesCommand::Search(search_args) => search_args.json,
         },
+        BrokerCommand::Chart(args) => args.json,
         BrokerCommand::Quote(args) => args.json,
         BrokerCommand::SecurityNews(args) => args.json,
         BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -437,7 +447,7 @@ fn run_human_command(
                         &dpop_options,
                     );
                 }
-                session_manager.delete_active()?;
+                session_manager.delete_active_locked()?;
                 println!("Logged out.");
             } else {
                 println!("No active session.");
@@ -445,6 +455,23 @@ fn run_human_command(
         }
         Commands::Whoami(args) => {
             run_human_whoami_command(args, config, session_manager)?;
+        }
+        Commands::Overnight(args) => {
+            let payload = run_overnight_command_human(args, config, session_manager)?;
+            match payload {
+                HumanOvernightOutput::Json(value, compact) => {
+                    if compact {
+                        println!("{}", serde_json::to_string(&value)?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    }
+                }
+                HumanOvernightOutput::Text(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+            }
         }
         Commands::Broker(args) => {
             let payload = run_broker_command_human(args, config, session_manager)?;
@@ -497,12 +524,13 @@ fn run_machine_command(
                         &dpop_options,
                     );
                 }
-                session_manager.delete_active()?;
+                session_manager.delete_active_locked()?;
                 return Ok(json!({"logged_out": true}));
             }
             Ok(json!({"logged_out": false}))
         }
         Commands::Whoami(args) => run_machine_whoami_command(args, config, session_manager),
+        Commands::Overnight(args) => run_overnight_command_machine(args, config, session_manager),
         Commands::Broker(args) => run_broker_command_machine(args, config, session_manager),
         Commands::Capabilities(_) => Ok(machine_capabilities(config)),
     }
@@ -546,7 +574,8 @@ fn finalize_login_human(
     Ok(())
 }
 
-fn machine_capabilities(_config: &AppConfig) -> Value {
+fn machine_capabilities(config: &AppConfig) -> Value {
+    let trade_controls = TradeControlsPolicy::from_app_config(config).capabilities_payload();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "output": "json_envelope",
@@ -559,6 +588,7 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
             "login",
             "logout",
             "whoami",
+            "overnight",
             "broker.context.show",
             "broker.context.select",
             "broker.overview",
@@ -572,6 +602,7 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
             "broker.watchlist.remove",
             "broker.search",
             "broker.derivatives.search",
+            "broker.chart",
             "broker.quote",
             "broker.security-news",
             "broker.price-alerts",
@@ -639,6 +670,7 @@ fn machine_capabilities(_config: &AppConfig) -> Value {
                 }
             }
         },
+        "local_trade_controls": trade_controls,
         "exit_codes": {
             "validation_error": 10,
             "auth_or_config_error": 20,
@@ -654,6 +686,7 @@ fn machine_command_name(command: &Commands) -> &'static str {
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",
+        Commands::Overnight(_) => "overnight",
         Commands::Broker(broker) => match &broker.command {
             BrokerCommand::Context(context) => match &context.command {
                 BrokerContextCommand::Show(_) => "broker.context.show",
@@ -676,6 +709,7 @@ fn machine_command_name(command: &Commands) -> &'static str {
             BrokerCommand::Derivatives(args) => match &args.command {
                 BrokerDerivativesCommand::Search(_) => "broker.derivatives.search",
             },
+            BrokerCommand::Chart(_) => "broker.chart",
             BrokerCommand::Quote(_) => "broker.quote",
             BrokerCommand::SecurityNews(_) => "broker.security-news",
             BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -726,149 +760,6 @@ fn run_installation_code_command(
     }
 
     Ok(())
-}
-
-pub(crate) fn refresh_loaded_session_if_needed(
-    session_manager: &mut SessionManager,
-    env: TargetEnv,
-    env_cfg: &EnvConfig,
-    stored_session: StoredSession,
-    dpop_options: &DpopRuntimeOptions,
-) -> Result<Session> {
-    let dpop = load_authenticated_session_dpop_context(&stored_session, dpop_options)?;
-    if let Some(refreshed) =
-        refresh_session_if_needed_with_dpop(env_cfg, &stored_session.session, &dpop)
-            .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?
-    {
-        save_active_session(
-            session_manager,
-            env,
-            &refreshed,
-            stored_session.mode,
-            dpop.jwk_thumbprint(),
-        )
-        .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?;
-        return Ok(refreshed);
-    }
-
-    Ok(stored_session.session)
-}
-
-pub(crate) fn execute_with_refresh_retry<T, F>(
-    session_manager: &mut SessionManager,
-    env: TargetEnv,
-    env_cfg: &EnvConfig,
-    session: &mut Session,
-    dpop_options: &DpopRuntimeOptions,
-    mut action: F,
-) -> Result<T>
-where
-    F: FnMut(&str) -> Result<T>,
-{
-    match action(&session.access_token) {
-        Ok(value) => Ok(value),
-        Err(first_err)
-            if is_unauthorized_graphql_error(&first_err) && session.refresh_token.is_some() =>
-        {
-            let dpop =
-                load_validated_active_session_dpop_context(session_manager, env, dpop_options)?;
-            let refreshed = refresh_session_with_dpop(env_cfg, session, &dpop)
-                .context("Token refresh after unauthorized response failed")
-                .map_err(|err| {
-                    clear_active_session_on_refresh_relogin_failure(session_manager, err)
-                })?;
-            let session_mode = session_manager.load_required_active()?.mode;
-            save_active_session(
-                session_manager,
-                env,
-                &refreshed,
-                session_mode,
-                dpop.jwk_thumbprint(),
-            )
-            .map_err(|err| clear_active_session_on_refresh_relogin_failure(session_manager, err))?;
-            *session = refreshed;
-
-            action(&session.access_token)
-                .context("GraphQL call failed after refreshing access token")
-        }
-        Err(first_err) => Err(first_err),
-    }
-}
-
-fn is_unauthorized_graphql_error(err: &anyhow::Error) -> bool {
-    let detail = err.to_string();
-    if detail.contains("GraphQL HTTP error 401") {
-        return true;
-    }
-
-    // Some GraphQL backends return auth failures in a 200 payload with errors[].
-    if detail.contains("GraphQL returned errors")
-        && (detail.contains("UNAUTHENTICATED")
-            || detail.contains("\"code\":\"UNAUTHENTICATED\"")
-            || detail.contains("Missing or invalid credentials"))
-    {
-        return true;
-    }
-
-    false
-}
-
-fn save_active_session(
-    session_manager: &mut SessionManager,
-    env: TargetEnv,
-    session: &Session,
-    session_mode: Option<SessionMode>,
-    dpop_jwk_thumbprint: &str,
-) -> Result<()> {
-    session_manager
-        .save_active(&StoredSession {
-            env,
-            session: session.clone(),
-            dpop_jwk_thumbprint: Some(dpop_jwk_thumbprint.to_string()),
-            mode: session_mode,
-        })
-        .map_err(|_err| {
-            anyhow::anyhow!(
-                "{REFRESH_RELOGIN_REQUIRED_PREFIX} Token refresh succeeded but the rotated session could not be persisted locally. Run 'sc login'."
-            )
-        })
-}
-
-fn load_validated_active_session_dpop_context(
-    session_manager: &SessionManager,
-    env: TargetEnv,
-    dpop_options: &DpopRuntimeOptions,
-) -> Result<auth::AuthDpopContext> {
-    let stored = session_manager.load_required_active()?;
-    if stored.env != env {
-        bail!(
-            "Stored session belongs to {}, not {env}. Run 'sc login' to replace it.",
-            stored.env
-        );
-    }
-    load_authenticated_session_dpop_context(&stored, dpop_options)
-}
-
-fn clear_active_session_on_refresh_relogin_failure(
-    session_manager: &mut SessionManager,
-    err: anyhow::Error,
-) -> anyhow::Error {
-    if !error_chain_contains_refresh_relogin_prefix(&err) {
-        return err;
-    }
-
-    match session_manager.delete_active() {
-        Ok(()) => err,
-        Err(delete_err) => anyhow::anyhow!(
-            "{REFRESH_RELOGIN_REQUIRED_PREFIX} {} Failed clearing the stale active session locally: {delete_err}",
-            user_error_message(&err)
-        ),
-    }
-}
-
-fn error_chain_contains_refresh_relogin_prefix(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.to_string().contains(REFRESH_RELOGIN_REQUIRED_PREFIX))
 }
 
 pub(crate) fn print_whoami_text(result: &Value) -> Result<()> {
@@ -937,15 +828,16 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use std::ffi::OsString;
 
+    use mockito::Server;
+    use tempfile::tempdir;
+
     use super::*;
-    use crate::cli::{BrokerArgs, Cli, Commands, LogoutArgs};
+    use crate::cli::{BrokerArgs, Cli, Commands, LogoutArgs, OvernightArgs};
     use crate::config::{
         AppConfig, AuthConfig, DpopKeyBackend, EnvConfig, RuntimeAuthConfig,
         SessionBackendPreference,
     };
-    use crate::session::{FileStore, LoginSource, SessionMode, StorageBackend, StoredSession};
-    use mockito::Server;
-    use tempfile::tempdir;
+    use crate::session::{FileStore, LoginSource, Session, StorageBackend, StoredSession};
 
     struct EnvGuard {
         key: &'static str,
@@ -991,109 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_detection_accepts_http_401_graphql_errors() {
-        let err = anyhow::anyhow!("GraphQL HTTP error 401: unauthorized");
-        assert!(is_unauthorized_graphql_error(&err));
-    }
-
-    #[test]
-    fn unauthorized_detection_accepts_graphql_unauthenticated_payload_errors() {
-        let err = anyhow::Error::msg("GraphQL returned errors for WhoAmI (code: UNAUTHENTICATED)");
-        assert!(is_unauthorized_graphql_error(&err));
-    }
-
-    #[test]
-    fn unauthorized_detection_ignores_non_auth_graphql_errors() {
-        let err = anyhow::Error::msg("GraphQL returned errors for WhoAmI (code: FORBIDDEN)");
-        assert!(!is_unauthorized_graphql_error(&err));
-    }
-
-    #[test]
-    fn unauthorized_detection_ignores_rate_limited_errors() {
-        let err = anyhow::Error::msg(
-            "RATE_LIMITED: backend rate limit exceeded during BrokerOverview; retry after 30s",
-        );
-        assert!(!is_unauthorized_graphql_error(&err));
-    }
-
-    #[test]
-    fn execute_with_refresh_retry_does_not_retry_rate_limited_errors() {
-        let tmp = tempdir().expect("tempdir");
-        let env_cfg = crate::channel::current_env_config();
-        let config = AppConfig {
-            auth: RuntimeAuthConfig {
-                session_backend: SessionBackendPreference::File,
-                signing_key_backend: DpopKeyBackend::File,
-                pkcs11: None,
-            },
-        };
-        let store =
-            StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
-        let mut session_manager = SessionManager::with_store(store);
-        let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-        let mut session = Session {
-            access_token: "access-token".to_string(),
-            refresh_token: Some("refresh-token".to_string()),
-            id_token: None,
-            expires_at: Some(9_999_999_999),
-            person_id: "person-1".to_string(),
-            source: LoginSource::DeviceCode,
-        };
-        let mut attempts = 0;
-
-        let result: Result<()> = execute_with_refresh_retry(
-            &mut session_manager,
-            crate::channel::current_env(),
-            &env_cfg,
-            &mut session,
-            &dpop_options,
-            |_| {
-                attempts += 1;
-                Err(anyhow::anyhow!(
-                    "RATE_LIMITED: backend rate limit exceeded during BrokerOverview; retry after 30s"
-                ))
-            },
-        );
-        let err = result.expect_err("rate-limited call should fail");
-
-        assert_eq!(attempts, 1);
-        assert!(err.to_string().contains("RATE_LIMITED:"));
-        assert_eq!(session.access_token, "access-token");
-        assert_eq!(session.refresh_token.as_deref(), Some("refresh-token"));
-    }
-
-    #[test]
-    fn save_active_session_preserves_session_mode() {
-        let tmp = tempdir().expect("tempdir");
-        let store =
-            StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
-        let mut session_manager = SessionManager::with_store(store);
-        let session = Session {
-            access_token: "access-token".to_string(),
-            refresh_token: Some("refresh-token".to_string()),
-            id_token: None,
-            expires_at: Some(9_999_999_999),
-            person_id: "person-1".to_string(),
-            source: LoginSource::DeviceCode,
-        };
-
-        save_active_session(
-            &mut session_manager,
-            crate::channel::current_env(),
-            &session,
-            Some(SessionMode::LocalReadOnly),
-            "thumbprint-1",
-        )
-        .expect("save refreshed session");
-
-        let stored = session_manager
-            .load_active()
-            .expect("load active")
-            .expect("stored session");
-        assert_eq!(stored.mode, Some(SessionMode::LocalReadOnly));
-    }
-
-    #[test]
     fn machine_logout_deletes_local_session_when_dpop_key_is_missing() {
         let _lock = crate::lock_test_env();
         let tmp = tempdir().expect("tempdir");
@@ -1114,6 +903,7 @@ mod tests {
                 signing_key_backend: DpopKeyBackend::File,
                 pkcs11: None,
             },
+            trade_controls: None,
         };
         let store =
             StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
@@ -1148,6 +938,31 @@ mod tests {
                 .expect("load active")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn overnight_machine_command_name_and_json_flag_are_wired() {
+        let command = Commands::Overnight(OvernightArgs {
+            savings_account_id: Some("sav-1".to_string()),
+            json: true,
+        });
+
+        assert!(command_requests_json_envelope(&command));
+        assert_eq!(machine_command_name(&command), "overnight");
+    }
+
+    #[test]
+    fn broker_chart_machine_command_name_and_json_flag_are_wired() {
+        let command = Commands::Broker(crate::cli::BrokerArgs {
+            command: BrokerCommand::Chart(crate::cli::BrokerChartArgs {
+                isin: "US0378331005".to_string(),
+                timeframe: crate::cli::BrokerChartTimeframe::OneMonth,
+                json: true,
+            }),
+        });
+
+        assert!(command_requests_json_envelope(&command));
+        assert_eq!(machine_command_name(&command), "broker.chart");
     }
 
     #[test]

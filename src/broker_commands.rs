@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
+use crate::active_session::load_active_session;
 use crate::broker_context::{
     BrokerContext, context_file_path, load_context as load_broker_context,
     save_context as save_broker_context,
@@ -8,6 +9,7 @@ use crate::broker_context::{
 use crate::broker_query_execution::{
     execute_broker_analytics as execute_broker_analytics_query,
     execute_broker_cash_breakdown as execute_broker_cash_breakdown_query,
+    execute_broker_chart as execute_broker_chart_query,
     execute_broker_derivatives_search as execute_broker_derivatives_search_query,
     execute_broker_holdings as execute_broker_holdings_query,
     execute_broker_overview as execute_broker_overview_query,
@@ -20,9 +22,7 @@ use crate::broker_query_execution::{
     execute_broker_transactions as execute_broker_transactions_query,
     execute_broker_watchlist as execute_broker_watchlist_query,
 };
-use crate::broker_shared::{
-    RESOLVE_BROKER_IDS_QUERY, load_active_session, resolve_broker_ids, validated_broker_input,
-};
+use crate::broker_shared::{RESOLVE_BROKER_IDS_QUERY, resolve_broker_ids, validated_broker_input};
 use crate::cli::{
     BrokerArgs, BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand,
     BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
@@ -49,12 +49,13 @@ use crate::helpers::{
     project_broker_savings_plan_by_isin_response, project_broker_savings_plan_config_response,
     project_broker_watchlist_add_response, project_broker_watchlist_remove_response,
 };
+use crate::resolve_active_env;
 use crate::session::{Session, SessionManager};
+use crate::session_refresh::execute_with_refresh_retry;
 use crate::trade_execution::{
     execute_broker_trade_buy, execute_broker_trade_cancel, execute_broker_trade_sell,
     render_trade_buy_text, render_trade_cancel_text, render_trade_sell_text,
 };
-use crate::{execute_with_refresh_retry, resolve_active_env};
 
 pub(crate) enum HumanBrokerOutput {
     Json(Value, bool),
@@ -318,6 +319,15 @@ pub(crate) fn run_broker_command_human(
                 Ok(HumanBrokerOutput::Json(payload, compact))
             }
         },
+        BrokerCommand::Chart(chart_args) => {
+            let compact = chart_args.json;
+            let payload = execute_broker_chart(chart_args, config, session_manager)?;
+            if compact {
+                Ok(HumanBrokerOutput::Json(payload, true))
+            } else {
+                Ok(HumanBrokerOutput::Text(render_broker_chart_text(&payload)))
+            }
+        }
         BrokerCommand::Quote(quote_args) => {
             let compact = quote_args.json;
             let payload = execute_broker_quote(quote_args, config, session_manager)?;
@@ -509,6 +519,7 @@ pub(crate) fn run_broker_command_machine(
                 execute_broker_derivatives_search(search_args, config, session_manager)
             }
         },
+        BrokerCommand::Chart(args) => execute_broker_chart(args, config, session_manager),
         BrokerCommand::Quote(args) => execute_broker_quote(args, config, session_manager),
         BrokerCommand::SecurityNews(args) => {
             execute_broker_security_news(args, config, session_manager)
@@ -1017,6 +1028,88 @@ fn display_money(value: Option<&Value>, currency: Option<&str>) -> String {
     }
 }
 
+fn render_broker_chart_text(payload: &Value) -> Vec<String> {
+    let result = payload.get("result").unwrap_or(payload);
+    let data_points = result
+        .get("data_points")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let currency = result.get("currency").and_then(Value::as_str);
+    let mut timestamped_points = data_points
+        .iter()
+        .filter(|point| chart_point_timestamp_key(point).is_some())
+        .collect::<Vec<_>>();
+    timestamped_points.sort_by_key(|point| chart_point_timestamp_key(point));
+    let first_point = timestamped_points.first().copied();
+    let last_point = timestamped_points.last().copied();
+    let min_point = data_points
+        .iter()
+        .filter_map(|point| chart_point_numeric_key(point).map(|value| (value, point)))
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, point)| point);
+    let max_point = data_points
+        .iter()
+        .filter_map(|point| chart_point_numeric_key(point).map(|value| (value, point)))
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, point)| point);
+
+    vec![
+        format!("isin: {}", display_value(result.get("isin"))),
+        format!("timeframe: {}", display_value(result.get("timeframe"))),
+        format!("currency: {}", display_value(result.get("currency"))),
+        format!("source: {}", display_value(result.get("source"))),
+        format!("point_count: {}", display_value(result.get("point_count"))),
+        format!(
+            "range_start: {}",
+            display_value(first_point.and_then(|point| point.get("timestamp_utc")))
+        ),
+        format!(
+            "range_end: {}",
+            display_value(last_point.and_then(|point| point.get("timestamp_utc")))
+        ),
+        format!(
+            "first_mid_price: {}",
+            display_money(
+                first_point.and_then(|point| point.get("mid_price")),
+                currency
+            )
+        ),
+        format!(
+            "last_mid_price: {}",
+            display_money(
+                last_point.and_then(|point| point.get("mid_price")),
+                currency
+            )
+        ),
+        format!(
+            "min_mid_price: {}",
+            display_money(min_point.and_then(|point| point.get("mid_price")), currency)
+        ),
+        format!(
+            "max_mid_price: {}",
+            display_money(max_point.and_then(|point| point.get("mid_price")), currency)
+        ),
+        "hint: rerun with --json to get the full point set".to_string(),
+    ]
+}
+
+fn chart_point_numeric_key(point: &Value) -> Option<f64> {
+    match point.get("mid_price")? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn chart_point_timestamp_key(point: &Value) -> Option<&str> {
+    point
+        .get("timestamp_utc")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn execute_broker_watchlist(
     args: crate::cli::BrokerWatchlistArgs,
     config: &AppConfig,
@@ -1143,6 +1236,14 @@ pub(crate) fn execute_broker_derivatives_search(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     execute_broker_derivatives_search_query(args, config, session_manager)
+}
+
+pub(crate) fn execute_broker_chart(
+    args: crate::cli::BrokerChartArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    execute_broker_chart_query(args, config, session_manager)
 }
 
 pub(crate) fn execute_broker_quote(
@@ -2415,6 +2516,7 @@ mod tests {
                 signing_key_backend: crate::config::DpopKeyBackend::File,
                 pkcs11: None,
             },
+            trade_controls: None,
         }
     }
 
@@ -2752,6 +2854,140 @@ mod tests {
                 "available_for_derivatives: 160",
             ]
         );
+    }
+
+    #[test]
+    fn render_broker_chart_text_summarizes_non_empty_series() {
+        let first_mid_price = json!(185.01);
+        let min_mid_price = json!(183.50);
+        let max_mid_price = json!(188.00);
+        let first_mid_price_line = format!(
+            "first_mid_price: {}",
+            display_money(Some(&first_mid_price), Some("EUR"))
+        );
+        let last_mid_price_line = format!(
+            "last_mid_price: {}",
+            display_money(Some(&max_mid_price), Some("EUR"))
+        );
+        let min_mid_price_line = format!(
+            "min_mid_price: {}",
+            display_money(Some(&min_mid_price), Some("EUR"))
+        );
+        let max_mid_price_line = format!(
+            "max_mid_price: {}",
+            display_money(Some(&max_mid_price), Some("EUR"))
+        );
+        let payload = json!({
+            "isin": "US0378331005",
+            "timeframe": "1m",
+            "currency": "EUR",
+            "source": "CONSOLIDATED",
+            "point_count": 3,
+            "data_points": [
+                {
+                    "mid_price": 188.00,
+                    "timestamp_utc": "2026-05-25T09:00:00Z"
+                },
+                {
+                    "mid_price": 185.01,
+                    "timestamp_utc": "2026-05-23T09:00:00Z"
+                },
+                {
+                    "mid_price": 183.50,
+                    "timestamp_utc": "2026-05-24T09:00:00Z"
+                }
+            ]
+        });
+
+        let lines = render_broker_chart_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "isin: US0378331005"));
+        assert!(lines.iter().any(|line| line == "timeframe: 1m"));
+        assert!(lines.iter().any(|line| line == "source: CONSOLIDATED"));
+        assert!(lines.iter().any(|line| line == "point_count: 3"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "range_start: 2026-05-23T09:00:00Z")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "range_end: 2026-05-25T09:00:00Z")
+        );
+        assert!(lines.iter().any(|line| line == &first_mid_price_line));
+        assert!(lines.iter().any(|line| line == &last_mid_price_line));
+        assert!(lines.iter().any(|line| line == &min_mid_price_line));
+        assert!(lines.iter().any(|line| line == &max_mid_price_line));
+    }
+
+    #[test]
+    fn render_broker_chart_text_uses_none_placeholders_for_empty_series() {
+        let payload = json!({
+            "isin": "US0378331005",
+            "timeframe": "ytd",
+            "currency": "EUR",
+            "source": "CONSOLIDATED",
+            "point_count": 0,
+            "data_points": []
+        });
+
+        let lines = render_broker_chart_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "point_count: 0"));
+        assert!(lines.iter().any(|line| line == "range_start: <none>"));
+        assert!(lines.iter().any(|line| line == "range_end: <none>"));
+        assert!(lines.iter().any(|line| line == "first_mid_price: <none>"));
+        assert!(lines.iter().any(|line| line == "last_mid_price: <none>"));
+        assert!(lines.iter().any(|line| line == "min_mid_price: <none>"));
+        assert!(lines.iter().any(|line| line == "max_mid_price: <none>"));
+    }
+
+    #[test]
+    fn render_broker_chart_text_supports_wrapped_result_payload() {
+        let payload = json!({
+            "result": {
+                "isin": "US0378331005",
+                "timeframe": "1m",
+                "currency": "EUR",
+                "source": "CONSOLIDATED",
+                "point_count": 1,
+                "data_points": [
+                    {
+                        "mid_price": 185.01,
+                        "timestamp_utc": "2026-05-23T09:00:00Z"
+                    }
+                ]
+            }
+        });
+
+        let lines = render_broker_chart_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "isin: US0378331005"));
+        assert!(lines.iter().any(|line| line == "timeframe: 1m"));
+        assert!(lines.iter().any(|line| line == "source: CONSOLIDATED"));
+        assert!(lines.iter().any(|line| line == "point_count: 1"));
+    }
+
+    #[test]
+    fn render_broker_chart_text_uses_projected_point_count() {
+        let payload = json!({
+            "isin": "US0378331005",
+            "timeframe": "1m",
+            "currency": "EUR",
+            "source": "CONSOLIDATED",
+            "point_count": 9,
+            "data_points": [
+                {
+                    "mid_price": 185.01,
+                    "timestamp_utc": "2026-05-23T09:00:00Z"
+                }
+            ]
+        });
+
+        let lines = render_broker_chart_text(&payload);
+
+        assert!(lines.iter().any(|line| line == "point_count: 9"));
     }
 
     #[test]

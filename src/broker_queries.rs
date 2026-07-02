@@ -4,8 +4,9 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 
 use crate::cli::{
-    BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField,
-    BrokerDerivativeSortOrder, BrokerDerivativeStrategy, BrokerDerivativeType,
+    BrokerChartTimeframe, BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory,
+    BrokerDerivativeSortField, BrokerDerivativeSortOrder, BrokerDerivativeStrategy,
+    BrokerDerivativeType,
 };
 
 const VALID_BROKER_TRANSACTION_TYPE_FILTERS: &[&str] = &[
@@ -427,6 +428,33 @@ query BrokerHoldings(
             isOutdated
           }
         }
+      }
+    }
+  }
+}
+"#;
+
+pub const BROKER_CHART_QUERY: &str = r#"
+query BrokerChart($isin: String!, $timeFrames: [TimeFrame!]!, $includeYearToDate: Boolean!) {
+  timeSeriesBySecurity(
+    isin: $isin
+    timeFrames: $timeFrames
+    includeYearToDate: $includeYearToDate
+  ) {
+    isin
+    timeFrame
+    currency
+    source
+    closingReferencePoint {
+      midPrice
+      timestampUtc {
+        time
+      }
+    }
+    dataPoints {
+      midPrice
+      timestampUtc {
+        time
       }
     }
   }
@@ -1311,6 +1339,16 @@ pub fn broker_holdings_variables(input: &BrokerInput) -> Result<Value> {
     }))
 }
 
+pub fn broker_chart_variables(isin: &str, timeframe: BrokerChartTimeframe) -> Result<Value> {
+    let isin = normalize_broker_isin(isin, "isin")?;
+
+    Ok(json!({
+        "isin": isin,
+        "timeFrames": [timeframe.as_graphql()],
+        "includeYearToDate": true,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn normalize_broker_transactions_query_input(
     page_size: u16,
@@ -1462,12 +1500,7 @@ pub fn broker_search_variables(input: &BrokerInput, search_term: &str) -> Result
 pub(crate) fn normalize_broker_derivatives_search_query_input(
     args: &crate::cli::BrokerDerivativesSearchArgs,
 ) -> Result<NormalizedBrokerDerivativesSearchQueryInput> {
-    let underlying_isin = args.underlying.trim();
-    if underlying_isin.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field 'underlying' must be a non-empty string"
-        ));
-    }
+    let underlying_isin = normalize_broker_isin(&args.underlying, "underlying")?;
     if args.offset > i32::MAX as u32 {
         return Err(anyhow!(
             "Broker input invalid: field 'offset' must be between 0 and {}",
@@ -1698,7 +1731,7 @@ pub(crate) fn normalize_broker_derivatives_search_query_input(
 
     Ok(NormalizedBrokerDerivativesSearchQueryInput {
         derivative_type: args.derivative_type,
-        underlying_isin: underlying_isin.to_string(),
+        underlying_isin,
         limit: args.limit,
         offset: args.offset,
         issuers: normalize_derivative_issuers(&args.issuer),
@@ -1753,18 +1786,13 @@ pub fn broker_derivatives_search_variables(
 }
 
 pub fn broker_quote_variables(input: &BrokerInput, isin: &str) -> Result<Value> {
-    let isin = isin.trim();
-    if isin.is_empty() {
-        return Err(anyhow!(
-            "Broker input invalid: field 'isin' must be a non-empty string"
-        ));
-    }
+    let isin = normalize_broker_isin(isin, "isin")?;
 
     let mut vars = broker_holdings_variables(input)?
         .as_object()
         .cloned()
         .ok_or_else(|| anyhow!("Broker input invalid: variables must be an object"))?;
-    vars.insert("isin".to_string(), Value::String(isin.to_string()));
+    vars.insert("isin".to_string(), Value::String(isin));
     Ok(Value::Object(vars))
 }
 
@@ -2562,6 +2590,61 @@ fn validate_enum_filter_values(
 
 fn format_enum_filter_help(prefix: &str, allowed: &[&str], normalization_hint: &str) -> String {
     format!("{prefix}: {}. {normalization_hint}", allowed.join(", "))
+}
+
+fn normalize_broker_isin(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Broker input invalid: field '{field}' must be a non-empty string"
+        ));
+    }
+
+    let canonical = trimmed.to_ascii_uppercase();
+    if !is_valid_isin(&canonical) {
+        return Err(anyhow!(
+            "Broker input invalid: field '{field}' must be a valid ISIN"
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn is_valid_isin(isin: &str) -> bool {
+    let bytes = isin.as_bytes();
+    if bytes.len() != 12
+        || !bytes[..2].iter().all(u8::is_ascii_alphabetic)
+        || !bytes[2..11].iter().all(u8::is_ascii_alphanumeric)
+        || !bytes[11].is_ascii_digit()
+    {
+        return false;
+    }
+
+    let mut expanded = String::with_capacity(24);
+    for byte in isin.bytes() {
+        match byte {
+            b'0'..=b'9' => expanded.push(char::from(byte)),
+            b'A'..=b'Z' => expanded.push_str((u16::from(byte - b'A') + 10).to_string().as_str()),
+            b'a'..=b'z' => expanded.push_str((u16::from(byte - b'a') + 10).to_string().as_str()),
+            _ => return false,
+        }
+    }
+
+    let mut sum = 0_u32;
+    let mut should_double = false;
+    for byte in expanded.bytes().rev() {
+        let mut digit = u32::from(byte - b'0');
+        if should_double {
+            digit *= 2;
+            if digit > 9 {
+                digit = (digit / 10) + (digit % 10);
+            }
+        }
+        sum += digit;
+        should_double = !should_double;
+    }
+
+    sum.is_multiple_of(10)
 }
 
 #[cfg(test)]

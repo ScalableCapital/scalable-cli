@@ -1,32 +1,35 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::active_session::load_active_session;
 use crate::broker_shared::{
     ResolvedBrokerIds, checksum_for_payload, fingerprint_payload_for_transactions_input,
-    load_active_session, resolve_broker_ids, validated_broker_input,
+    resolve_broker_ids, validated_broker_input,
 };
 use crate::config::AppConfig;
 use crate::graphql::execute_graphql;
 use crate::helpers::{
-    BROKER_ANALYTICS_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY, BROKER_HOLDINGS_QUERY,
-    BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY,
-    BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY, BROKER_SECURITY_NEWS_QUERY,
-    BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY, BROKER_WATCHLIST_QUERY,
-    broker_analytics_variables, broker_derivatives_search_variables, broker_holdings_variables,
-    broker_limits_variables, broker_overview_variables, broker_price_alerts_variables,
-    broker_quote_variables, broker_savings_plans_variables, broker_search_variables,
-    broker_transaction_details_variables, broker_transactions_variables_from_normalized,
-    broker_watchlist_variables, normalize_broker_derivatives_search_query_input,
-    normalize_broker_transactions_query_input, project_broker_analytics_response,
-    project_broker_cash_breakdown_response, project_broker_derivatives_search_response,
+    BROKER_ANALYTICS_QUERY, BROKER_CHART_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY,
+    BROKER_HOLDINGS_QUERY, BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY,
+    BROKER_QUOTE_QUERY, BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY,
+    BROKER_SECURITY_NEWS_QUERY, BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY,
+    BROKER_WATCHLIST_QUERY, broker_analytics_variables, broker_chart_variables,
+    broker_derivatives_search_variables, broker_holdings_variables, broker_limits_variables,
+    broker_overview_variables, broker_price_alerts_variables, broker_quote_variables,
+    broker_savings_plans_variables, broker_search_variables, broker_transaction_details_variables,
+    broker_transactions_variables_from_normalized, broker_watchlist_variables,
+    normalize_broker_derivatives_search_query_input, normalize_broker_transactions_query_input,
+    project_broker_analytics_response, project_broker_cash_breakdown_response,
+    project_broker_chart_response, project_broker_derivatives_search_response,
     project_broker_holdings_response, project_broker_overview_response,
     project_broker_price_alerts_response, project_broker_quote_response,
     project_broker_savings_plans_response, project_broker_search_response,
     project_broker_security_news_response, project_broker_transaction_details_response,
     project_broker_transactions_response, project_broker_watchlist_response,
 };
+use crate::resolve_active_env;
 use crate::session::SessionManager;
-use crate::{execute_with_refresh_retry, resolve_active_env};
+use crate::session_refresh::execute_with_refresh_retry;
 
 fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> Value {
     json!({
@@ -479,6 +482,46 @@ pub(crate) fn execute_broker_quote(
     Ok(broker_result_envelope(&ids, projected))
 }
 
+pub(crate) fn execute_broker_chart(
+    args: crate::cli::BrokerChartArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    let env_cfg = crate::channel::current_env_config();
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
+    let requested_timeframe = args.timeframe;
+    let variables = broker_chart_variables(&args.isin, requested_timeframe)?;
+    let requested_isin = variables
+        .get("isin")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Broker input invalid: variables.isin must be a string"))?
+        .to_string();
+    let response = execute_with_refresh_retry(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        |token| {
+            execute_graphql(
+                &env_cfg.graphql_url,
+                token,
+                BROKER_CHART_QUERY,
+                &variables,
+                Some("BrokerChart"),
+                access_context,
+                dpop_options,
+            )
+        },
+    )?;
+    project_broker_chart_response(&requested_isin, requested_timeframe, &response)
+}
+
 pub(crate) fn execute_broker_security_news(
     args: crate::cli::BrokerSecurityNewsArgs,
     config: &AppConfig,
@@ -675,12 +718,14 @@ mod tests {
     use mockito::{Matcher, Server};
 
     use crate::cli::{
-        BrokerCashBreakdownArgs, BrokerDerivativeIssuer, BrokerDerivativeKnockoutSubcategory,
-        BrokerDerivativeSortField, BrokerDerivativeSortOrder, BrokerDerivativeStrategy,
-        BrokerDerivativeType, BrokerDerivativesSearchArgs, BrokerOverviewArgs, BrokerQuoteArgs,
-        BrokerSearchArgs, BrokerTransactionsArgs,
+        BrokerCashBreakdownArgs, BrokerChartArgs, BrokerChartTimeframe, BrokerDerivativeIssuer,
+        BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField, BrokerDerivativeSortOrder,
+        BrokerDerivativeStrategy, BrokerDerivativeType, BrokerDerivativesSearchArgs,
+        BrokerOverviewArgs, BrokerQuoteArgs, BrokerSearchArgs, BrokerTransactionDetailsArgs,
+        BrokerTransactionsArgs,
     };
     use crate::config::TargetEnv;
+    use crate::machine::classify_error;
     use crate::session::{LoginSource, Session, StoredSession};
 
     struct EnvGuard {
@@ -761,6 +806,7 @@ mod tests {
                 signing_key_backend: crate::config::DpopKeyBackend::File,
                 pkcs11: None,
             },
+            trade_controls: None,
         }
     }
 
@@ -829,6 +875,14 @@ mod tests {
             isin: "US0378331005".to_string(),
             include_year_to_date: true,
             quote_source: Some("CONSOLIDATED".to_string()),
+            json: true,
+        }
+    }
+
+    fn sample_chart_args() -> BrokerChartArgs {
+        BrokerChartArgs {
+            isin: "US0378331005".to_string(),
+            timeframe: BrokerChartTimeframe::OneMonth,
             json: true,
         }
     }
@@ -1511,6 +1565,28 @@ mod tests {
     }
 
     #[test]
+    fn execute_broker_derivatives_search_rejects_invalid_underlying_isin_before_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let mut args = sample_derivatives_search_args();
+        args.underlying = "US0378331006".to_string();
+
+        let err = execute_broker_derivatives_search(args, &config, &mut session_manager)
+            .expect_err("invalid isin should fail locally");
+        assert!(err.to_string().contains("field 'underlying'"));
+        assert!(err.to_string().contains("valid ISIN"));
+    }
+
+    #[test]
     fn execute_broker_quote_accepts_derivative_isin() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut server = Server::new();
@@ -1533,7 +1609,7 @@ mod tests {
                     "accountId": "person-1",
                     "portfolioId": "portfolio-1",
                     "includeYearToDate": false,
-                    "isin": "DE000HSBC123"
+                    "isin": "DE000HSBC121"
                 }
             })))
             .with_status(200)
@@ -1545,7 +1621,7 @@ mod tests {
                             "brokerPortfolio": {
                                 "security": {
                                     "id": "security-derivative-1",
-                                    "isin": "DE000HSBC123",
+                                    "isin": "DE000HSBC121",
                                     "name": "Apple Turbo Long",
                                     "type": "WARRANT",
                                     "quoteTick": {
@@ -1574,7 +1650,7 @@ mod tests {
         let payload = execute_broker_quote(
             crate::cli::BrokerQuoteArgs {
                 portfolio_id: Some("portfolio-1".to_string()),
-                isin: "DE000HSBC123".to_string(),
+                isin: "DE000HSBC121".to_string(),
                 include_year_to_date: false,
                 quote_source: None,
                 json: true,
@@ -1586,7 +1662,7 @@ mod tests {
 
         assert_eq!(
             payload.pointer("/result/isin").and_then(Value::as_str),
-            Some("DE000HSBC123")
+            Some("DE000HSBC121")
         );
         assert_eq!(
             payload
@@ -1595,6 +1671,28 @@ mod tests {
             Some("WARRANT")
         );
         quote_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_quote_rejects_invalid_isin_before_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let mut args = sample_quote_args();
+        args.isin = "US0378331006".to_string();
+
+        let err = execute_broker_quote(args, &config, &mut session_manager)
+            .expect_err("invalid isin should fail locally");
+        assert!(err.to_string().contains("field 'isin'"));
+        assert!(err.to_string().contains("valid ISIN"));
     }
 
     #[test]
@@ -1710,5 +1808,386 @@ mod tests {
             Some(&json!("ONE_DAY"))
         );
         quote_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_chart_happy_path_returns_direct_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let chart_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerChart".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "isin": "US0378331005",
+                    "timeFrames": ["ONE_MONTH"],
+                    "includeYearToDate": true
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "timeSeriesBySecurity": [
+                            {
+                                "isin": "US0378331005",
+                                "timeFrame": "ONE_MONTH",
+                                "currency": "EUR",
+                                "source": "CONSOLIDATED",
+                                "closingReferencePoint": {
+                                    "midPrice": 184.12,
+                                    "timestampUtc": {
+                                        "time": "2026-05-22T21:59:59Z"
+                                    }
+                                },
+                                "dataPoints": [
+                                    {
+                                        "midPrice": 185.01,
+                                        "timestampUtc": {
+                                            "time": "2026-05-23T09:00:00Z"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_chart(sample_chart_args(), &config, &mut session_manager)
+            .expect("chart payload");
+
+        assert_eq!(payload.get("account_id"), None);
+        assert_eq!(
+            payload.get("isin").and_then(Value::as_str),
+            Some("US0378331005")
+        );
+        assert_eq!(payload.get("timeframe").and_then(Value::as_str), Some("1m"));
+        assert_eq!(
+            payload.get("source").and_then(Value::as_str),
+            Some("CONSOLIDATED")
+        );
+        assert_eq!(payload.get("point_count").and_then(Value::as_u64), Some(1));
+        chart_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_chart_accepts_lowercase_isin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let chart_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerChart".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "isin": "US0378331005",
+                    "timeFrames": ["ONE_MONTH"],
+                    "includeYearToDate": true
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "timeSeriesBySecurity": [
+                            {
+                                "isin": "US0378331005",
+                                "timeFrame": "ONE_MONTH",
+                                "currency": "EUR",
+                                "source": "CONSOLIDATED",
+                                "closingReferencePoint": {
+                                    "midPrice": 184.12,
+                                    "timestampUtc": {
+                                        "time": "2026-05-22T21:59:59Z"
+                                    }
+                                },
+                                "dataPoints": []
+                            }
+                        ]
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_chart(
+            BrokerChartArgs {
+                isin: "us0378331005".to_string(),
+                timeframe: BrokerChartTimeframe::OneMonth,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("chart payload");
+
+        assert_eq!(
+            payload.get("isin").and_then(Value::as_str),
+            Some("US0378331005")
+        );
+        assert_eq!(payload.get("point_count").and_then(Value::as_u64), Some(0));
+        chart_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_chart_maps_ytd_alias_to_year_to_date() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let chart_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerChart".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "isin": "US0378331005",
+                    "timeFrames": ["YEAR_TO_DATE"],
+                    "includeYearToDate": true
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "timeSeriesBySecurity": [
+                            {
+                                "isin": "US0378331005",
+                                "timeFrame": "YEAR_TO_DATE",
+                                "currency": "EUR",
+                                "source": "CONSOLIDATED",
+                                "closingReferencePoint": {
+                                    "midPrice": 184.12,
+                                    "timestampUtc": {
+                                        "time": "2026-05-22T21:59:59Z"
+                                    }
+                                },
+                                "dataPoints": []
+                            }
+                        ]
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_chart(
+            BrokerChartArgs {
+                isin: "US0378331005".to_string(),
+                timeframe: BrokerChartTimeframe::YearToDate,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("chart payload");
+
+        assert_eq!(
+            payload.get("timeframe").and_then(Value::as_str),
+            Some("ytd")
+        );
+        assert_eq!(payload.get("point_count").and_then(Value::as_u64), Some(0));
+        chart_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_quote_preserves_soft_success_for_checksum_valid_unknown_isin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let quote_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerQuote".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "LU2903252406",
+                    "includeYearToDate": false
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "brokerPortfolio": {
+                                "security": {
+                                    "id": "security-unknown-1",
+                                    "isin": "LU2903252406",
+                                    "name": "LU2903252406",
+                                    "type": "EQ",
+                                    "quoteTick": null
+                                }
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload = execute_broker_quote(
+            BrokerQuoteArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                isin: "LU2903252406".to_string(),
+                include_year_to_date: false,
+                quote_source: None,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("quote payload");
+
+        assert_eq!(
+            payload.pointer("/result/isin").and_then(Value::as_str),
+            Some("LU2903252406")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/security_id")
+                .and_then(Value::as_str),
+            Some("security-unknown-1")
+        );
+        assert_eq!(
+            payload.pointer("/result/quote_mid_price"),
+            Some(&Value::Null)
+        );
+        assert_eq!(payload.pointer("/result/quote_tick_id"), Some(&Value::Null));
+        quote_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_chart_rejects_invalid_isin_before_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let err = execute_broker_chart(
+            BrokerChartArgs {
+                isin: "US0378331006".to_string(),
+                timeframe: BrokerChartTimeframe::OneMonth,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect_err("invalid isin should fail locally");
+
+        assert!(err.to_string().contains("field 'isin'"));
+        assert!(err.to_string().contains("valid ISIN"));
+    }
+
+    #[test]
+    fn execute_broker_transaction_details_maps_transaction_not_found_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let transaction_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerTransactionDetails".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "accountId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "transactionId": "not-a-real-transaction-id"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "errors": [
+                        {
+                            "message": "Transaction with ID not-a-real-transaction-id not found",
+                            "extensions": {
+                                "code": "BAD_REQUEST"
+                            },
+                            "validationErrors": {
+                                "errorCode": "TransactionNotFound"
+                            }
+                        }
+                    ]
+                }"#,
+            )
+            .create();
+
+        let err = execute_broker_transaction_details(
+            BrokerTransactionDetailsArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                transaction_id: "not-a-real-transaction-id".to_string(),
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect_err("transaction not found should be classified");
+
+        assert_eq!(
+            err.to_string(),
+            "Broker transaction not found: field 'transaction_id' was not found"
+        );
+        assert_eq!(classify_error(&err).code, "broker_transaction_not_found");
+        transaction_mock.assert();
     }
 }

@@ -467,23 +467,31 @@ pub fn login_with_device_code(
             DevicePollState::Authorized(token) => {
                 let verified = verify_access_token_strict(&token.access_token, env_cfg)
                     .context("Access token verification failed after device login")?;
-                handle_post_login_mfa_with_sanitized_errors(
-                    &mut progress,
-                    env_cfg,
-                    &token.access_token,
-                    &verified.person_id,
-                    dpop_options,
-                )?;
-                progress.finish()?;
-
+                let expires_at = token.expires_in.map(|s| current_epoch_seconds() + s);
                 let session = Session {
                     access_token: token.access_token,
                     refresh_token: token.refresh_token,
                     id_token: token.id_token,
-                    expires_at: token.expires_in.map(|s| current_epoch_seconds() + s),
+                    expires_at,
                     person_id: verified.person_id,
                     source: LoginSource::DeviceCode,
                 };
+                if let Err(err) = handle_post_login_mfa_with_sanitized_errors(
+                    &mut progress,
+                    env_cfg,
+                    &session.access_token,
+                    &session.person_id,
+                    dpop_options,
+                ) {
+                    revoke_tokens_on_logout_best_effort(
+                        env_cfg,
+                        &session,
+                        session_mode,
+                        dpop_options,
+                    );
+                    return Err(err);
+                }
+                progress.finish()?;
                 return session_manager.save_active_with_backend(&StoredSession {
                     env,
                     session,
@@ -938,10 +946,8 @@ fn handle_post_login_mfa(
 ) -> Result<()> {
     let endpoint = &env_cfg.graphql_url;
 
-    let state = match fetch_login_2fa_state(endpoint, token, user_id, dpop_options) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
+    let state = fetch_login_2fa_state(endpoint, token, user_id, dpop_options)
+        .context("Failed to verify trusted-device 2FA state")?;
 
     if state.enabled != Some(true) {
         return Ok(());
@@ -2314,6 +2320,111 @@ Verify the code \u{1b}[1mVXWZ-JZDW\u{1b}[0m in your browser.\n\n"
         let msg = err.to_string();
         assert_eq!(msg, TRUSTED_DEVICE_2FA_FAILURE_MESSAGE);
         assert!(!msg.contains("LEAK_ME"));
+    }
+
+    #[test]
+    fn login_with_device_code_fails_when_trusted_device_2fa_state_cannot_be_verified() {
+        let _lock = crate::lock_test_env();
+        let mut server = Server::new();
+        let env_cfg = EnvConfig {
+            graphql_url: format!("{}/graphql", server.url()),
+            auth: AuthConfig {
+                issuer: server.url(),
+                audience: "aud".to_string(),
+                client_id: "client-id".to_string(),
+            },
+        };
+        let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+        let access_token = make_verified_token(&env_cfg, json!({}));
+        let _device_code = server
+            .mock("POST", "/oauth/device/code")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+                Matcher::UrlEncoded("audience".into(), "aud".into()),
+                Matcher::UrlEncoded("scope".into(), AUTH_SCOPE.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"device_code":"dc","user_code":"uc","verification_uri":"https://verify","expires_in":600,"interval":1}"#,
+            )
+            .expect(1)
+            .create();
+        let _token = server
+            .mock("POST", "/oauth/token")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::UrlEncoded(
+                    "grant_type".into(),
+                    "urn:ietf:params:oauth:grant-type:device_code".into(),
+                ),
+                Matcher::UrlEncoded("device_code".into(), "dc".into()),
+                Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"access_token":"{access_token}","expires_in":3600}}"#
+            ))
+            .expect(1)
+            .create();
+        let _is_enabled = server
+            .mock("POST", "/graphql")
+            .match_body(PartialJson(serde_json::json!({
+                "operation_name": "Is2faOnLoginEnabled",
+                "variables": {
+                    "input": {
+                        "userId": "p-1"
+                    }
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"errors":[{"extensions":{"code":"UNAUTHENTICATED"},"message":"LEAK_STATE","path":["is2faOnLoginEnabled"]}]}"#,
+            )
+            .expect(1)
+            .create();
+        let _revoke_access = server
+            .mock("POST", "/graphql")
+            .match_body(PartialJson(serde_json::json!({
+                "operation_name": "revokeAuthAccessToken",
+                "variables": {
+                    "input": {
+                        "accessToken": access_token
+                    }
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"revokeAuthAccessToken":true}}"#)
+            .expect(1)
+            .create();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let store = crate::session::StorageBackend::File(
+            crate::session::FileStore::new(tmp.path().to_path_buf()).expect("file store"),
+        );
+        let mut session_manager = SessionManager::with_store(store);
+
+        let err = login_with_device_code(
+            &mut session_manager,
+            TargetEnv::Prod,
+            &env_cfg,
+            None,
+            &runtime_dpop_options(),
+        )
+        .expect_err("login should fail when trusted-device 2fa state cannot be verified");
+
+        let msg = err.to_string();
+        assert_eq!(msg, TRUSTED_DEVICE_2FA_FAILURE_MESSAGE);
+        assert!(!msg.contains("LEAK_STATE"));
+        assert!(
+            session_manager
+                .load_active()
+                .expect("load session")
+                .is_none()
+        );
     }
 
     #[test]

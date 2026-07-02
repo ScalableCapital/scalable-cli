@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use crate::broker_queries::{
     BrokerInput, NormalizedBrokerDerivativesSearchQueryInput, timestamp_value_or_null,
 };
+use crate::cli::BrokerChartTimeframe;
 
 pub fn project_broker_overview_response(input: &BrokerInput, response: &Value) -> Result<Value> {
     let valuation = response
@@ -471,6 +472,78 @@ pub fn project_broker_quote_response(
             .unwrap_or(Value::Null),
         "quote_performances": mapped_performances,
     }))
+}
+
+pub fn project_broker_chart_response(
+    requested_isin: &str,
+    requested_timeframe: BrokerChartTimeframe,
+    response: &Value,
+) -> Result<Value> {
+    let series = response
+        .get("timeSeriesBySecurity")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Broker response invalid: missing timeSeriesBySecurity"))?;
+
+    let requested_isin = requested_isin.trim();
+    let requested_timeframe_graphql = requested_timeframe.as_graphql();
+    let requested_timeframe_cli = requested_timeframe.as_cli_value();
+    let matching_series = series
+        .iter()
+        .find(|entry| {
+            entry
+                .get("timeFrame")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                == Some(requested_timeframe_graphql)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Broker response invalid: requested timeframe '{requested_timeframe_cli}' missing from timeSeriesBySecurity"
+            )
+        })?;
+
+    let actual_isin = matching_series
+        .get("isin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Broker response invalid: missing timeSeriesBySecurity[].isin"))?;
+    if actual_isin != requested_isin {
+        return Err(anyhow!(
+            "Broker response invalid: requested isin '{requested_isin}' does not match returned security isin '{actual_isin}'"
+        ));
+    }
+
+    let raw_data_points = matching_series
+        .get("dataPoints")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let data_points = raw_data_points
+        .iter()
+        .map(map_broker_chart_point)
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "isin": actual_isin,
+        "timeframe": requested_timeframe_cli,
+        "currency": matching_series.get("currency").cloned().unwrap_or(Value::Null),
+        "source": matching_series.get("source").cloned().unwrap_or(Value::Null),
+        "closing_reference_point": map_broker_chart_point(
+            matching_series
+                .get("closingReferencePoint")
+                .unwrap_or(&Value::Null),
+        ),
+        "data_points": data_points,
+        "point_count": raw_data_points.len(),
+    }))
+}
+
+fn map_broker_chart_point(point: &Value) -> Value {
+    json!({
+        "mid_price": point.get("midPrice").cloned().unwrap_or(Value::Null),
+        "timestamp_utc": timestamp_value_or_null(point.get("timestampUtc")),
+    })
 }
 
 pub fn project_broker_security_news_response(

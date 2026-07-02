@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 use crate::cli::WhoamiArgs;
 use crate::config::AppConfig;
 use crate::graphql::run_whoami_query;
+use crate::print_whoami_text;
 use crate::session::SessionManager;
+use crate::session_refresh::{execute_with_refresh_retry, refresh_loaded_session_if_needed};
 use crate::transport_security::validate_env_transport_security;
-use crate::{execute_with_refresh_retry, print_whoami_text, refresh_loaded_session_if_needed};
 
 fn load_whoami_result(config: &AppConfig, session_manager: &mut SessionManager) -> Result<Value> {
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
@@ -178,6 +179,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 signing_key_backend: DpopKeyBackend::File,
                 pkcs11: None,
             },
+            trade_controls: None,
         }
     }
 

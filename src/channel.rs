@@ -231,6 +231,7 @@ mod tests {
                     key_uri: "pkcs11:token=YubiKey%20PIV;id=%01".to_string(),
                 }),
             },
+            trade_controls: None,
         };
 
         let options = current_dpop_runtime_options(&config);

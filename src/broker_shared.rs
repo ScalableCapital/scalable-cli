@@ -8,8 +8,7 @@ use crate::dpop::DpopRuntimeOptions;
 use crate::graphql::{GraphqlAccessContext, execute_graphql};
 use crate::helpers::BrokerInput;
 use crate::session::{Session, SessionManager};
-use crate::transport_security::validate_env_transport_security;
-use crate::{execute_with_refresh_retry, refresh_loaded_session_if_needed};
+use crate::session_refresh::execute_with_refresh_retry;
 
 pub(crate) const RESOLVE_BROKER_IDS_QUERY: &str = r#"
 query ResolveBrokerIds($id: ID!) {
@@ -27,11 +26,6 @@ pub(crate) struct ResolvedBrokerIds {
     pub(crate) portfolio_id: String,
     pub(crate) account_source: &'static str,
     pub(crate) portfolio_source: &'static str,
-}
-
-pub(crate) struct LoadedActiveSession {
-    pub(crate) session: Session,
-    pub(crate) access_context: GraphqlAccessContext,
 }
 
 pub(crate) fn fingerprint_payload_for_transactions_input(normalized_input: &Value) -> Value {
@@ -70,29 +64,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hasher.update(bytes);
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub(crate) fn load_active_session(
-    session_manager: &mut SessionManager,
-    env: TargetEnv,
-    env_cfg: &EnvConfig,
-    dpop_options: &DpopRuntimeOptions,
-) -> Result<LoadedActiveSession> {
-    validate_env_transport_security(env_cfg)?;
-    let stored = session_manager.load_required_active()?;
-    if stored.env != env {
-        bail!(
-            "Stored session belongs to {}, not {env}. Run 'sc login' to replace it.",
-            stored.env
-        );
-    }
-    let access_context = GraphqlAccessContext::with_session_mode(stored.mode);
-    let session =
-        refresh_loaded_session_if_needed(session_manager, env, env_cfg, stored, dpop_options)?;
-    Ok(LoadedActiveSession {
-        session,
-        access_context,
-    })
 }
 
 pub(crate) fn validated_broker_input(

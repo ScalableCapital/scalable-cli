@@ -37,10 +37,12 @@ fn capabilities_returns_machine_json_envelope() {
     assert_eq!(envelope["command"], json!("capabilities"));
     assert!(commands.contains(&json!("installation-code")));
     assert!(commands.contains(&json!("login")));
+    assert!(commands.contains(&json!("overnight")));
     assert!(commands.contains(&json!("broker.overview")));
     assert!(commands.contains(&json!("broker.analytics")));
     assert!(commands.contains(&json!("broker.watchlist.add")));
     assert!(commands.contains(&json!("broker.watchlist.remove")));
+    assert!(commands.contains(&json!("broker.chart")));
     assert!(commands.contains(&json!("broker.quote")));
     assert!(commands.contains(&json!("broker.price-alerts.remove")));
     assert!(commands.contains(&json!("broker.trade.buy")));

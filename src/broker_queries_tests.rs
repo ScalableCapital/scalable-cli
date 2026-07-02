@@ -271,6 +271,26 @@ fn broker_derivatives_search_variables_reject_offset_above_graphql_int_max() {
 }
 
 #[test]
+fn broker_derivatives_search_variables_reject_invalid_underlying_isin_checksum() {
+    let mut args = sample_derivatives_search_args();
+    args.underlying = "US0378331006".to_string();
+
+    let err = normalize_broker_derivatives_search_query_input(&args).unwrap_err();
+    assert!(err.to_string().contains("field 'underlying'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_derivatives_search_variables_reject_non_isin_underlying_shape() {
+    let mut args = sample_derivatives_search_args();
+    args.underlying = "000000000000".to_string();
+
+    let err = normalize_broker_derivatives_search_query_input(&args).unwrap_err();
+    assert!(err.to_string().contains("field 'underlying'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
 fn broker_derivatives_search_variables_reject_invalid_warrant_expiry_range() {
     let mut args = sample_derivatives_search_args();
     args.derivative_type = crate::cli::BrokerDerivativeType::Warrant;
@@ -432,9 +452,67 @@ fn broker_quote_variables_map_input() {
 }
 
 #[test]
+fn broker_chart_variables_map_input() {
+    let vars = broker_chart_variables(" US0378331005 ", crate::cli::BrokerChartTimeframe::OneMonth)
+        .expect("vars");
+    assert_eq!(vars["isin"], "US0378331005");
+    assert_eq!(vars["timeFrames"], json!(["ONE_MONTH"]));
+    assert_eq!(vars["includeYearToDate"], true);
+}
+
+#[test]
+fn broker_chart_variables_reject_blank_isin() {
+    let err = broker_chart_variables("  ", crate::cli::BrokerChartTimeframe::OneMonth).unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+}
+
+#[test]
+fn broker_chart_variables_reject_invalid_isin_checksum() {
+    let err = broker_chart_variables("US0378331006", crate::cli::BrokerChartTimeframe::OneMonth)
+        .unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_chart_variables_reject_non_isin_shape() {
+    let err = broker_chart_variables("000000000000", crate::cli::BrokerChartTimeframe::OneMonth)
+        .unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_chart_variables_normalize_lowercase_isin() {
+    let vars = broker_chart_variables("us0378331005", crate::cli::BrokerChartTimeframe::OneMonth)
+        .expect("vars");
+    assert_eq!(vars["isin"], "US0378331005");
+}
+
+#[test]
 fn broker_quote_variables_reject_blank_isin() {
     let err = broker_quote_variables(&broker_input(false, None), "  ").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
+}
+
+#[test]
+fn broker_quote_variables_reject_invalid_isin_checksum() {
+    let err = broker_quote_variables(&broker_input(false, None), "US0378331006").unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_quote_variables_reject_non_isin_shape() {
+    let err = broker_quote_variables(&broker_input(false, None), "000000000000").unwrap_err();
+    assert!(err.to_string().contains("field 'isin'"));
+    assert!(err.to_string().contains("valid ISIN"));
+}
+
+#[test]
+fn broker_quote_variables_normalize_lowercase_isin() {
+    let vars = broker_quote_variables(&broker_input(false, None), "us0378331005").expect("vars");
+    assert_eq!(vars["isin"], "US0378331005");
 }
 
 #[test]
@@ -456,6 +534,34 @@ fn broker_quote_query_contains_app_parity_identity_and_tick_fields() {
     assert!(
         !BROKER_QUOTE_QUERY.contains("\n          time\n"),
         "quote query should not request deprecated QuoteTick.time"
+    );
+}
+
+#[test]
+fn broker_chart_query_contains_timeseries_fields_without_deprecated_timestamps() {
+    for required in [
+        "timeSeriesBySecurity(",
+        "timeFrames: $timeFrames",
+        "includeYearToDate: $includeYearToDate",
+        "timeFrame",
+        "source",
+        "closingReferencePoint",
+        "dataPoints",
+        "midPrice",
+        "timestampUtc",
+    ] {
+        assert!(
+            BROKER_CHART_QUERY.contains(required),
+            "chart query should contain {required}"
+        );
+    }
+    assert!(
+        !BROKER_CHART_QUERY.contains("\n        timestamp\n"),
+        "chart query should not request deprecated timestamp"
+    );
+    assert!(
+        !BROKER_CHART_QUERY.contains("epochSeconds"),
+        "chart query should not request deprecated epochSeconds"
     );
 }
 

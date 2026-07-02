@@ -13,11 +13,20 @@ fn sc_command() -> Command {
 }
 
 fn write_test_config(config_dir: &Path) {
+    write_test_config_with_extra(config_dir, "");
+}
+
+fn write_test_config_with_extra(config_dir: &Path, extra: &str) {
     let config = r#"[auth]
 session_backend = "file"
 signing_key_backend = "file"
 "#;
-    fs::write(config_dir.join("config.toml"), config).expect("write config");
+    let contents = if extra.trim().is_empty() {
+        config.to_string()
+    } else {
+        format!("{config}\n{extra}\n")
+    };
+    fs::write(config_dir.join("config.toml"), contents).expect("write config");
 }
 
 fn current_session_env() -> &'static str {
@@ -125,6 +134,17 @@ fn temp_config_dir() -> (TempDir, String) {
     write_test_config(tmp.path());
     let config_dir = tmp.path().to_string_lossy().to_string();
     (tmp, config_dir)
+}
+
+fn capabilities_json(config_dir: &str) -> Value {
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", config_dir)
+        .args(["capabilities", "--json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    serde_json::from_str(&stdout).expect("machine json envelope")
 }
 
 fn assert_json_no_session(args: &[&str], command: &str) {
@@ -264,6 +284,151 @@ fn broker_watchlist_add_json_returns_local_read_only_machine_error() {
         .stdout(predicate::str::contains("\"code\":\"local_read_only\""))
         .stdout(predicate::str::contains(
             "local read-only mode blocks write operation 'BrokerAddToWatchlist'",
+        ));
+}
+
+#[test]
+fn capabilities_json_reports_disabled_local_trade_controls_when_not_configured() {
+    let (_tmp, config_dir) = temp_config_dir();
+    let envelope = capabilities_json(&config_dir);
+    let controls = &envelope["data"]["local_trade_controls"];
+
+    assert_eq!(envelope["ok"], json!(true));
+    assert_eq!(envelope["command"], json!("capabilities"));
+    assert_eq!(controls["enabled"], json!(false));
+    assert_eq!(controls["isin_controls_active"], json!(false));
+    assert_eq!(controls["allowed_isins_configured"], json!(false));
+    assert_eq!(controls["denied_isins_configured"], json!(false));
+    assert_eq!(controls["max_order_notional_active"], json!(false));
+}
+
+#[test]
+fn capabilities_json_reports_configured_empty_allowlist_as_active() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config_with_extra(
+        tmp.path(),
+        r#"[trade_controls]
+allowed_isins = []
+max_order_notional = "1000"
+"#,
+    );
+
+    let envelope = capabilities_json(&config_dir);
+    let controls = &envelope["data"]["local_trade_controls"];
+
+    assert_eq!(envelope["ok"], json!(true));
+    assert_eq!(envelope["command"], json!("capabilities"));
+    assert_eq!(controls["enabled"], json!(true));
+    assert_eq!(controls["isin_controls_active"], json!(true));
+    assert_eq!(controls["allowed_isins_configured"], json!(true));
+    assert_eq!(controls["denied_isins_configured"], json!(false));
+    assert_eq!(controls["max_order_notional_active"], json!(true));
+    assert_eq!(controls["allowed_isins"], json!([]));
+    assert_eq!(controls["max_order_notional"], json!("1000"));
+}
+
+#[test]
+fn broker_trade_buy_json_returns_isin_not_allowed_machine_error_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config_with_extra(
+        tmp.path(),
+        r#"[trade_controls]
+allowed_isins = ["IE00B4L5Y983"]
+"#,
+    );
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "100",
+            "--json",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains(
+            "\"code\":\"trade_control_isin_not_allowed\"",
+        ))
+        .stdout(predicate::str::contains(
+            "local trade controls require ISIN 'US0378331005' to be present in allowed_isins",
+        ));
+}
+
+#[test]
+fn broker_trade_buy_json_returns_isin_denied_machine_error_before_session_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config_with_extra(
+        tmp.path(),
+        r#"[trade_controls]
+allowed_isins = ["US0378331005"]
+denied_isins = ["US0378331005"]
+"#,
+    );
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "100",
+            "--json",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains(
+            "\"code\":\"trade_control_isin_denied\"",
+        ))
+        .stdout(predicate::str::contains(
+            "local trade controls deny ISIN 'US0378331005' via denied_isins",
+        ));
+}
+
+#[test]
+fn broker_trade_buy_json_prioritizes_isin_denied_over_allowlist_miss() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config_with_extra(
+        tmp.path(),
+        r#"[trade_controls]
+allowed_isins = ["IE00B4L5Y983"]
+denied_isins = ["US0378331005"]
+"#,
+    );
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "trade",
+            "buy",
+            "--isin",
+            "US0378331005",
+            "--amount",
+            "100",
+            "--json",
+        ])
+        .assert()
+        .code(10)
+        .stdout(predicate::str::contains("\"command\":\"broker.trade.buy\""))
+        .stdout(predicate::str::contains(
+            "\"code\":\"trade_control_isin_denied\"",
+        ))
+        .stdout(predicate::str::contains(
+            "local trade controls deny ISIN 'US0378331005' via denied_isins",
         ));
 }
 
@@ -500,6 +665,98 @@ fn broker_quote_json_without_session_returns_no_session_code() {
 }
 
 #[test]
+fn broker_chart_json_without_session_returns_no_session_code() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "chart",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "1m",
+            "--json",
+        ],
+        "broker.chart",
+    );
+}
+
+#[test]
+fn broker_quote_json_invalid_isin_returns_broker_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        None,
+        Some(thumbprint.as_str()),
+    );
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "quote",
+            "--portfolio-id",
+            "portfolio-1",
+            "--isin",
+            "US0378331006",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.quote"));
+    assert_eq!(envelope["error"]["code"], json!("broker_input_invalid"));
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("Broker input invalid: field 'isin' must be a valid ISIN")
+    );
+}
+
+#[test]
+fn broker_chart_json_invalid_isin_returns_broker_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    let thumbprint = ensure_runtime_dpop_key(tmp.path());
+    write_test_session_with_options(
+        tmp.path(),
+        "test-access-token",
+        None,
+        Some(thumbprint.as_str()),
+    );
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "chart",
+            "--isin",
+            "US0378331006",
+            "--timeframe",
+            "1m",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.chart"));
+    assert_eq!(envelope["error"]["code"], json!("broker_input_invalid"));
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("Broker input invalid: field 'isin' must be a valid ISIN")
+    );
+}
+
+#[test]
 fn broker_watchlist_add_parent_json_without_session_returns_no_session_code() {
     assert_json_no_session(
         &[
@@ -541,6 +798,43 @@ fn broker_watchlist_remove_parent_json_without_session_returns_no_session_code()
             "US0378331005",
         ],
         "broker.watchlist.remove",
+    );
+}
+
+#[test]
+fn broker_derivatives_search_json_invalid_underlying_returns_broker_input_invalid_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().to_string_lossy().to_string();
+    write_test_config(tmp.path());
+    write_test_session(tmp.path(), "test-access-token");
+
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args([
+            "broker",
+            "derivatives",
+            "search",
+            "--portfolio-id",
+            "portfolio-1",
+            "--underlying",
+            "US0378331006",
+            "--type",
+            "warrant",
+            "--strategy",
+            "call",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(envelope["command"], json!("broker.derivatives.search"));
+    assert_eq!(envelope["error"]["code"], json!("broker_input_invalid"));
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("Broker input invalid: field 'underlying' must be a valid ISIN")
     );
 }
 

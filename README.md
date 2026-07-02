@@ -228,6 +228,7 @@ sc broker analytics
 sc broker transactions
 sc broker transaction details --transaction-id <TRANSACTION_ID>
 sc broker holdings
+sc broker chart --isin US0378331005 --timeframe 1m
 sc broker quote --isin US0378331005
 sc broker watchlist
 sc broker search "apple"
@@ -297,9 +298,21 @@ Trade cancellation is a separate single-step command for pending orders. Use
 the `order_id` returned by `sc broker trade buy` or `sc broker trade sell`; it
 is the same ID shown in `sc broker transactions`.
 
+Optional local trade controls can be configured in `config.toml` for CLI-based
+trading:
+
+- `allowed_isins`
+- `denied_isins`
+- `max_order_notional`
+
+These controls are enforced locally by the CLI only. They do not change your
+account permissions or backend trading permissions.
+
 ## Automation
 
 - `sc capabilities --json` exposes the supported machine-readable command surface.
+- `sc capabilities --json` also exposes the parsed local trade-control state in
+  `local_trade_controls`.
 - Broker commands support `--json` for compact structured output.
 - `sc login` remains human-oriented in the current version.
 
@@ -328,6 +341,27 @@ Configuration options:
 
 - session_backend: where the login session is stored. Supported values: `keyring`, `file`. Default is `keyring` on macOS/Linux.
 - signing_key_backend: where the authentication signing key is stored. Supported values: `file`, `secure_enclave`, `pkcs11`. Default is `secure_enclave` on macOS and `file` on Linux. `secure_enclave` is macOS-only. `pkcs11` is Linux-only and opt-in.
+
+### Local trade controls
+
+You can optionally define local trade controls for the CLI:
+
+```toml
+[trade_controls]
+allowed_isins = ["US0378331005", "IE00B4L5Y983"]
+denied_isins = ["US88160R1014"]
+max_order_notional = "1000"
+```
+
+Trade-control behavior:
+
+- If a control is not configured, it is inactive.
+- If neither `allowed_isins` nor `denied_isins` is configured, ISIN controls are inactive.
+- If `allowed_isins = []`, no ISIN can be traded through the CLI.
+- If both `allowed_isins` and `denied_isins` are configured, the effective set is `allowed_isins - denied_isins`.
+- `max_order_notional` is checked against the prepared order notional before submission.
+
+These controls apply only when trading through `sc`.
 
 ### Linux PKCS#11 signing key
 

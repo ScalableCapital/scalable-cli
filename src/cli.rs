@@ -8,7 +8,7 @@ use crate::helpers::{broker_transactions_status_help, broker_transactions_type_f
     about = "Scalable Capital CLI",
     long_about = "Scalable Capital CLI",
     version,
-    after_help = "Examples:\n  sc installation-code\n  sc login\n  sc broker context select --portfolio-id <PORTFOLIO_ID>\n  sc broker overview"
+    after_help = "Examples:\n  sc installation-code\n  sc login\n  sc overnight\n  sc broker context select --portfolio-id <PORTFOLIO_ID>\n  sc broker overview"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -26,6 +26,8 @@ pub enum Commands {
     Logout(LogoutArgs),
     #[command(about = "Run the built-in WhoAmI query")]
     Whoami(WhoamiArgs),
+    #[command(about = "Show overnight savings account summary")]
+    Overnight(OvernightArgs),
     #[command(about = "Broker commands")]
     Broker(BrokerArgs),
     #[command(about = "List CLI capabilities")]
@@ -55,6 +57,15 @@ pub struct LogoutArgs {
 
 #[derive(Debug, Args)]
 pub struct WhoamiArgs {
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct OvernightArgs {
+    #[arg(long, help = "Overnight savings account id override")]
+    pub savings_account_id: Option<String>,
+
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
@@ -90,6 +101,8 @@ pub enum BrokerCommand {
     Search(BrokerSearchArgs),
     #[command(about = "Discover derivatives for a known underlying ISIN")]
     Derivatives(BrokerDerivativesArgs),
+    #[command(about = "Get historical chart data for a security ISIN")]
+    Chart(BrokerChartArgs),
     #[command(about = "Get the current quote for a security ISIN")]
     Quote(BrokerQuoteArgs),
     #[command(about = "Get news summary for a security ISIN")]
@@ -560,6 +573,66 @@ pub struct BrokerQuoteArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BrokerChartTimeframe {
+    #[value(name = "1d")]
+    OneDay,
+    #[value(name = "7d")]
+    SevenDays,
+    #[value(name = "1m")]
+    OneMonth,
+    #[value(name = "3m")]
+    ThreeMonths,
+    #[value(name = "6m")]
+    SixMonths,
+    #[value(name = "ytd")]
+    YearToDate,
+    #[value(name = "1y")]
+    OneYear,
+    #[value(name = "max")]
+    Max,
+}
+
+impl BrokerChartTimeframe {
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::OneDay => "1d",
+            Self::SevenDays => "7d",
+            Self::OneMonth => "1m",
+            Self::ThreeMonths => "3m",
+            Self::SixMonths => "6m",
+            Self::YearToDate => "ytd",
+            Self::OneYear => "1y",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn as_graphql(self) -> &'static str {
+        match self {
+            Self::OneDay => "TWO_DAYS",
+            Self::SevenDays => "ONE_WEEK",
+            Self::OneMonth => "ONE_MONTH",
+            Self::ThreeMonths => "THREE_MONTHS",
+            Self::SixMonths => "SIX_MONTHS",
+            Self::YearToDate => "YEAR_TO_DATE",
+            Self::OneYear => "ONE_YEAR",
+            Self::Max => "MAX",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerChartArgs {
+    #[arg(long, help = "Security ISIN")]
+    pub isin: String,
+
+    #[arg(long, value_enum, help = "Chart timeframe")]
+    pub timeframe: BrokerChartTimeframe,
+
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct BrokerSecurityNewsArgs {
     #[arg(long, help = "Security ISIN")]
@@ -920,6 +993,7 @@ mod tests {
         cmd.write_long_help(&mut help).unwrap();
         let text = String::from_utf8(help).unwrap();
         assert!(text.contains("Broker commands"));
+        assert!(text.contains("Show overnight savings account summary"));
     }
 
     #[test]
@@ -941,6 +1015,36 @@ mod tests {
                 assert!(args.json);
             }
             _ => panic!("capabilities --json should parse"),
+        }
+    }
+
+    #[test]
+    fn overnight_parses() {
+        let cli = Cli::parse_from(["sc", "overnight", "--savings-account-id", "sav-1"]);
+        match cli.command {
+            Commands::Overnight(OvernightArgs {
+                savings_account_id,
+                json,
+            }) => {
+                assert_eq!(savings_account_id.as_deref(), Some("sav-1"));
+                assert!(!json);
+            }
+            _ => panic!("overnight should parse"),
+        }
+    }
+
+    #[test]
+    fn overnight_json_parses() {
+        let cli = Cli::parse_from(["sc", "overnight", "--savings-account-id", "sav-1", "--json"]);
+        match cli.command {
+            Commands::Overnight(OvernightArgs {
+                savings_account_id,
+                json,
+            }) => {
+                assert_eq!(savings_account_id.as_deref(), Some("sav-1"));
+                assert!(json);
+            }
+            _ => panic!("overnight --json should parse"),
         }
     }
 
@@ -1161,6 +1265,65 @@ mod tests {
                 assert!(args.json);
             }
             _ => panic!("broker quote should parse"),
+        }
+    }
+
+    #[test]
+    fn broker_chart_parses() {
+        let cli = Cli::parse_from([
+            "sc",
+            "broker",
+            "chart",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "1m",
+            "--json",
+        ]);
+        match cli.command {
+            Commands::Broker(BrokerArgs {
+                command: BrokerCommand::Chart(args),
+            }) => {
+                assert_eq!(args.isin, "US0378331005");
+                assert_eq!(args.timeframe, BrokerChartTimeframe::OneMonth);
+                assert!(args.json);
+            }
+            _ => panic!("broker chart should parse"),
+        }
+    }
+
+    #[test]
+    fn broker_chart_rejects_unknown_timeframe() {
+        let err = Cli::try_parse_from([
+            "sc",
+            "broker",
+            "chart",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "1w",
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("7d"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn broker_chart_timeframes_map_to_public_and_graphql_values() {
+        let cases = [
+            (BrokerChartTimeframe::OneDay, "1d", "TWO_DAYS"),
+            (BrokerChartTimeframe::SevenDays, "7d", "ONE_WEEK"),
+            (BrokerChartTimeframe::OneMonth, "1m", "ONE_MONTH"),
+            (BrokerChartTimeframe::ThreeMonths, "3m", "THREE_MONTHS"),
+            (BrokerChartTimeframe::SixMonths, "6m", "SIX_MONTHS"),
+            (BrokerChartTimeframe::YearToDate, "ytd", "YEAR_TO_DATE"),
+            (BrokerChartTimeframe::OneYear, "1y", "ONE_YEAR"),
+            (BrokerChartTimeframe::Max, "max", "MAX"),
+        ];
+
+        for (timeframe, public, graphql) in cases {
+            assert_eq!(timeframe.as_cli_value(), public);
+            assert_eq!(timeframe.as_graphql(), graphql);
         }
     }
 

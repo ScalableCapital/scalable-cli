@@ -4,10 +4,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::broker_shared::{checksum_for_payload, load_active_session, resolve_broker_ids};
+use crate::active_session::load_active_session;
+use crate::broker_shared::{checksum_for_payload, resolve_broker_ids};
 use crate::config::{AppConfig, TargetEnv};
 use crate::graphql::{LOCAL_READ_ONLY_ERROR_PREFIX, execute_graphql, execute_graphql_with_headers};
+use crate::resolve_active_env;
 use crate::session::SessionManager;
+use crate::session_refresh::execute_with_refresh_retry;
 use crate::trade::{
     PlaceOrderFields, SecurityTick, SingleExAnteFields, TRADE_APPROPRIATENESS_WARNING_QUERY,
     TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION, TRADE_SECURITY_TICK_QUERY,
@@ -29,6 +32,7 @@ use crate::trade_confirmation::{
     ConfirmationFields, ConfirmationPhase1Input, TradeConfirmation, load_confirmation,
     mark_confirmation_consumed, upsert_confirmation,
 };
+use crate::trade_controls::TradeControlsPolicy;
 use crate::trade_presentation::{
     PHASE1_COMPLIANCE_RULE_ID, PHASE1_PRESENTATION_FORMAT,
     build_phase1_command_template as build_phase1_command_template_from_module,
@@ -41,7 +45,6 @@ use crate::trade_presentation::{
     render_trade_buy_text as render_trade_buy_text_from_module,
     render_trade_sell_text as render_trade_sell_text_from_module,
 };
-use crate::{execute_with_refresh_retry, resolve_active_env};
 
 const CONFIRMATION_TTL_SECONDS: i64 = 15 * 60;
 const ORDER_TYPE_MARKET: &str = "market";
@@ -301,7 +304,10 @@ fn execute_trade_phase1(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
+    let trade_controls = TradeControlsPolicy::from_app_config(config);
+    trade_controls.check_isin(&intent.isin)?;
     let prepared = prepare_trade(&intent, config, session_manager)?;
+    trade_controls.check_estimated_order_volume(prepared.estimated_order_volume)?;
     ensure_price_warning_quote_legs(
         &prepared.intent,
         &SecurityTick {
@@ -453,9 +459,12 @@ fn execute_trade_phase2(
     assert_phase2_matches_phase1_input(side, &phase2, &stored.phase1_input)?;
 
     let intent = build_phase2_intent(side, &phase2, &stored.phase1_input)?;
+    let trade_controls = TradeControlsPolicy::from_app_config(config);
+    trade_controls.check_isin(&intent.isin)?;
     let prepared = prepare_trade(&intent, config, session_manager)?;
 
     ensure_phase2_submission_requirements(&prepared, &phase2, &stored)?;
+    trade_controls.check_estimated_order_volume(prepared.estimated_order_volume)?;
 
     let order_submission = submit_order(
         &prepared,
@@ -2049,6 +2058,7 @@ mod tests {
                 signing_key_backend: crate::config::DpopKeyBackend::File,
                 pkcs11: None,
             },
+            trade_controls: None,
         }
     }
 

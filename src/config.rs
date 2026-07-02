@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
@@ -111,6 +112,22 @@ const fn default_signing_key_backend() -> DpopKeyBackend {
 pub struct AppConfig {
     #[serde(default)]
     pub auth: RuntimeAuthConfig,
+    #[serde(default)]
+    pub trade_controls: Option<TradeControlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeControlsConfig {
+    #[serde(default, deserialize_with = "deserialize_optional_isin_list")]
+    pub allowed_isins: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_isin_list")]
+    pub denied_isins: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_positive_decimal_string"
+    )]
+    pub max_order_notional: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +141,128 @@ pub struct AuthConfig {
     pub issuer: String,
     pub audience: String,
     pub client_id: String,
+}
+
+fn deserialize_optional_isin_list<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Option::<Vec<String>>::deserialize(deserializer)?;
+    values
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|value| canonical_isin_for_config(&value).map_err(de::Error::custom))
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+}
+
+fn deserialize_optional_positive_decimal_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|raw| canonical_positive_decimal_for_config(&raw).map_err(de::Error::custom))
+        .transpose()
+}
+
+fn canonical_isin_for_config(value: &str) -> Result<String> {
+    let normalized = value.trim().to_uppercase();
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "trade_controls ISIN entries must be non-empty strings"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn canonical_positive_decimal_for_config(raw: &str) -> Result<String> {
+    let normalized = normalize_decimal_str(raw);
+    if !is_canonical_unsigned_decimal(&normalized) || normalized == "0" {
+        return Err(anyhow!(
+            "trade_controls.max_order_notional must be a positive decimal"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn is_canonical_unsigned_decimal(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        return false;
+    }
+
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return false;
+    }
+
+    match fraction {
+        Some(part) => !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()),
+        None => true,
+    }
+}
+
+fn normalize_decimal_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "0".to_string();
+    }
+
+    let mut chars = trimmed.chars();
+    let negative = matches!(chars.next(), Some('-'));
+    let unsigned = if negative || trimmed.starts_with('+') {
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+
+    if unsigned.is_empty() {
+        return "0".to_string();
+    }
+
+    let parts = unsigned.split('.').collect::<Vec<_>>();
+    if parts.len() > 2
+        || !parts
+            .iter()
+            .all(|segment| segment.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return trimmed.to_string();
+    }
+
+    let integer_raw = parts[0].trim_start_matches('0');
+    let integer = if integer_raw.is_empty() {
+        "0"
+    } else {
+        integer_raw
+    };
+    let fraction = if parts.len() == 2 {
+        parts[1].trim_end_matches('0')
+    } else {
+        ""
+    };
+
+    let mut normalized = if fraction.is_empty() {
+        integer.to_string()
+    } else {
+        format!("{integer}.{fraction}")
+    };
+
+    if negative && normalized != "0" {
+        normalized = format!("-{normalized}");
+    }
+
+    normalized
 }
 
 impl AppConfig {
@@ -656,11 +795,66 @@ session_backend = "file"
     }
 
     #[test]
+    fn app_config_parses_trade_controls() {
+        let raw = r#"
+[trade_controls]
+allowed_isins = [" us0378331005 ", "IE00B4L5Y983"]
+denied_isins = ["us88160r1014"]
+max_order_notional = "001000.00"
+"#;
+        let cfg = toml::from_str::<AppConfig>(raw).expect("trade controls should parse");
+
+        assert_eq!(
+            cfg.trade_controls,
+            Some(TradeControlsConfig {
+                allowed_isins: Some(vec!["US0378331005".to_string(), "IE00B4L5Y983".to_string()]),
+                denied_isins: Some(vec!["US88160R1014".to_string()]),
+                max_order_notional: Some("1000".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn app_config_rejects_unknown_top_level_keys() {
         let raw = r#"
 foo = "bar"
 "#;
         let err = toml::from_str::<AppConfig>(raw).expect_err("unknown keys should fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn app_config_rejects_blank_trade_control_isin_entries() {
+        let raw = r#"
+[trade_controls]
+allowed_isins = [" "]
+"#;
+        let err = toml::from_str::<AppConfig>(raw).expect_err("blank ISIN should fail");
+        assert!(err.to_string().contains("trade_controls ISIN entries"));
+    }
+
+    #[test]
+    fn app_config_rejects_invalid_trade_control_notional() {
+        let raw = r#"
+[trade_controls]
+max_order_notional = "abc"
+"#;
+        let err = toml::from_str::<AppConfig>(raw).expect_err("invalid notional should fail");
+        assert!(
+            err.to_string()
+                .contains("trade_controls.max_order_notional")
+        );
+    }
+
+    #[test]
+    fn app_config_rejects_unknown_trade_control_keys() {
+        let raw = r#"
+[trade_controls]
+allowed_isins = ["US0378331005"]
+allowed_order_types = ["market"]
+"#;
+        let err =
+            toml::from_str::<AppConfig>(raw).expect_err("unknown trade control keys should fail");
         assert!(err.to_string().contains("unknown field"));
     }
 
