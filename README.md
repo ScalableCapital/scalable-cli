@@ -334,7 +334,9 @@ sc broker trade buy --isin US0378331005 --shares 2 --order-type market \
   --confirm <CONFIRMATION_ID>
 ```
 
-If phase 1 explicitly requires unsuitable acknowledgement for the buy order, `--accept-unsuitable` confirms that you are aware of the risks and still want to proceed.
+If phase 1 explicitly requires acknowledgement of an appropriateness warning for
+the buy order, set `--acknowledge-appropriateness-warning` only after reviewing
+the warning and confirming that you understand the risks and want to proceed.
 
 Buy orders require exactly one sizing input: `--amount` or `--shares`. Buy-side
 share input currently accepts whole shares only.
