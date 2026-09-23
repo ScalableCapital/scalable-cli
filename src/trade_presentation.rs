@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 
 #[cfg(test)]
 use crate::trade::NumberOfShares;
-use crate::trade::TradeSide;
+use crate::trade::{TradeComplianceDecision, TradeSide};
 use crate::trade_confirmation::ConfirmationPhase1Input;
 use crate::trade_execution::{
     ORDER_SIDE_BUY, ORDER_SIDE_SELL, PreparedTrade, VENUE_GETTEX, VENUE_LABEL_GETTEX,
@@ -585,8 +585,8 @@ const PHASE1_PRESENTATION_FIELDS_SUITABILITY: [PresentationFieldSpec; 7] = [
     },
     PresentationFieldSpec {
         section_key: "suitability",
-        path: "/result/suitability/requires_accept_unsuitable",
-        label: "Requires unsuitable acknowledgement",
+        path: "/result/suitability/requires_appropriateness_warning_acknowledgement",
+        label: "Requires appropriateness warning acknowledgement",
         nullable: false,
     },
 ];
@@ -812,26 +812,13 @@ fn append_phase1_sizing_argument(cmd: &mut String, phase1_input: &ConfirmationPh
 pub(crate) fn build_phase2_command_template(
     confirmation_id: &str,
     phase1_input: &ConfirmationPhase1Input,
-    requires_accept_unsuitable: bool,
+    requires_appropriateness_warning_acknowledgement: bool,
     json_mode: bool,
 ) -> String {
-    let mut cmd = format!(
-        "sc broker trade {} --isin {} --order-type {}",
-        phase1_input.side, phase1_input.isin, phase1_input.order_type
-    );
-    append_phase1_sizing_argument(&mut cmd, phase1_input);
-    if let Some(venue) = phase1_input.venue.as_deref() {
-        cmd.push_str(&format!(" --venue {venue}"));
-    }
-    if let Some(limit_price) = phase1_input.limit_price.as_deref() {
-        cmd.push_str(&format!(" --limit-price {limit_price}"));
-    }
-    if let Some(stop_price) = phase1_input.stop_price.as_deref() {
-        cmd.push_str(&format!(" --stop-price {stop_price}"));
-    }
+    let mut cmd = build_phase1_command_template(phase1_input, false);
     cmd.push_str(&format!(" --confirm {confirmation_id}"));
-    if requires_accept_unsuitable {
-        cmd.push_str(" --accept-unsuitable");
+    if requires_appropriateness_warning_acknowledgement {
+        cmd.push_str(" --acknowledge-appropriateness-warning");
     }
     if json_mode {
         cmd.push_str(" --json");
@@ -861,6 +848,19 @@ pub(crate) fn build_phase1_command_template(
         cmd.push_str(" --json");
     }
     cmd
+}
+
+pub(crate) fn build_suitability_payload(decision: &TradeComplianceDecision) -> Value {
+    json!({
+        "source": decision.source_kind.as_str(),
+        "type": decision.suitability_type.map(|value| value.as_str()),
+        "status": decision.status.as_str(),
+        "action_when_unsuitable": decision.action_when_unsuitable.map(|value| value.as_str()),
+        "questionnaire_required": decision.questionnaire_required,
+        "questionnaire_reason": decision.questionnaire_reason,
+        "requires_appropriateness_warning_acknowledgement": decision.requires_appropriateness_warning_acknowledgement,
+        "acknowledgement_flag": decision.requires_appropriateness_warning_acknowledgement.then_some("--acknowledge-appropriateness-warning"),
+    })
 }
 
 pub(crate) fn build_result_payload(
@@ -902,22 +902,7 @@ pub(crate) fn build_result_payload(
             "reason": "phase_1_preview_only"
         })
     });
-    let suitability = json!({
-        "source": prepared.compliance_decision.source_kind.as_str(),
-        "type": prepared.compliance_decision.suitability_type.map(|value| value.as_str()),
-        "status": prepared.compliance_decision.status.as_str(),
-        "action_when_unsuitable": prepared
-            .compliance_decision
-            .action_when_unsuitable
-            .map(|value| value.as_str()),
-        "questionnaire_required": prepared.compliance_decision.questionnaire_required,
-        "questionnaire_reason": prepared.compliance_decision.questionnaire_reason,
-        "requires_accept_unsuitable": prepared.compliance_decision.requires_accept_unsuitable,
-        "accept_flag": prepared
-            .compliance_decision
-            .requires_accept_unsuitable
-            .then_some("--accept-unsuitable"),
-    });
+    let suitability = build_suitability_payload(&prepared.compliance_decision);
     let mut result = json!({
         "intent": {
             "side": prepared.intent.side_label(),
@@ -1269,11 +1254,11 @@ fn render_suitability_block(payload: &Value) -> Vec<String> {
             .unwrap_or_else(|| value.to_string()),
         None => "<missing>".to_string(),
     };
-    let requires_accept_unsuitable = payload
-        .pointer("/result/suitability/requires_accept_unsuitable")
+    let requires_appropriateness_warning_acknowledgement = payload
+        .pointer("/result/suitability/requires_appropriateness_warning_acknowledgement")
         .map(|value| value.to_string())
         .unwrap_or_else(|| "<missing>".to_string());
-    let accept_flag = match payload.pointer("/result/suitability/accept_flag") {
+    let acknowledgement_flag = match payload.pointer("/result/suitability/acknowledgement_flag") {
         Some(value) if value.is_null() => "null".to_string(),
         Some(value) => value
             .as_str()
@@ -1289,9 +1274,11 @@ fn render_suitability_block(payload: &Value) -> Vec<String> {
     lines.push(format!("questionnaire_required: {questionnaire_required}"));
     lines.push(format!("questionnaire_reason: {questionnaire_reason}"));
     lines.push(format!(
-        "requires_accept_unsuitable: {requires_accept_unsuitable}"
+        "requires_appropriateness_warning_acknowledgement: {requires_appropriateness_warning_acknowledgement}"
     ));
-    lines.push(format!("phase_2_acknowledgement_flag: {accept_flag}"));
+    lines.push(format!(
+        "phase_2_acknowledgement_flag: {acknowledgement_flag}"
+    ));
 
     lines
 }
@@ -1913,13 +1900,13 @@ mod tests {
     }
 
     #[test]
-    fn phase2_command_template_includes_accept_unsuitable_when_required() {
+    fn phase2_command_template_includes_acknowledge_appropriateness_warning_when_required() {
         let template =
             build_phase2_command_template("scb1_test", &sample_phase1_input("buy"), true, true);
 
         assert_eq!(
             template,
-            "sc broker trade buy --isin DE0007100000 --order-type limit --amount 500 --venue SEIX --limit-price 48.50 --stop-price 47.00 --confirm scb1_test --accept-unsuitable --json"
+            "sc broker trade buy --isin DE0007100000 --order-type limit --amount 500 --venue SEIX --limit-price 48.50 --stop-price 47.00 --confirm scb1_test --acknowledge-appropriateness-warning --json"
         );
     }
 
@@ -2033,6 +2020,35 @@ mod tests {
                 .pointer("/calculation/estimate_price_basis")
                 .and_then(Value::as_str),
             Some("limit_price")
+        );
+    }
+
+    #[test]
+    fn phase1_presentation_surfaces_required_appropriateness_warning_acknowledgement() {
+        let mut prepared = sample_prepared_trade(TradeSide::Buy);
+        prepared
+            .compliance_decision
+            .requires_appropriateness_warning_acknowledgement = true;
+        let result = build_result_payload(&prepared, None);
+        assert_eq!(
+            result["suitability"]["acknowledgement_flag"],
+            "--acknowledge-appropriateness-warning"
+        );
+
+        let presentation = build_phase1_presentation(
+            &result,
+            &json!({"id": "scb1_test", "expires_at_epoch": 1_777_777_777i64}),
+        )
+        .expect("presentation should build");
+        let acknowledgement = find_field(
+            &presentation,
+            "/result/suitability/requires_appropriateness_warning_acknowledgement",
+        )
+        .expect("warning acknowledgement requirement should be presented");
+        assert_eq!(acknowledgement["value"], true);
+        assert_eq!(
+            acknowledgement["label"],
+            "Requires appropriateness warning acknowledgement"
         );
     }
 
@@ -2153,8 +2169,8 @@ mod tests {
                     "action_when_unsuitable": Value::Null,
                     "questionnaire_required": false,
                     "questionnaire_reason": Value::Null,
-                    "requires_accept_unsuitable": false,
-                    "accept_flag": Value::Null
+                    "requires_appropriateness_warning_acknowledgement": false,
+                    "acknowledgement_flag": Value::Null
                 }
             },
             "confirmation": { "id": "scb1_test" },
@@ -2232,8 +2248,8 @@ mod tests {
                     "action_when_unsuitable": Value::Null,
                     "questionnaire_required": false,
                     "questionnaire_reason": Value::Null,
-                    "requires_accept_unsuitable": false,
-                    "accept_flag": Value::Null
+                    "requires_appropriateness_warning_acknowledgement": false,
+                    "acknowledgement_flag": Value::Null
                 }
             },
             "confirmation": { "id": "scb1_test" },
@@ -2450,8 +2466,8 @@ mod tests {
                     "action_when_unsuitable": Value::Null,
                     "questionnaire_required": false,
                     "questionnaire_reason": Value::Null,
-                    "requires_accept_unsuitable": false,
-                    "accept_flag": Value::Null
+                    "requires_appropriateness_warning_acknowledgement": false,
+                    "acknowledgement_flag": Value::Null
                 }
             },
             "confirmation": { "id": "scb1_test" },

@@ -18,6 +18,11 @@ mod command_handlers;
 mod config;
 pub mod dpop;
 mod execution_context;
+mod fixed_term_commands;
+mod fixed_term_projections;
+mod fixed_term_queries;
+#[cfg(test)]
+mod fixed_term_tests;
 mod graphql;
 mod helpers;
 mod machine;
@@ -55,7 +60,8 @@ use crate::broker_context::delete_context as delete_broker_context;
 use crate::cli::{
     BrokerCommand, BrokerContextCommand, BrokerDerivativesCommand, BrokerPortfolioGroupsCommand,
     BrokerPriceAlertsCommand, BrokerSavingsPlansCommand, BrokerTradeCommand,
-    BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands, OvernightCommand,
+    BrokerTransactionCommand, BrokerWatchlistCommand, Cli, Commands, FixedTermCommand,
+    OvernightCommand,
 };
 use crate::command_handlers::{run_human_whoami_command, run_machine_whoami_command};
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
@@ -134,6 +140,10 @@ pub(crate) fn command_requests_json_envelope(command: &Commands) -> bool {
         Commands::Login(_) => false,
         Commands::Logout(args) => args.json,
         Commands::Whoami(args) => args.json,
+        Commands::FixedTerm(args) => match &args.command {
+            FixedTermCommand::List(args) => args.json,
+            FixedTermCommand::Details(args) => args.json,
+        },
         Commands::Overnight(args) => match &args.command {
             Some(OvernightCommand::Transactions(transactions_args)) => transactions_args.json,
             None => args.json,
@@ -516,7 +526,6 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             BrokerContextCommand::Select(args) => args.json,
         },
         BrokerCommand::Overview(args) => args.json,
-        BrokerCommand::Analytics(args) => args.json,
         BrokerCommand::CashBreakdown(args) => args.json,
         BrokerCommand::Transactions(args) => args.json,
         BrokerCommand::Transaction(transaction_args) => match &transaction_args.command {
@@ -612,38 +621,26 @@ fn run_human_command(
         Commands::Whoami(args) => {
             run_human_whoami_command(args, config, session_manager)?;
         }
+        Commands::FixedTerm(args) => {
+            let payload = fixed_term_commands::execute(args.command, config, session_manager)?;
+            print_human_lines(&fixed_term_commands::render(&payload));
+        }
         Commands::Overnight(args) => {
             let payload = run_overnight_command_human(args, config, session_manager)?;
             match payload {
                 HumanOvernightOutput::Json(value, compact) => {
-                    if compact {
-                        println!("{}", serde_json::to_string(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    print_human_json(&value, compact)?;
                 }
-                HumanOvernightOutput::Text(lines) => {
-                    for line in lines {
-                        println!("{line}");
-                    }
-                }
+                HumanOvernightOutput::Text(lines) => print_human_lines(&lines),
             }
         }
         Commands::Broker(args) => {
             let payload = run_broker_command_human(args, config, session_manager)?;
             match payload {
                 HumanBrokerOutput::Json(value, compact) => {
-                    if compact {
-                        println!("{}", serde_json::to_string(&value)?);
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    print_human_json(&value, compact)?;
                 }
-                HumanBrokerOutput::Text(lines) => {
-                    for line in lines {
-                        println!("{line}");
-                    }
-                }
+                HumanBrokerOutput::Text(lines) => print_human_lines(&lines),
             }
         }
         Commands::Capabilities(_) => {
@@ -655,6 +652,22 @@ fn run_human_command(
     }
 
     Ok(())
+}
+
+fn print_human_json(value: &Value, compact: bool) -> Result<()> {
+    let output = if compact {
+        serde_json::to_string(value)?
+    } else {
+        serde_json::to_string_pretty(value)?
+    };
+    println!("{output}");
+    Ok(())
+}
+
+fn print_human_lines(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
+    }
 }
 
 fn run_machine_command(
@@ -683,6 +696,9 @@ fn run_machine_command(
             Ok(json!({"logged_out": false}))
         }
         Commands::Whoami(args) => run_machine_whoami_command(args, config, session_manager),
+        Commands::FixedTerm(args) => {
+            fixed_term_commands::execute(args.command, config, session_manager)
+        }
         Commands::Overnight(args) => run_overnight_command_machine(args, config, session_manager),
         Commands::Broker(args) => run_broker_command_machine(args, config, session_manager),
         Commands::Capabilities(_) => Ok(machine_capabilities(config)),
@@ -743,10 +759,11 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "whoami",
             "overnight",
             "overnight.transactions",
+            "fixed-term.list",
+            "fixed-term.details",
             "broker.context.show",
             "broker.context.select",
             "broker.overview",
-            "broker.analytics",
             "broker.cash-breakdown",
             "broker.transactions",
             "broker.transaction.details",
@@ -787,12 +804,12 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "broker.trade.buy": {
                 "mode": "two_phase_confirmation",
                 "phase_1": "Run trade buy args with exactly one of --amount or --shares, and without --confirm, to preview and receive confirmation id.",
-                "phase_2": "Repeat the same trade buy args with exactly one of --amount or --shares and --confirm <id> to submit, and add --accept-unsuitable when phase 1 marks the instrument as not suitable.",
+                "phase_2": "Repeat the same trade buy args with exactly one of --amount or --shares and --confirm <id> to submit, and add --acknowledge-appropriateness-warning when phase 1 requires acknowledgement of an appropriateness warning.",
                 "preferred_output": "json",
                 "phase_1_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--accept-unsuitable] --json",
+                "phase_2_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
                 "phase_1_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--accept-unsuitable] --json",
+                "phase_2_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -871,63 +888,72 @@ pub(crate) fn machine_command_name(command: &Commands) -> &'static str {
         Commands::Login(_) => "login",
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",
+        Commands::FixedTerm(args) => match &args.command {
+            FixedTermCommand::List(_) => "fixed-term.list",
+            FixedTermCommand::Details(_) => "fixed-term.details",
+        },
         Commands::Overnight(args) => match &args.command {
             Some(OvernightCommand::Transactions(_)) => "overnight.transactions",
             None => "overnight",
         },
-        Commands::Broker(broker) => match &broker.command {
-            BrokerCommand::Context(context) => match &context.command {
-                BrokerContextCommand::Show(_) => "broker.context.show",
-                BrokerContextCommand::Select(_) => "broker.context.select",
-            },
-            BrokerCommand::Overview(_) => "broker.overview",
-            BrokerCommand::Analytics(_) => "broker.analytics",
-            BrokerCommand::CashBreakdown(_) => "broker.cash-breakdown",
-            BrokerCommand::Transactions(_) => "broker.transactions",
-            BrokerCommand::Transaction(transaction_args) => match &transaction_args.command {
-                BrokerTransactionCommand::Details(_) => "broker.transaction.details",
-            },
-            BrokerCommand::Holdings(_) => "broker.holdings",
-            BrokerCommand::PortfolioGroups(args) => match &args.command {
-                Some(BrokerPortfolioGroupsCommand::Create(_)) => "broker.portfolio-groups.create",
-                Some(BrokerPortfolioGroupsCommand::Update(_)) => "broker.portfolio-groups.update",
-                Some(BrokerPortfolioGroupsCommand::Delete(_)) => "broker.portfolio-groups.delete",
-                Some(BrokerPortfolioGroupsCommand::Assign(_)) => "broker.portfolio-groups.assign",
-                Some(BrokerPortfolioGroupsCommand::Unassign(_)) => {
-                    "broker.portfolio-groups.unassign"
-                }
-                None => "broker.portfolio-groups",
-            },
-            BrokerCommand::Watchlist(args) => match &args.command {
-                Some(BrokerWatchlistCommand::Add(_)) => "broker.watchlist.add",
-                Some(BrokerWatchlistCommand::Remove(_)) => "broker.watchlist.remove",
-                None => "broker.watchlist",
-            },
-            BrokerCommand::Search(_) => "broker.search",
-            BrokerCommand::Derivatives(args) => match &args.command {
-                BrokerDerivativesCommand::Search(_) => "broker.derivatives.search",
-            },
-            BrokerCommand::Chart(_) => "broker.chart",
-            BrokerCommand::Quote(_) => "broker.quote",
-            BrokerCommand::SecurityNews(_) => "broker.security-news",
-            BrokerCommand::PriceAlerts(args) => match &args.command {
-                Some(BrokerPriceAlertsCommand::Add(_)) => "broker.price-alerts.add",
-                Some(BrokerPriceAlertsCommand::Remove(_)) => "broker.price-alerts.remove",
-                None => "broker.price-alerts",
-            },
-            BrokerCommand::SavingsPlans(args) => match &args.command {
-                Some(BrokerSavingsPlansCommand::Add(_)) => "broker.savings-plans.add",
-                Some(BrokerSavingsPlansCommand::Config(_)) => "broker.savings-plans.config",
-                Some(BrokerSavingsPlansCommand::Remove(_)) => "broker.savings-plans.remove",
-                None => "broker.savings-plans",
-            },
-            BrokerCommand::Trade(trade_args) => match &trade_args.command {
-                BrokerTradeCommand::Buy(_) => "broker.trade.buy",
-                BrokerTradeCommand::Sell(_) => "broker.trade.sell",
-                BrokerTradeCommand::Cancel(_) => "broker.trade.cancel",
-            },
-        },
+        Commands::Broker(broker) => broker_machine_command_name(&broker.command),
         Commands::Capabilities(_) => "capabilities",
+    }
+}
+
+fn broker_machine_command_name(command: &BrokerCommand) -> &'static str {
+    match command {
+        BrokerCommand::Context(context) => match &context.command {
+            BrokerContextCommand::Show(_) => "broker.context.show",
+            BrokerContextCommand::Select(_) => "broker.context.select",
+        },
+        BrokerCommand::Overview(_) => "broker.overview",
+        BrokerCommand::CashBreakdown(_) => "broker.cash-breakdown",
+        BrokerCommand::Transactions(_) => "broker.transactions",
+        BrokerCommand::Transaction(transaction_args) => match &transaction_args.command {
+            BrokerTransactionCommand::Details(_) => "broker.transaction.details",
+        },
+        BrokerCommand::Holdings(_) => "broker.holdings",
+        BrokerCommand::PortfolioGroups(args) => match &args.command {
+            Some(BrokerPortfolioGroupsCommand::Create(_)) => "broker.portfolio-groups.create",
+            Some(BrokerPortfolioGroupsCommand::Update(_)) => "broker.portfolio-groups.update",
+            Some(BrokerPortfolioGroupsCommand::Delete(_)) => "broker.portfolio-groups.delete",
+            Some(BrokerPortfolioGroupsCommand::Assign(_)) => "broker.portfolio-groups.assign",
+            Some(BrokerPortfolioGroupsCommand::Unassign(_)) => "broker.portfolio-groups.unassign",
+            None => "broker.portfolio-groups",
+        },
+        BrokerCommand::Watchlist(args) => match &args.command {
+            Some(BrokerWatchlistCommand::Add(_)) => "broker.watchlist.add",
+            Some(BrokerWatchlistCommand::Remove(_)) => "broker.watchlist.remove",
+            None => "broker.watchlist",
+        },
+        BrokerCommand::Search(_) => "broker.search",
+        BrokerCommand::Derivatives(args) => match &args.command {
+            BrokerDerivativesCommand::Search(_) => "broker.derivatives.search",
+        },
+        BrokerCommand::Chart(_) => "broker.chart",
+        BrokerCommand::Quote(_) => "broker.quote",
+        BrokerCommand::SecurityNews(_) => "broker.security-news",
+        BrokerCommand::PriceAlerts(args) => match &args.command {
+            Some(BrokerPriceAlertsCommand::Add(_)) => "broker.price-alerts.add",
+            Some(BrokerPriceAlertsCommand::Remove(_)) => "broker.price-alerts.remove",
+            None => "broker.price-alerts",
+        },
+        BrokerCommand::SavingsPlans(args) => match &args.command {
+            Some(BrokerSavingsPlansCommand::Add(_)) => "broker.savings-plans.add",
+            Some(BrokerSavingsPlansCommand::Config(_)) => "broker.savings-plans.config",
+            Some(BrokerSavingsPlansCommand::Remove(_)) => "broker.savings-plans.remove",
+            None => "broker.savings-plans",
+        },
+        BrokerCommand::Trade(args) => broker_trade_machine_command_name(&args.command),
+    }
+}
+
+fn broker_trade_machine_command_name(command: &BrokerTradeCommand) -> &'static str {
+    match command {
+        BrokerTradeCommand::Buy(_) => "broker.trade.buy",
+        BrokerTradeCommand::Sell(_) => "broker.trade.sell",
+        BrokerTradeCommand::Cancel(_) => "broker.trade.cancel",
     }
 }
 

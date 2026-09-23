@@ -569,11 +569,6 @@ fn broker_overview_json_without_session_returns_no_session_code() {
 }
 
 #[test]
-fn broker_analytics_json_without_session_returns_no_session_code() {
-    assert_json_no_session(&["broker", "analytics", "--json"], "broker.analytics");
-}
-
-#[test]
 fn broker_transactions_json_without_session_returns_no_session_code() {
     assert_json_no_session(&["broker", "transactions", "--json"], "broker.transactions");
 }

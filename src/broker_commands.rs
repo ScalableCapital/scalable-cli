@@ -17,7 +17,6 @@ use crate::broker_portfolio_groups_render::{
     render_broker_portfolio_groups_mutation_text, render_broker_portfolio_groups_text,
 };
 use crate::broker_query_execution::{
-    execute_broker_analytics as execute_broker_analytics_query,
     execute_broker_cash_breakdown as execute_broker_cash_breakdown_query,
     execute_broker_chart as execute_broker_chart_query,
     execute_broker_derivatives_search as execute_broker_derivatives_search_query,
@@ -41,7 +40,9 @@ use crate::cli::{
     BrokerTradeCommand, BrokerTransactionCommand, BrokerWatchlistCommand,
 };
 use crate::config::{AppConfig, EnvConfig, TargetEnv};
-use crate::graphql::{enforce_graphql_access_policy, execute_graphql, execute_graphql_once};
+use crate::graphql::{
+    enforce_graphql_access_policy, execute_graphql, execute_graphql_once_with_headers,
+};
 use crate::helpers::{
     BROKER_ADD_CRYPTO_PRICE_ALERT_MUTATION, BROKER_ADD_PRICE_ALERT_MUTATION,
     BROKER_ADD_TO_WATCHLIST_MUTATION, BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
@@ -254,11 +255,6 @@ pub(crate) fn run_broker_command_human(
         BrokerCommand::Overview(overview_args) => {
             let compact = overview_args.json;
             let payload = execute_broker_overview(overview_args, config, session_manager)?;
-            Ok(HumanBrokerOutput::Json(payload, compact))
-        }
-        BrokerCommand::Analytics(analytics_args) => {
-            let compact = analytics_args.json;
-            let payload = execute_broker_analytics(analytics_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
         }
         BrokerCommand::CashBreakdown(cash_breakdown_args) => {
@@ -595,7 +591,6 @@ pub(crate) fn run_broker_command_machine(
             }
         },
         BrokerCommand::Overview(args) => execute_broker_overview(args, config, session_manager),
-        BrokerCommand::Analytics(args) => execute_broker_analytics(args, config, session_manager),
         BrokerCommand::CashBreakdown(args) => {
             execute_broker_cash_breakdown(args, config, session_manager)
         }
@@ -755,14 +750,6 @@ pub(crate) fn execute_broker_overview(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     execute_broker_overview_query(args, config, session_manager)
-}
-
-pub(crate) fn execute_broker_analytics(
-    args: crate::cli::BrokerAnalyticsArgs,
-    config: &AppConfig,
-    session_manager: &mut SessionManager,
-) -> Result<Value> {
-    execute_broker_analytics_query(args, config, session_manager)
 }
 
 pub(crate) fn execute_broker_transactions(
@@ -2259,13 +2246,14 @@ fn execute_broker_savings_plan_add_phase2(
         stored.snapshot_checksum.as_str(),
         current_epoch_seconds(),
     )?;
-    let mutation_response = execute_graphql_once(
+    let mutation_response = execute_graphql_once_with_headers(
         &env_cfg.graphql_url,
         &session.access_token,
         BROKER_CREATE_OR_UPDATE_SAVINGS_PLAN_MUTATION,
         &mutation_variables,
         Some("BrokerCreateOrUpdateSavingsPlan"),
         access_context,
+        &[("X-SC-Order-Origin", "CLI")],
         dpop_options,
     );
     let mutation_projected = match mutation_response {
@@ -3513,6 +3501,7 @@ mod tests {
             .create();
         let mutation_mock = server
             .mock("POST", "/")
+            .match_header("x-sc-order-origin", "CLI")
             .match_body(mockito::Matcher::Regex(
                 "BrokerCreateOrUpdateSavingsPlan".to_string(),
             ))

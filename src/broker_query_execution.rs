@@ -9,17 +9,16 @@ use crate::broker_shared::{
 use crate::config::AppConfig;
 use crate::graphql::execute_graphql;
 use crate::helpers::{
-    BROKER_ANALYTICS_QUERY, BROKER_CHART_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY,
-    BROKER_HOLDINGS_QUERY, BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY,
-    BROKER_QUOTE_QUERY, BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY,
-    BROKER_SECURITY_NEWS_QUERY, BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY,
-    BROKER_WATCHLIST_QUERY, broker_analytics_variables, broker_chart_variables,
-    broker_derivatives_search_variables, broker_holdings_variables, broker_limits_variables,
-    broker_overview_variables, broker_price_alerts_variables, broker_quote_variables,
-    broker_savings_plans_variables, broker_search_variables, broker_transaction_details_variables,
-    broker_transactions_variables_from_normalized, broker_watchlist_variables,
-    normalize_broker_derivatives_search_query_input, normalize_broker_transactions_query_input,
-    project_broker_analytics_response, project_broker_cash_breakdown_response,
+    BROKER_CHART_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY, BROKER_HOLDINGS_QUERY,
+    BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY,
+    BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY, BROKER_SECURITY_NEWS_QUERY,
+    BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY, BROKER_WATCHLIST_QUERY,
+    broker_chart_variables, broker_derivatives_search_variables, broker_holdings_variables,
+    broker_limits_variables, broker_overview_variables, broker_price_alerts_variables,
+    broker_quote_variables, broker_savings_plans_variables, broker_search_variables,
+    broker_transaction_details_variables, broker_transactions_variables_from_normalized,
+    broker_watchlist_variables, normalize_broker_derivatives_search_query_input,
+    normalize_broker_transactions_query_input, project_broker_cash_breakdown_response,
     project_broker_chart_response, project_broker_derivatives_search_response,
     project_broker_holdings_response, project_broker_overview_response,
     project_broker_price_alerts_response, project_broker_quote_response,
@@ -74,50 +73,6 @@ pub(crate) fn execute_broker_overview(
         },
     )?;
     let projected = project_broker_overview_response(&input, &response)?;
-    Ok(broker_result_envelope(&ids, projected))
-}
-
-pub(crate) fn execute_broker_analytics(
-    args: crate::cli::BrokerAnalyticsArgs,
-    config: &AppConfig,
-    session_manager: &mut SessionManager,
-) -> Result<Value> {
-    let dpop_options = crate::channel::current_dpop_runtime_options(config);
-    let dpop_options = &dpop_options;
-    let env = resolve_active_env(session_manager)?;
-    let env_cfg = crate::channel::current_env_config();
-    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
-    let mut session = loaded.session;
-    let access_context = loaded.access_context;
-    let ids = resolve_broker_ids(
-        session_manager,
-        env,
-        &env_cfg,
-        &mut session,
-        dpop_options,
-        args.portfolio_id.as_deref(),
-    )?;
-    let input = validated_broker_input(&ids, false, None)?;
-    let variables = broker_analytics_variables(&input)?;
-    let response = execute_with_refresh_retry(
-        session_manager,
-        env,
-        &env_cfg,
-        &mut session,
-        dpop_options,
-        |token| {
-            execute_graphql(
-                &env_cfg.graphql_url,
-                token,
-                BROKER_ANALYTICS_QUERY,
-                &variables,
-                Some("BrokerAnalytics"),
-                access_context,
-                dpop_options,
-            )
-        },
-    )?;
-    let projected = project_broker_analytics_response(&input, &response)?;
     Ok(broker_result_envelope(&ids, projected))
 }
 

@@ -100,15 +100,18 @@ pub fn execute_graphql<T: Serialize>(
     )
 }
 
-/// Executes exactly one GraphQL HTTP request. Mutations that may have a
-/// non-idempotent effect use this instead of the normal nonce-retrying path.
-pub(crate) fn execute_graphql_once<T: Serialize>(
+/// Executes exactly one GraphQL HTTP request with additional headers.
+/// Mutations that may have a non-idempotent effect use this instead of the
+/// normal nonce-retrying path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_graphql_once_with_headers<T: Serialize>(
     endpoint: &str,
     token: &str,
     query: &str,
     variables: &T,
     operation_name: Option<&str>,
     access_context: GraphqlAccessContext,
+    headers: &[(&str, &str)],
     dpop_options: &DpopRuntimeOptions,
 ) -> Result<Value> {
     let dpop = GraphqlDpopContext::from_runtime_options(dpop_options)?;
@@ -119,7 +122,7 @@ pub(crate) fn execute_graphql_once<T: Serialize>(
         variables,
         operation_name,
         access_context,
-        &[],
+        headers,
         &dpop,
         false,
     )
@@ -927,28 +930,28 @@ mod tests {
 
     #[test]
     fn non_replaying_graphql_path_does_not_retry_dpop_nonce_challenge() {
+        let _lock = crate::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        ensure_runtime_dpop_key();
         let mut server = Server::new();
         let first = server
             .mock("POST", "/graphql")
+            .match_header("x-sc-order-origin", "CLI")
             .with_status(401)
             .with_header("DPoP-Nonce", "nonce-1")
             .with_body(r#"{"error":"use_dpop_nonce"}"#)
             .expect(1)
             .create();
-        let dpop = GraphqlDpopContext::with_key_material_for_tests(
-            DpopKeyMaterial::from_private_scalar_bytes([8_u8; 32]).expect("fixed dpop key"),
-        );
-
-        let err = execute_graphql_with_headers_with_retry_policy(
+        let err = execute_graphql_once_with_headers(
             &format!("{}/graphql", server.url()),
             "token-1",
             "mutation OneShot { ok }",
             &json!({}),
             Some("OneShot"),
             GraphqlAccessContext::default(),
-            &[],
-            &dpop,
-            false,
+            &[("X-SC-Order-Origin", "CLI")],
+            &test_dpop_options(),
         )
         .expect_err("one-shot mutation must not replay nonce challenges");
 

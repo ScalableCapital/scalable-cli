@@ -39,7 +39,6 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(commands.contains(&json!("login")));
     assert!(commands.contains(&json!("overnight")));
     assert!(commands.contains(&json!("broker.overview")));
-    assert!(commands.contains(&json!("broker.analytics")));
     assert!(commands.contains(&json!("broker.watchlist.add")));
     assert!(commands.contains(&json!("broker.watchlist.remove")));
     assert!(commands.contains(&json!("broker.portfolio-groups")));
@@ -92,7 +91,7 @@ fn capabilities_returns_machine_json_envelope() {
         buy_workflow["phase_2_command_template_json"]
             .as_str()
             .expect("phase 2 template")
-            .contains("--accept-unsuitable")
+            .contains("--acknowledge-appropriateness-warning")
     );
     assert!(
         buy_workflow["phase_2_command_template_json_shares"]

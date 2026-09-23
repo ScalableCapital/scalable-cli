@@ -49,8 +49,9 @@ pub struct TradeConfirmation {
     pub locale: String,
     pub venue_override: Option<String>,
     pub warning_version: Option<String>,
-    #[serde(default)]
-    pub requires_accept_unsuitable: bool,
+    // Keep the persisted key compatible with confirmations from earlier CLI versions.
+    #[serde(default, rename = "requires_accept_unsuitable")]
+    pub requires_appropriateness_warning_acknowledgement: bool,
     #[serde(default)]
     pub phase1_input: ConfirmationPhase1Input,
     pub fields: ConfirmationFields,
@@ -225,7 +226,7 @@ mod tests {
             locale: "en_DE".to_string(),
             venue_override: Some("MUNC".to_string()),
             warning_version: Some("v1".to_string()),
-            requires_accept_unsuitable: false,
+            requires_appropriateness_warning_acknowledgement: false,
             phase1_input: ConfirmationPhase1Input {
                 side: "buy".to_string(),
                 isin: "US0378331005".to_string(),
@@ -268,20 +269,27 @@ mod tests {
     }
 
     #[test]
-    fn upsert_and_load_confirmation_round_trip_preserves_requires_accept_unsuitable() {
+    fn confirmation_store_preserves_warning_acknowledgement_requirement() {
         let _lock = crate::lock_test_env();
         let (_tmp, config_dir) = temp_config_dir();
         let _guard = EnvGuard::set("SC_CONFIG_DIR", config_dir);
 
-        let mut confirmation = sample_confirmation("scb1_unsuitable");
-        confirmation.requires_accept_unsuitable = true;
+        let mut confirmation = sample_confirmation("scb1_warning");
+        confirmation.requires_appropriateness_warning_acknowledgement = true;
 
         upsert_confirmation(confirmation, 1_000).expect("save");
-        let loaded = load_confirmation("scb1_unsuitable")
+        let stored: Value = serde_json::from_str(
+            &fs::read_to_string(confirmation_file_path().expect("confirmation path"))
+                .expect("read confirmation store"),
+        )
+        .expect("parse confirmation store");
+        assert_eq!(stored["pending"]["requires_accept_unsuitable"], true);
+
+        let loaded = load_confirmation("scb1_warning")
             .expect("load")
             .expect("should exist");
 
-        assert!(loaded.requires_accept_unsuitable);
+        assert!(loaded.requires_appropriateness_warning_acknowledgement);
     }
 
     #[test]
@@ -375,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn load_confirmation_defaults_requires_accept_unsuitable_for_legacy_store() {
+    fn legacy_confirmation_store_defaults_warning_acknowledgement_requirement() {
         let _lock = crate::lock_test_env();
         let (_tmp, config_dir) = temp_config_dir();
         let _guard = EnvGuard::set("SC_CONFIG_DIR", config_dir);
@@ -431,7 +439,7 @@ mod tests {
             .expect("load")
             .expect("should exist");
 
-        assert!(!loaded.requires_accept_unsuitable);
+        assert!(!loaded.requires_appropriateness_warning_acknowledgement);
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::trade_presentation::{
     build_phase1_command_template as build_phase1_command_template_from_module,
     build_phase1_presentation as build_phase1_presentation_from_module,
     build_phase2_command_template as build_phase2_command_template_from_module,
-    build_result_payload as build_result_payload_from_module,
+    build_result_payload as build_result_payload_from_module, build_suitability_payload,
     display_venue_label as display_venue_label_from_module,
     phase1_required_json_paths as phase1_required_json_paths_from_module,
     presentation_section_order_keys as presentation_section_order_keys_from_module,
@@ -199,7 +199,7 @@ impl TradeSizingInput {
 #[derive(Debug, Clone)]
 struct Phase2Input {
     confirmation_id: String,
-    accept_unsuitable: bool,
+    acknowledge_appropriateness_warning: bool,
     isin: String,
     sizing: TradeSizingInput,
     venue: Option<String>,
@@ -419,7 +419,8 @@ fn execute_trade_phase1(
         locale: prepared.intent.locale.clone(),
         venue_override: prepared.intent.venue_override.clone(),
         warning_version: prepared.warning_version_for_order.clone(),
-        requires_accept_unsuitable: phase1_requires_accept_unsuitable(&prepared),
+        requires_appropriateness_warning_acknowledgement:
+            phase1_requires_appropriateness_warning_acknowledgement(&prepared),
         phase1_input: phase1_input.clone(),
         fields: prepared.confirmation_fields.clone(),
         snapshot_payload: prepared.snapshot_payload.clone(),
@@ -428,17 +429,18 @@ fn execute_trade_phase1(
     upsert_confirmation(confirmation, now).context("Failed to persist phase 1 confirmation")?;
 
     let phase1_command_template_json = build_phase1_command_template(&phase1_input, true);
-    let requires_accept_unsuitable = phase1_requires_accept_unsuitable(&prepared);
+    let requires_appropriateness_warning_acknowledgement =
+        phase1_requires_appropriateness_warning_acknowledgement(&prepared);
     let phase2_command_template_json = build_phase2_command_template(
         &confirmation_id,
         &phase1_input,
-        requires_accept_unsuitable,
+        requires_appropriateness_warning_acknowledgement,
         true,
     );
     let command_template = build_phase2_command_template(
         &confirmation_id,
         &phase1_input,
-        requires_accept_unsuitable,
+        requires_appropriateness_warning_acknowledgement,
         json_mode,
     );
 
@@ -449,8 +451,8 @@ fn execute_trade_phase1(
         "expires_at_epoch": expires_at_epoch,
         "required_fields": prepared.confirmation_fields,
         "warning_version": prepared.warning_version_for_order,
-        "requires_accept_unsuitable": requires_accept_unsuitable,
-        "accept_unsuitable_flag": requires_accept_unsuitable.then_some("--accept-unsuitable"),
+        "requires_appropriateness_warning_acknowledgement": requires_appropriateness_warning_acknowledgement,
+        "appropriateness_warning_acknowledgement_flag": requires_appropriateness_warning_acknowledgement.then_some("--acknowledge-appropriateness-warning"),
         "command_template": command_template,
         "phase_1_command_template_json": phase1_command_template_json,
         "phase_2_command_template_json": phase2_command_template_json,
@@ -485,8 +487,8 @@ fn execute_trade_phase1(
                 "display_null_as_literal": true,
                 "raw_json_only_on_user_request": true,
             },
-            "phase_2_requirement": if requires_accept_unsuitable {
-                "Repeat the phase 1 command with --confirm <id> and --accept-unsuitable only after explicit affirmative user confirmation in a separate interaction step."
+            "phase_2_requirement": if requires_appropriateness_warning_acknowledgement {
+                "Repeat the phase 1 command with --confirm <id> and --acknowledge-appropriateness-warning only after explicit affirmative user confirmation in a separate interaction step."
             } else {
                 "Repeat the phase 1 command with --confirm <id> only after explicit affirmative user confirmation in a separate interaction step."
             }
@@ -630,9 +632,11 @@ fn ensure_phase2_snapshot_matches(
             "CONFIRMATION_FIELDS_MISMATCH: fresh warning version differs from phase 1 snapshot; rerun phase 1"
         );
     }
-    if phase1_requires_accept_unsuitable(prepared) != stored.requires_accept_unsuitable {
+    if phase1_requires_appropriateness_warning_acknowledgement(prepared)
+        != stored.requires_appropriateness_warning_acknowledgement
+    {
         bail!(
-            "CONFIRMATION_FIELDS_MISMATCH: fresh suitability acknowledgement requirement differs from phase 1 snapshot; rerun phase 1"
+            "CONFIRMATION_FIELDS_MISMATCH: fresh appropriateness warning acknowledgement requirement differs from phase 1 snapshot; rerun phase 1"
         );
     }
 
@@ -679,7 +683,7 @@ fn ensure_phase2_submission_requirements(
     stored: &TradeConfirmation,
 ) -> Result<()> {
     ensure_phase2_snapshot_matches(prepared, stored)?;
-    ensure_unsuitable_acknowledgement(phase2, stored)?;
+    ensure_appropriateness_warning_acknowledgement(phase2, stored)?;
     Ok(())
 }
 
@@ -856,7 +860,7 @@ fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase
 
     Ok(Phase2Input {
         confirmation_id,
-        accept_unsuitable: args.accept_unsuitable,
+        acknowledge_appropriateness_warning: args.acknowledge_appropriateness_warning,
         isin,
         sizing,
         venue,
@@ -882,7 +886,7 @@ fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Pha
 
     Ok(Phase2Input {
         confirmation_id,
-        accept_unsuitable: false,
+        acknowledge_appropriateness_warning: false,
         isin,
         sizing,
         venue,
@@ -993,13 +997,15 @@ fn build_trade_intent(input: TradeIntentBuildInput<'_>) -> Result<TradeIntent> {
     })
 }
 
-fn ensure_unsuitable_acknowledgement(
+fn ensure_appropriateness_warning_acknowledgement(
     phase2: &Phase2Input,
     stored: &TradeConfirmation,
 ) -> Result<()> {
-    if stored.requires_accept_unsuitable && !phase2.accept_unsuitable {
+    if stored.requires_appropriateness_warning_acknowledgement
+        && !phase2.acknowledge_appropriateness_warning
+    {
         bail!(
-            "CONFIRMATION_UNSUITABLE_ACK_REQUIRED: phase 1 marked this instrument as not suitable; rerun phase 2 with --accept-unsuitable"
+            "CONFIRMATION_APPROPRIATENESS_WARNING_ACK_REQUIRED: phase 1 requires acknowledgement of an appropriateness warning; rerun phase 2 with --acknowledge-appropriateness-warning"
         );
     }
     Ok(())
@@ -1937,13 +1943,13 @@ fn intent_checksum_payload(input: IntentChecksumInput<'_>) -> Value {
 fn build_phase2_command_template(
     confirmation_id: &str,
     phase1_input: &ConfirmationPhase1Input,
-    requires_accept_unsuitable: bool,
+    requires_appropriateness_warning_acknowledgement: bool,
     json_mode: bool,
 ) -> String {
     build_phase2_command_template_from_module(
         confirmation_id,
         phase1_input,
-        requires_accept_unsuitable,
+        requires_appropriateness_warning_acknowledgement,
         json_mode,
     )
 }
@@ -1974,19 +1980,6 @@ fn build_warning_payload(decision: &TradeComplianceDecision) -> Value {
     })
 }
 
-fn build_suitability_payload(decision: &TradeComplianceDecision) -> Value {
-    json!({
-        "source": decision.source_kind.as_str(),
-        "type": decision.suitability_type.map(|value| value.as_str()),
-        "status": decision.status.as_str(),
-        "action_when_unsuitable": decision.action_when_unsuitable.map(|value| value.as_str()),
-        "questionnaire_required": decision.questionnaire_required,
-        "questionnaire_reason": decision.questionnaire_reason,
-        "requires_accept_unsuitable": decision.requires_accept_unsuitable,
-        "accept_flag": decision.requires_accept_unsuitable.then_some("--accept-unsuitable"),
-    })
-}
-
 fn questionnaire_name_for_error(decision: &TradeComplianceDecision) -> &'static str {
     match decision.source_kind {
         crate::trade::TradeComplianceSourceKind::LegacyAppropriatenessFallback => "appropriateness",
@@ -1997,8 +1990,11 @@ fn questionnaire_name_for_error(decision: &TradeComplianceDecision) -> &'static 
     }
 }
 
-fn phase1_requires_accept_unsuitable(prepared: &PreparedTrade) -> bool {
-    prepared.intent.side.is_buy() && prepared.compliance_decision.requires_accept_unsuitable
+fn phase1_requires_appropriateness_warning_acknowledgement(prepared: &PreparedTrade) -> bool {
+    prepared.intent.side.is_buy()
+        && prepared
+            .compliance_decision
+            .requires_appropriateness_warning_acknowledgement
 }
 
 fn phase1_required_json_paths(side: TradeSide) -> Vec<&'static str> {
@@ -2363,8 +2359,8 @@ mod tests {
                 "action_when_unsuitable": Value::Null,
                 "questionnaire_required": false,
                 "questionnaire_reason": Value::Null,
-                "requires_accept_unsuitable": false,
-                "accept_flag": Value::Null
+                "requires_appropriateness_warning_acknowledgement": false,
+                "acknowledgement_flag": Value::Null
             },
             "warning": Value::Null,
             "price_warnings": {
@@ -2463,8 +2459,8 @@ mod tests {
                 "action_when_unsuitable": Value::Null,
                 "questionnaire_required": false,
                 "questionnaire_reason": Value::Null,
-                "requires_accept_unsuitable": false,
-                "accept_flag": Value::Null
+                "requires_appropriateness_warning_acknowledgement": false,
+                "acknowledgement_flag": Value::Null
             },
             "warning": Value::Null,
             "price_warnings": {
@@ -3073,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn render_trade_buy_text_shows_unsuitable_acknowledgement_section() {
+    fn render_trade_buy_text_shows_appropriateness_warning_acknowledgement_section() {
         let mut result = sample_result_payload();
         result["suitability"] = json!({
             "source": "legacy_appropriateness_fallback",
@@ -3082,8 +3078,8 @@ mod tests {
             "action_when_unsuitable": "PROCEED_TO_ORDER_FLOW",
             "questionnaire_required": false,
             "questionnaire_reason": Value::Null,
-            "requires_accept_unsuitable": true,
-            "accept_flag": "--accept-unsuitable"
+            "requires_appropriateness_warning_acknowledgement": true,
+            "acknowledgement_flag": "--acknowledge-appropriateness-warning"
         });
         let payload = json!({
             "result": result,
@@ -3103,9 +3099,8 @@ mod tests {
         assert!(lines[suitability_idx + 1] == "source: legacy_appropriateness_fallback");
         assert!(lines[suitability_idx + 3] == "status: UNSUITABLE");
         assert!(
-            lines
-                .iter()
-                .any(|line| line == "phase_2_acknowledgement_flag: --accept-unsuitable")
+            lines.iter().any(|line| line
+                == "phase_2_acknowledgement_flag: --acknowledge-appropriateness-warning")
         );
     }
 
@@ -3119,8 +3114,8 @@ mod tests {
             "action_when_unsuitable": "PROCEED_TO_ORDER_FLOW",
             "questionnaire_required": false,
             "questionnaire_reason": Value::Null,
-            "requires_accept_unsuitable": false,
-            "accept_flag": Value::Null
+            "requires_appropriateness_warning_acknowledgement": false,
+            "acknowledgement_flag": Value::Null
         });
         result["warning"] = json!({
             "kind": "knockout_risk_warning",
@@ -3536,7 +3531,7 @@ mod tests {
             locale: prepared.intent.locale.clone(),
             venue_override: prepared.intent.venue_override.clone(),
             warning_version: prepared.warning_version_for_order.clone(),
-            requires_accept_unsuitable: false,
+            requires_appropriateness_warning_acknowledgement: false,
             phase1_input: ConfirmationPhase1Input {
                 side: ORDER_SIDE_BUY.to_string(),
                 isin: prepared.intent.isin.clone(),
@@ -3651,18 +3646,20 @@ mod tests {
     }
 
     #[test]
-    fn phase2_snapshot_check_rejects_suitability_acknowledgement_drift() {
+    fn phase2_snapshot_check_rejects_appropriateness_warning_acknowledgement_drift() {
         let mut prepared = sample_prepared_trade_for_phase2_validation();
         let stored = sample_trade_confirmation_for_phase2_validation(&prepared);
 
-        prepared.compliance_decision.requires_accept_unsuitable = true;
+        prepared
+            .compliance_decision
+            .requires_appropriateness_warning_acknowledgement = true;
         prepared.compliance_decision.status = crate::trade::TradeSuitabilityStatus::Unsuitable;
 
         let err = ensure_phase2_snapshot_matches(&prepared, &stored)
             .expect_err("suitability drift should fail");
         assert!(
             err.to_string()
-                .contains("fresh suitability acknowledgement requirement differs")
+                .contains("fresh appropriateness warning acknowledgement requirement differs")
         );
     }
 
@@ -3670,10 +3667,10 @@ mod tests {
     fn phase2_submission_requirements_prefer_snapshot_mismatch_over_ack_error() {
         let prepared = sample_prepared_trade_for_phase2_validation();
         let mut stored = sample_trade_confirmation_for_phase2_validation(&prepared);
-        stored.requires_accept_unsuitable = true;
+        stored.requires_appropriateness_warning_acknowledgement = true;
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "DE0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500".to_string(),
@@ -3692,7 +3689,7 @@ mod tests {
             .expect_err("suitability drift should fail before ack requirement");
         assert!(
             err.to_string()
-                .contains("fresh suitability acknowledgement requirement differs")
+                .contains("fresh appropriateness warning acknowledgement requirement differs")
         );
     }
 
@@ -3706,7 +3703,7 @@ mod tests {
     fn build_phase2_intent_uses_phase2_values() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "de0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500.00".to_string(),
@@ -3751,7 +3748,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
         let phase2_args = crate::cli::BrokerTradeBuyArgs {
@@ -3763,7 +3760,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: Some("scb1_test".to_string()),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -3790,7 +3787,7 @@ mod tests {
     fn build_phase2_intent_supports_buy_shares() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "de0007100000".to_string(),
             sizing: TradeSizingInput::WholeShares(ParsedWholeSharesInput {
                 raw: "3".to_string(),
@@ -3829,7 +3826,7 @@ mod tests {
     fn build_phase2_intent_normalizes_warning_query_locale_without_mutating_intent_locale() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "de0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500.00".to_string(),
@@ -3909,7 +3906,7 @@ mod tests {
     fn assert_phase2_matches_phase1_rejects_limit_price_mismatch() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "DE0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500".to_string(),
@@ -3943,7 +3940,7 @@ mod tests {
     fn assert_phase2_matches_phase1_rejects_stop_price_mismatch() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "DE0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500".to_string(),
@@ -3974,13 +3971,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_unsuitable_acknowledgement_requires_accept_unsuitable_when_stored() {
+    fn appropriateness_warning_acknowledgement_is_required_only_when_stored() {
         let prepared = sample_prepared_trade_for_phase2_validation();
         let mut stored = sample_trade_confirmation_for_phase2_validation(&prepared);
-        stored.requires_accept_unsuitable = true;
-        let phase2 = Phase2Input {
+        stored.requires_appropriateness_warning_acknowledgement = true;
+        let mut phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "DE0007100000".to_string(),
             sizing: TradeSizingInput::Amount(ParsedNumericInput {
                 raw: "500".to_string(),
@@ -3995,9 +3992,21 @@ mod tests {
             stop_price_value: None,
         };
 
-        let err = ensure_unsuitable_acknowledgement(&phase2, &stored)
+        let err = ensure_appropriateness_warning_acknowledgement(&phase2, &stored)
             .expect_err("missing ack should fail");
-        assert!(err.to_string().contains("--accept-unsuitable"));
+        assert!(
+            err.to_string()
+                .contains("--acknowledge-appropriateness-warning")
+        );
+
+        phase2.acknowledge_appropriateness_warning = true;
+        ensure_appropriateness_warning_acknowledgement(&phase2, &stored)
+            .expect("explicit acknowledgement should satisfy the warning requirement");
+
+        stored.requires_appropriateness_warning_acknowledgement = false;
+        phase2.acknowledge_appropriateness_warning = false;
+        ensure_appropriateness_warning_acknowledgement(&phase2, &stored)
+            .expect("no acknowledgement should be needed when phase 1 did not require it");
     }
 
     #[test]
@@ -4023,7 +4032,7 @@ mod tests {
             stop_price: None,
             venue: Some("gettex".to_string()),
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4047,7 +4056,7 @@ mod tests {
             stop_price: None,
             venue: Some("gettex".to_string()),
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4074,7 +4083,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4098,7 +4107,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4117,7 +4126,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4136,7 +4145,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: None,
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4156,7 +4165,7 @@ mod tests {
                 stop_price: None,
                 venue: None,
                 confirm: None,
-                accept_unsuitable: false,
+                acknowledge_appropriateness_warning: false,
                 json: true,
             };
 
@@ -4179,7 +4188,7 @@ mod tests {
             stop_price: None,
             venue: None,
             confirm: Some("scb1_test".to_string()),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             json: true,
         };
 
@@ -4191,7 +4200,7 @@ mod tests {
     fn assert_phase2_matches_phase1_rejects_buy_sizing_mode_mismatch() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
-            accept_unsuitable: false,
+            acknowledge_appropriateness_warning: false,
             isin: "DE0007100000".to_string(),
             sizing: TradeSizingInput::WholeShares(ParsedWholeSharesInput {
                 raw: "3".to_string(),

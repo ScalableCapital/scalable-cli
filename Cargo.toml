@@ -1,6 +1,6 @@
 [package]
 name = "scalable-cli"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.96"
 
@@ -19,7 +19,7 @@ strip = "symbols"
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 keyring-core = "1.0"

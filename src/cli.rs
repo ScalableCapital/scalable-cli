@@ -35,6 +35,8 @@ pub enum Commands {
     Whoami(WhoamiArgs),
     #[command(about = "Show overnight savings account summary")]
     Overnight(OvernightArgs),
+    #[command(about = "Read personal Fixed-Term savings accounts")]
+    FixedTerm(FixedTermArgs),
     #[command(about = "Broker commands")]
     Broker(BrokerArgs),
     #[command(about = "List CLI capabilities")]
@@ -58,6 +60,35 @@ pub struct LogoutArgs {
 
 #[derive(Debug, Args)]
 pub struct WhoamiArgs {
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FixedTermArgs {
+    #[command(subcommand)]
+    pub command: FixedTermCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FixedTermCommand {
+    #[command(about = "List supported personal Fixed-Term accounts")]
+    List(FixedTermListArgs),
+    #[command(about = "Show a personal Fixed-Term account, including its auto-renewal setting")]
+    Details(FixedTermDetailsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FixedTermListArgs {
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FixedTermDetailsArgs {
+    #[arg(long, value_parser = non_empty_trimmed_value, help = "Account id returned by fixed-term list")]
+    pub fixed_term_account_id: String,
+
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
@@ -129,8 +160,6 @@ pub enum BrokerCommand {
     Context(BrokerContextArgs),
     #[command(about = "Get broker portfolio overview/valuation")]
     Overview(BrokerOverviewArgs),
-    #[command(about = "Explore broker portfolio analytics")]
-    Analytics(BrokerAnalyticsArgs),
     #[command(
         about = "Get broker cash, buying-power, credit, and derivatives-availability breakdown"
     )]
@@ -199,15 +228,6 @@ pub struct BrokerOverviewArgs {
 
     #[arg(long, help = "Include year-to-date performance points")]
     pub include_year_to_date: bool,
-
-    #[arg(long, help = "Print compact JSON")]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct BrokerAnalyticsArgs {
-    #[arg(long, help = "Portfolio id override")]
-    pub portfolio_id: Option<String>,
 
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
@@ -1064,10 +1084,11 @@ pub struct BrokerTradeBuyArgs {
 
     #[arg(
         long,
+        alias = "accept-unsuitable",
         requires = "confirm",
-        help = "Phase 2 acknowledgement required when phase 1 marks the instrument as not suitable"
+        help = "Acknowledge the appropriateness warning when required by the phase 1 preview (phase 2 only)"
     )]
-    pub accept_unsuitable: bool,
+    pub acknowledge_appropriateness_warning: bool,
 
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
@@ -1275,27 +1296,6 @@ mod tests {
                 assert_eq!(args.portfolio_id.as_deref(), Some("p1"));
             }
             _ => panic!("broker overview should parse"),
-        }
-    }
-
-    #[test]
-    fn broker_analytics_parses() {
-        let cli = Cli::parse_from([
-            "sc",
-            "broker",
-            "analytics",
-            "--portfolio-id",
-            "p1",
-            "--json",
-        ]);
-        match cli.command {
-            Commands::Broker(BrokerArgs {
-                command: BrokerCommand::Analytics(args),
-            }) => {
-                assert_eq!(args.portfolio_id.as_deref(), Some("p1"));
-                assert!(args.json);
-            }
-            _ => panic!("broker analytics should parse"),
         }
     }
 
@@ -2050,7 +2050,7 @@ mod tests {
                 assert_eq!(args.limit_price, None);
                 assert_eq!(args.stop_price, None);
                 assert_eq!(args.confirm, None);
-                assert!(!args.accept_unsuitable);
+                assert!(!args.acknowledge_appropriateness_warning);
             }
             _ => panic!("broker trade buy should parse"),
         }
@@ -2118,7 +2118,7 @@ mod tests {
                 assert_eq!(args.limit_price, None);
                 assert_eq!(args.stop_price, None);
                 assert_eq!(args.confirm, None);
-                assert!(!args.accept_unsuitable);
+                assert!(!args.acknowledge_appropriateness_warning);
             }
             _ => panic!("broker trade buy shares should parse"),
         }
@@ -2157,58 +2157,68 @@ mod tests {
 
     #[test]
     fn broker_trade_buy_confirm_parses() {
-        let cli = Cli::parse_from([
-            "sc",
-            "broker",
-            "trade",
-            "buy",
-            "--isin",
-            "US0378331005",
-            "--amount",
-            "500",
-            "--venue",
-            "MUNC",
-            "--confirm",
-            "scb1_deadbeef",
+        for acknowledgement_flag in [
+            "--acknowledge-appropriateness-warning",
             "--accept-unsuitable",
-        ]);
-        match cli.command {
-            Commands::Broker(BrokerArgs {
-                command:
-                    BrokerCommand::Trade(BrokerTradeArgs {
-                        command: BrokerTradeCommand::Buy(args),
-                    }),
-            }) => {
-                assert_eq!(args.confirm.as_deref(), Some("scb1_deadbeef"));
-                assert_eq!(args.isin.as_deref(), Some("US0378331005"));
-                assert_eq!(args.amount.as_deref(), Some("500"));
-                assert_eq!(args.shares, None);
-                assert_eq!(args.venue.as_deref(), Some("MUNC"));
-                assert!(args.accept_unsuitable);
+        ] {
+            let cli = Cli::parse_from([
+                "sc",
+                "broker",
+                "trade",
+                "buy",
+                "--isin",
+                "US0378331005",
+                "--amount",
+                "500",
+                "--venue",
+                "MUNC",
+                "--confirm",
+                "scb1_deadbeef",
+                acknowledgement_flag,
+            ]);
+            match cli.command {
+                Commands::Broker(BrokerArgs {
+                    command:
+                        BrokerCommand::Trade(BrokerTradeArgs {
+                            command: BrokerTradeCommand::Buy(args),
+                        }),
+                }) => {
+                    assert_eq!(args.confirm.as_deref(), Some("scb1_deadbeef"));
+                    assert_eq!(args.isin.as_deref(), Some("US0378331005"));
+                    assert_eq!(args.amount.as_deref(), Some("500"));
+                    assert_eq!(args.shares, None);
+                    assert_eq!(args.venue.as_deref(), Some("MUNC"));
+                    assert!(args.acknowledge_appropriateness_warning);
+                }
+                _ => panic!("broker trade buy confirm should parse"),
             }
-            _ => panic!("broker trade buy confirm should parse"),
         }
     }
 
     #[test]
-    fn broker_trade_buy_accept_unsuitable_requires_confirm() {
-        let err = Cli::try_parse_from([
-            "sc",
-            "broker",
-            "trade",
-            "buy",
-            "--isin",
-            "US0378331005",
-            "--amount",
-            "500",
+    fn broker_trade_buy_acknowledge_appropriateness_warning_requires_confirm() {
+        for acknowledgement_flag in [
+            "--acknowledge-appropriateness-warning",
             "--accept-unsuitable",
-        ])
-        .unwrap_err();
+        ] {
+            let err = Cli::try_parse_from([
+                "sc",
+                "broker",
+                "trade",
+                "buy",
+                "--isin",
+                "US0378331005",
+                "--amount",
+                "500",
+                acknowledgement_flag,
+            ])
+            .unwrap_err();
 
-        assert!(
-            err.to_string().contains("--confirm"),
-            "unexpected error: {err}"
-        );
+            assert!(
+                err.to_string().contains("--confirm"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

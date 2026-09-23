@@ -220,6 +220,21 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
     let text = full_error_text(err);
     let lower = text.to_lowercase();
 
+    if text.contains(crate::fixed_term_projections::NOT_FOUND) {
+        return ClassifiedError {
+            code: "fixed_term_account_not_found",
+            exit_code: 10,
+            hints: vec!["Run `sc fixed-term list` and select an available account id.".into()],
+        };
+    }
+    if lower.contains("fixed-term response invalid:") {
+        return ClassifiedError {
+            code: "fixed_term_response_invalid",
+            exit_code: 30,
+            hints: vec!["Backend response did not match the Fixed-Term contract.".into()],
+        };
+    }
+
     if text.contains("Provide exactly one of --query or --query-file")
         || text.contains("Provide at most one of --variables or --variables-file")
         || text.contains("Token from stdin is empty")
@@ -586,11 +601,14 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
         };
     }
 
-    if text.contains("CONFIRMATION_UNSUITABLE_ACK_REQUIRED:") {
+    if text.contains("CONFIRMATION_APPROPRIATENESS_WARNING_ACK_REQUIRED:") {
         return ClassifiedError {
-            code: "confirmation_unsuitable_ack_required",
+            code: "confirmation_appropriateness_warning_ack_required",
             exit_code: 10,
-            hints: vec!["Repeat the phase-2 trade command with --accept-unsuitable.".to_string()],
+            hints: vec![
+                "Repeat the phase-2 trade command with --acknowledge-appropriateness-warning."
+                    .to_string(),
+            ],
         };
     }
 
@@ -1293,17 +1311,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_confirmation_unsuitable_ack_required_error() {
+    fn classify_confirmation_appropriateness_warning_ack_required_error() {
         let err = anyhow!(
-            "CONFIRMATION_UNSUITABLE_ACK_REQUIRED: phase 1 marked this instrument as not suitable"
+            "CONFIRMATION_APPROPRIATENESS_WARNING_ACK_REQUIRED: phase 1 requires acknowledgement of an appropriateness warning"
         );
         let c = classify_error(&err);
-        assert_eq!(c.code, "confirmation_unsuitable_ack_required");
+        assert_eq!(c.code, "confirmation_appropriateness_warning_ack_required");
         assert_eq!(c.exit_code, 10);
         assert!(
             c.hints
                 .iter()
-                .any(|hint| hint.contains("--accept-unsuitable"))
+                .any(|hint| hint.contains("--acknowledge-appropriateness-warning"))
         );
     }
 

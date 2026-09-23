@@ -52,13 +52,6 @@ fn broker_overview_query_requests_only_supported_return_fields() {
 }
 
 #[test]
-fn broker_analytics_variables_map_input() {
-    let vars = broker_analytics_variables(&broker_input(false, None)).expect("vars");
-    assert_eq!(vars["accountId"], "acc-1");
-    assert_eq!(vars["portfolioId"], "port-1");
-}
-
-#[test]
 fn broker_transactions_variables_map_input() {
     let normalized = normalize_broker_transactions_query_input(
         50,
@@ -843,7 +836,6 @@ fn broker_add_price_alert_variables_reject_invalid_price() {
 fn broker_query_documents_parse_as_graphql_documents() {
     let queries = [
         BROKER_OVERVIEW_QUERY,
-        BROKER_ANALYTICS_QUERY,
         BROKER_TRANSACTIONS_QUERY,
         BROKER_TRANSACTION_DETAILS_QUERY,
         BROKER_HOLDINGS_QUERY,

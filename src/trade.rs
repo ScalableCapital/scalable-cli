@@ -541,7 +541,7 @@ pub struct TradeComplianceDecision {
     pub action_when_unsuitable: Option<TradeActionWhenUnsuitable>,
     pub questionnaire_required: bool,
     pub questionnaire_reason: Option<&'static str>,
-    pub requires_accept_unsuitable: bool,
+    pub requires_appropriateness_warning_acknowledgement: bool,
     pub submission_appropriateness_id: Option<String>,
     pub warning: TradeWarningDecision,
 }
@@ -555,7 +555,7 @@ impl TradeComplianceDecision {
             action_when_unsuitable: None,
             questionnaire_required: false,
             questionnaire_reason: None,
-            requires_accept_unsuitable: false,
+            requires_appropriateness_warning_acknowledgement: false,
             submission_appropriateness_id: None,
             warning: TradeWarningDecision::none(),
         }
@@ -835,7 +835,7 @@ fn evaluate_required_suitability(
         _ => None,
     };
     let questionnaire_required = questionnaire_reason.is_some();
-    let requires_accept_unsuitable = matches!(
+    let requires_appropriateness_warning_acknowledgement = matches!(
         (
             required.suitability_type,
             status,
@@ -882,7 +882,7 @@ fn evaluate_required_suitability(
             version_for_order: None,
             acknowledgement_text: None,
         }
-    } else if requires_accept_unsuitable {
+    } else if requires_appropriateness_warning_acknowledgement {
         TradeWarningDecision {
             kind: TradeWarningKind::LegacyAppropriatenessWarning,
             title: None,
@@ -902,7 +902,7 @@ fn evaluate_required_suitability(
         action_when_unsuitable: Some(required.action_when_unsuitable),
         questionnaire_required,
         questionnaire_reason,
-        requires_accept_unsuitable,
+        requires_appropriateness_warning_acknowledgement,
         submission_appropriateness_id,
         warning,
     })
@@ -924,7 +924,8 @@ fn evaluate_legacy_appropriateness_fallback(
         _ => None,
     };
     let questionnaire_required = questionnaire_reason.is_some();
-    let requires_accept_unsuitable = info.status == TradeSuitabilityStatus::Unsuitable;
+    let requires_appropriateness_warning_acknowledgement =
+        info.status == TradeSuitabilityStatus::Unsuitable;
     let submission_appropriateness_id = if questionnaire_required {
         None
     } else {
@@ -944,7 +945,7 @@ fn evaluate_legacy_appropriateness_fallback(
             _ => None,
         }
     };
-    let warning = if requires_accept_unsuitable {
+    let warning = if requires_appropriateness_warning_acknowledgement {
         TradeWarningDecision {
             kind: TradeWarningKind::LegacyAppropriatenessWarning,
             title: None,
@@ -961,11 +962,11 @@ fn evaluate_legacy_appropriateness_fallback(
         source_kind: TradeComplianceSourceKind::LegacyAppropriatenessFallback,
         suitability_type: Some(TradeSuitabilityType::LegacyFallback),
         status: info.status,
-        action_when_unsuitable: requires_accept_unsuitable
+        action_when_unsuitable: requires_appropriateness_warning_acknowledgement
             .then_some(TradeActionWhenUnsuitable::ProceedToOrderFlow),
         questionnaire_required,
         questionnaire_reason,
-        requires_accept_unsuitable,
+        requires_appropriateness_warning_acknowledgement,
         submission_appropriateness_id,
         warning,
     })
@@ -2324,7 +2325,7 @@ mod tests {
         assert_eq!(decision.status, TradeSuitabilityStatus::NotCompleted);
         assert!(decision.questionnaire_required);
         assert_eq!(decision.questionnaire_reason, Some("not_completed"));
-        assert!(!decision.requires_accept_unsuitable);
+        assert!(!decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(decision.submission_appropriateness_id, None);
         assert_eq!(decision.warning.kind, TradeWarningKind::None);
     }
@@ -2364,7 +2365,7 @@ mod tests {
             decision.questionnaire_reason,
             Some("unsuitable_reopens_questionnaire")
         );
-        assert!(!decision.requires_accept_unsuitable);
+        assert!(!decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(decision.submission_appropriateness_id, None);
         assert_eq!(decision.warning.kind, TradeWarningKind::None);
     }
@@ -2400,7 +2401,7 @@ mod tests {
 
         assert_eq!(decision.status, TradeSuitabilityStatus::Suitable);
         assert!(!decision.questionnaire_required);
-        assert!(!decision.requires_accept_unsuitable);
+        assert!(!decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(
             decision.submission_appropriateness_id.as_deref(),
             Some("suit-ko-1")
@@ -2488,7 +2489,7 @@ mod tests {
 
         assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
         assert!(!decision.questionnaire_required);
-        assert!(decision.requires_accept_unsuitable);
+        assert!(decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(
             decision.submission_appropriateness_id.as_deref(),
             Some("suit-ci-1")
@@ -2539,7 +2540,7 @@ mod tests {
             .expect("complex suitability should ignore unrelated status rows");
 
         assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
-        assert!(decision.requires_accept_unsuitable);
+        assert!(decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(
             decision.submission_appropriateness_id.as_deref(),
             Some("suit-ci-2")
@@ -2581,7 +2582,7 @@ mod tests {
             .expect("unknown unrelated status rows should be ignored");
 
         assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
-        assert!(decision.requires_accept_unsuitable);
+        assert!(decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(
             decision.submission_appropriateness_id.as_deref(),
             Some("suit-ci-3")
@@ -2655,7 +2656,7 @@ mod tests {
             Some(TradeSuitabilityType::LegacyFallback)
         );
         assert_eq!(decision.status, TradeSuitabilityStatus::Unsuitable);
-        assert!(decision.requires_accept_unsuitable);
+        assert!(decision.requires_appropriateness_warning_acknowledgement);
         assert_eq!(
             decision.submission_appropriateness_id.as_deref(),
             Some("legacy-2")
