@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +29,46 @@ pub struct VerifiedTokenClaims {
     pub person_id: String,
     pub expires_at: Option<i64>,
     pub session_id: Option<String>,
+}
+
+/// Distinguishes a token the CLI can reject locally from verification that
+/// cannot complete because issuer metadata is unavailable.
+#[derive(Debug)]
+pub enum AccessTokenVerificationError {
+    Unavailable(anyhow::Error),
+    Rejected(anyhow::Error),
+}
+
+impl AccessTokenVerificationError {
+    fn unavailable(error: anyhow::Error) -> Self {
+        Self::Unavailable(error)
+    }
+
+    fn rejected(error: anyhow::Error) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl Display for AccessTokenVerificationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => {
+                write!(
+                    formatter,
+                    "Token verification is temporarily unavailable: {error}"
+                )
+            }
+            Self::Rejected(error) => write!(formatter, "Token verification failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AccessTokenVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable(error) | Self::Rejected(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,14 +105,17 @@ struct JwkSigningKey {
     e: Option<String>,
 }
 
-pub fn verify_access_token_strict(token: &str, env_cfg: &EnvConfig) -> Result<VerifiedTokenClaims> {
+pub fn verify_access_token_strict(
+    token: &str,
+    env_cfg: &EnvConfig,
+) -> std::result::Result<VerifiedTokenClaims, AccessTokenVerificationError> {
     verify_access_token(token, env_cfg, VerificationMode::Strict)
 }
 
 pub fn verify_access_token_allow_expired(
     token: &str,
     env_cfg: &EnvConfig,
-) -> Result<VerifiedTokenClaims> {
+) -> std::result::Result<VerifiedTokenClaims, AccessTokenVerificationError> {
     verify_access_token(token, env_cfg, VerificationMode::AllowExpired)
 }
 
@@ -79,41 +123,52 @@ fn verify_access_token(
     token: &str,
     env_cfg: &EnvConfig,
     mode: VerificationMode,
-) -> Result<VerifiedTokenClaims> {
+) -> std::result::Result<VerifiedTokenClaims, AccessTokenVerificationError> {
+    let issuer_url = validate_https_url(&env_cfg.auth.issuer, "auth.issuer")
+        .map_err(AccessTokenVerificationError::rejected)?;
     let expected_issuer =
-        normalize_issuer(validate_https_url(&env_cfg.auth.issuer, "auth.issuer")?.as_str())?;
-    let header = decode_header(token).context("Token is not a valid JWT header")?;
+        normalize_issuer(issuer_url.as_str()).map_err(AccessTokenVerificationError::rejected)?;
+    let header = decode_header(token)
+        .context("Token is not a valid JWT header")
+        .map_err(AccessTokenVerificationError::rejected)?;
     if header.alg != PINNED_ALGORITHM {
-        bail!(
+        return Err(AccessTokenVerificationError::rejected(anyhow::anyhow!(
             "Unsupported JWT algorithm '{:?}'; expected '{}'",
             header.alg,
             PINNED_ALGORITHM_NAME
-        );
+        )));
     }
     let kid = header
         .kid
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .context("Token header is missing required 'kid'")?;
+        .context("Token header is missing required 'kid'")
+        .map_err(AccessTokenVerificationError::rejected)?;
 
     let deadline = Instant::now() + Duration::from_secs(TOTAL_NETWORK_BUDGET_SECONDS);
-    let discovery = fetch_oidc_discovery(&expected_issuer, deadline)?;
+    let discovery = fetch_oidc_discovery(&expected_issuer, deadline)
+        .map_err(AccessTokenVerificationError::unavailable)?;
     let discovered_issuer = normalize_issuer(&discovery.issuer)
-        .context("OIDC discovery response contains invalid issuer")?;
+        .context("OIDC discovery response contains invalid issuer")
+        .map_err(AccessTokenVerificationError::unavailable)?;
     if discovered_issuer != expected_issuer {
-        bail!(
+        return Err(AccessTokenVerificationError::unavailable(anyhow::anyhow!(
             "OIDC discovery issuer mismatch: expected '{}', got '{}'",
             expected_issuer,
             discovered_issuer
-        );
+        )));
     }
 
-    let jwks_url = validate_https_url(&discovery.jwks_uri, "OIDC discovery jwks_uri")?;
-    let jwks = fetch_jwks(jwks_url.as_str(), deadline)?;
-    let (n, e) = select_rsa_signing_key(&jwks, kid)?;
+    let jwks_url = validate_https_url(&discovery.jwks_uri, "OIDC discovery jwks_uri")
+        .map_err(AccessTokenVerificationError::unavailable)?;
+    let jwks = fetch_jwks(jwks_url.as_str(), deadline)
+        .map_err(AccessTokenVerificationError::unavailable)?;
+    let (n, e) =
+        select_rsa_signing_key(&jwks, kid).map_err(AccessTokenVerificationError::unavailable)?;
     let decoding_key = DecodingKey::from_rsa_components(n, e)
-        .context("Failed constructing RSA decoding key from JWKS components")?;
+        .context("Failed constructing RSA decoding key from JWKS components")
+        .map_err(AccessTokenVerificationError::unavailable)?;
 
     let mut validation = Validation::new(PINNED_ALGORITHM);
     validation.required_spec_claims.clear();
@@ -122,10 +177,12 @@ fn verify_access_token(
     validation.validate_aud = false;
 
     let token_data = decode::<Value>(token, &decoding_key, &validation)
-        .context("JWT signature verification failed")?;
+        .context("JWT signature verification failed")
+        .map_err(AccessTokenVerificationError::rejected)?;
 
-    validate_claims(&token_data.claims, &expected_issuer, env_cfg, mode)?;
-    build_verified_claims(&token_data.claims)
+    validate_claims(&token_data.claims, &expected_issuer, env_cfg, mode)
+        .map_err(AccessTokenVerificationError::rejected)?;
+    build_verified_claims(&token_data.claims).map_err(AccessTokenVerificationError::rejected)
 }
 
 fn fetch_oidc_discovery(expected_issuer: &str, deadline: Instant) -> Result<OidcDiscovery> {
@@ -176,11 +233,12 @@ fn fetch_json_with_retry<T: DeserializeOwned>(
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().unwrap_or_default();
+            // Issuer and JWKS response bodies are untrusted and can echo
+            // credentials or operational details. Keep the failure category
+            // and status, but never render the body.
             let message = format!(
-                "{label} request returned HTTP {} at {validated_url}: {}",
+                "{label} request returned HTTP {} at {validated_url}",
                 status.as_u16(),
-                body.trim()
             );
             if attempt == 0 && status.is_server_error() {
                 last_error = Some(message);
@@ -831,7 +889,35 @@ Avd7QBCxvqXU+7acaZ2xxaV4
         let claims = baseline_claims(&env_cfg.auth.issuer);
         let token = signed_rs256_token(claims, Some(TEST_KID));
         let err = verify_access_token_strict(&token, &env_cfg).unwrap_err();
+        assert!(matches!(&err, AccessTokenVerificationError::Unavailable(_)));
         assert!(err.to_string().contains("HTTP 404"));
+        discovery.assert();
+    }
+
+    #[test]
+    fn verifier_redacts_issuer_response_bodies_from_human_and_machine_errors() {
+        let mut server = Server::new();
+        let env_cfg = sample_env(server.url());
+        let sentinel = "issuer-response-secret-sentinel";
+        let discovery = server
+            .mock("GET", OIDC_DISCOVERY_PATH)
+            .with_status(503)
+            .with_body(sentinel)
+            // Server errors are retried once before the verifier gives up.
+            .expect(2)
+            .create();
+
+        let claims = baseline_claims(&env_cfg.auth.issuer);
+        let token = signed_rs256_token(claims, Some(TEST_KID));
+        let verification_error = verify_access_token_strict(&token, &env_cfg).unwrap_err();
+        let err = anyhow::Error::new(verification_error);
+
+        let human = crate::human_error_message(&err);
+        let machine = crate::user_error_message(&err);
+        assert!(human.contains("HTTP 503"));
+        assert!(machine.contains("HTTP 503"));
+        assert!(!human.contains(sentinel));
+        assert!(!machine.contains(sentinel));
         discovery.assert();
     }
 

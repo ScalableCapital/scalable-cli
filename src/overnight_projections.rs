@@ -262,16 +262,6 @@ fn optional_non_empty_string(value: Option<&Value>) -> Option<String> {
 }
 
 fn map_overnight_transaction(transaction: &Value) -> Result<Value> {
-    let documents = match transaction.get("documents") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(documents)) => documents.iter().map(map_transaction_document).collect(),
-        Some(_) => {
-            return Err(anyhow!(
-                "Overnight response invalid: invalid transaction.documents (expected array)"
-            ));
-        }
-    };
-
     Ok(json!({
         "id": transaction.get("id").cloned().unwrap_or(Value::Null),
         "currency": transaction.get("currency").cloned().unwrap_or(Value::Null),
@@ -284,16 +274,7 @@ fn map_overnight_transaction(transaction: &Value) -> Result<Value> {
         "amount": transaction.get("amount").cloned().unwrap_or(Value::Null),
         "custodian": transaction.get("custodian").cloned().unwrap_or(Value::Null),
         "related_isin": transaction.get("relatedIsin").cloned().unwrap_or(Value::Null),
-        "documents": documents,
     }))
-}
-
-fn map_transaction_document(document: &Value) -> Value {
-    json!({
-        "id": document.get("id").cloned().unwrap_or(Value::Null),
-        "label": document.get("label").cloned().unwrap_or(Value::Null),
-        "url": document.get("url").cloned().unwrap_or(Value::Null),
-    })
 }
 
 fn timestamp_value_or_null(raw: Option<&Value>) -> Value {

@@ -464,6 +464,7 @@ fn fixed_term_authenticated_dispatch_uses_scoped_queries_and_existing_error_hand
                 person_id: "person-1".into(),
                 source: LoginSource::DeviceCode,
             },
+            refresh_recovery_pending: false,
         })
         .unwrap();
     for (args, query, operation, variables, response, expected) in [

@@ -89,11 +89,6 @@ query OvernightTransactions(
           amount
           custodian
           relatedIsin
-          documents {
-            id
-            label
-            url
-          }
         }
       }
     }

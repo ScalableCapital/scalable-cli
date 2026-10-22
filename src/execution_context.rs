@@ -429,7 +429,6 @@ mod tests {
                 )),
                 portfolio_id: None,
                 include_year_to_date: false,
-                quote_source: Some("CONSOLIDATED".to_string()),
                 json: false,
             }),
         });
@@ -438,8 +437,6 @@ mod tests {
             OsString::from("broker"),
             OsString::from("watchlist"),
             OsString::from("--json"),
-            OsString::from("--quote-source"),
-            OsString::from("CONSOLIDATED"),
             OsString::from("add"),
             OsString::from("--isin"),
             OsString::from("US0378331005"),

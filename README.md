@@ -32,7 +32,7 @@ Selenium, browser scraping, or brittle UI scripts.
 ## Why use `sc`
 
 - Use supported broker commands instead of browser automation or screen scraping.
-- Work interactively in the terminal or use `--json` for local scripts and agent workflows.
+- Work interactively in the terminal or use `--json` for scripts and agents.
 - Review trades and savings-plan changes before submission with an explicit
   two-step confirmation flow.
 
@@ -40,57 +40,65 @@ Selenium, browser scraping, or brittle UI scripts.
 
 ### macOS
 
-#### Option 1: Homebrew
-1. Tap the repository:
-   ```bash
-   brew tap ScalableCapital/tap
-   brew trust --formula ScalableCapital/tap/scalable-cli
-   ```
-2. Install the CLI:
-   ```bash
-   brew install scalable-cli
-   ```
+#### Homebrew
 
-#### Option 2: Manual install
-1. Download the macOS PKG installer from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
-2. Run the installer.
+```bash
+brew tap ScalableCapital/tap
+brew trust --formula ScalableCapital/tap/scalable-cli
+brew install scalable-cli
+```
+
+#### Manual install
+
+Download the macOS PKG installer from the
+[latest release](https://github.com/ScalableCapital/scalable-cli/releases)
+and run it.
 
 ### Linux
 
-#### Manual install
-1. Download the tar.gz archive for your architecture (`x86_64` or `aarch64`) from the [latest release](https://github.com/ScalableCapital/scalable-cli/releases).
-2. Extract the archive.
-3. Move the `sc` binary to a directory on your `PATH`.
+Download the tar.gz archive for your architecture (`x86_64` or `aarch64`) from
+the [latest release](https://github.com/ScalableCapital/scalable-cli/releases),
+extract it, and move the `sc` binary to a directory on your `PATH`.
 
-### Official binaries and source builds
+Official Linux binaries require **glibc 2.38 or newer**. Older distributions,
+such as Debian 12 (`glibc 2.36`), cannot run these binaries. Official release
+artifacts do not support musl-based distributions such as Alpine. Building
+from source on an older distribution is a workaround.
 
-Official Scalable-distributed binaries are the release assets published by
-Scalable Capital on GitHub and the packages installed from the official
-Scalable Homebrew tap.
+### Provenance and verification
 
-If you build this repository yourself, use a fork, install from a third-party
-package manager, pull a container image, or receive a redistributed binary from
-someone else, that binary is not distributed by Scalable Capital. Only use
-binaries whose source and provenance you trust, especially before logging in or
-running broker commands.
+Official Scalable-distributed binaries are the GitHub release assets and
+packages from the official Scalable Homebrew tap. Source builds, forks,
+third-party packages, containers, and redistributed binaries are not
+Scalable-distributed binaries. Only use binaries whose provenance you trust.
 
-### Basic verification
+Release assets include signed checksums. See
+[Verify release artifacts](public-docs/verify-releases.md) for the signing key
+and complete verification commands.
 
 ```bash
 sc --version
 sc --help
 ```
 
+### Build from source
+
+Build the production-channel binary with a Rust toolchain:
+
+```bash
+cargo build --locked --release --features channel-prod --bin sc
+target/release/sc --version
+target/release/sc --help
+```
+
+The binary is written to `target/release/sc`. A self-built binary is not an
+official Scalable-distributed release artifact.
+
 ## Quick start
 
-Scalable CLI is the official command line for the Scalable Broker.
-
-> [!IMPORTANT]  
-> Before you can use the CLI, enable Scalable CLI in your profile on the Scalable
-**web platform** under Profile > Security > Agentic Investing.
-
-Once you have enabled Scalable CLI in your profile on the Scalable web platform,
-authenticate and confirm the CLI can access your Scalable Broker account:
+Before you authenticate, enable Scalable CLI on the Scalable web platform
+under **Profile → Security → Agentic Investing**. Then authenticate and confirm
+that the CLI can access your Broker account:
 
 ```bash
 sc login
@@ -99,465 +107,148 @@ sc capabilities --json
 sc broker overview --json
 ```
 
-`sc login` uses an OAuth 2.0 device-code flow.
-For security and reliability, complete login yourself rather than via an AI agent.
+`sc login` uses an OAuth 2.0 device-code flow. Complete login yourself in a
+browser rather than via an AI agent.
 
-Optional local write guard:
+For a locally enforced read-only session, use `sc login --local-read-only`.
+This blocks CLI write commands locally; it does not restrict backend token
+permissions. See [Local read-only mode](public-docs/configuration.md#local-read-only-mode).
 
-- `sc login --local-read-only` stores the session in a locally enforced read-only mode.
-- This does not change token permissions or backend access.
-- Read commands and local commands such as `sc broker context select` continue to work, while write commands are blocked locally until you run `sc login` again without `--local-read-only`.
+### Refresh recovery
 
-## Release artifact provenance
-
-Release assets include checksums and a minisign signature for the checksum
-manifest. The examples below assume `minisign` and the GitHub CLI (`gh`) are
-installed.
-
-Each snippet below pins the current Scalable Capital minisign release signing
-public key: `RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b`.
-
-### Verify a Linux tarball
-
-```bash
-tag="vX.Y.Z"
-arch="x86_64" # or aarch64
-repo="ScalableCapital/scalable-cli"
-minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
-
-asset="sc-${tag}-linux-${arch}-gnu.tar.gz"
-checksums="sc-${tag}-SHA256SUMS"
-
-gh release download "${tag}" \
-  --repo "${repo}" \
-  --pattern "${asset}" \
-  --pattern "${checksums}" \
-  --pattern "${checksums}.minisig" \
-  --clobber
-
-minisign -V \
-  -P "${minisign_public_key}" \
-  -m "${checksums}" \
-  -x "${checksums}.minisig"
-
-set -o pipefail
-grep -F "  ${asset}" "${checksums}" | sha256sum -c -
-```
-
-### Verify a macOS PKG installer
-
-```bash
-tag="vX.Y.Z"
-repo="ScalableCapital/scalable-cli"
-minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
-
-asset="sc-${tag}-macos-universal2.pkg"
-checksums="sc-${tag}-SHA256SUMS"
-
-gh release download "${tag}" \
-  --repo "${repo}" \
-  --pattern "${asset}" \
-  --pattern "${checksums}" \
-  --pattern "${checksums}.minisig" \
-  --clobber
-
-minisign -V \
-  -P "${minisign_public_key}" \
-  -m "${checksums}" \
-  -x "${checksums}.minisig"
-
-set -o pipefail
-grep -F "  ${asset}" "${checksums}" | shasum -a 256 -c -
-pkgutil --check-signature "${asset}"
-spctl -a -vv --type install "${asset}"
-```
-
-### Verify the macOS Homebrew runtime ZIP
-
-```bash
-tag="vX.Y.Z"
-repo="ScalableCapital/scalable-cli"
-minisign_public_key="RWRKuuSASIzbSYpuU5gdXeTkXirJBl5+XVXLP6E60hBUUKZ5HPIGjV8b"
-
-asset="sc-${tag}-macos-universal2.zip"
-checksums="sc-${tag}-SHA256SUMS"
-
-gh release download "${tag}" \
-  --repo "${repo}" \
-  --pattern "${asset}" \
-  --pattern "${checksums}" \
-  --pattern "${checksums}.minisig" \
-  --clobber
-
-minisign -V \
-  -P "${minisign_public_key}" \
-  -m "${checksums}" \
-  -x "${checksums}.minisig"
-
-set -o pipefail
-grep -F "  ${asset}" "${checksums}" | shasum -a 256 -c -
-
-rm -rf ./sc-homebrew-runtime
-unzip -q "${asset}" -d ./sc-homebrew-runtime
-codesign -dv --verbose=4 ./sc-homebrew-runtime/Sc.app
-spctl -a -vv --type exec ./sc-homebrew-runtime/Sc.app
-```
+Once the rotated refresh token has been saved locally, temporary issuer
+verification failures or failures saving the final verified session can be
+retried. In `--json` mode these are reported as
+`refresh_retryable` with exit code `30`; retry the same command. A response
+whose token fails local signature or claim validation still requires `sc login`.
 
 ## Common commands
 
-### Identity and session
+| Task | Example |
+| --- | --- |
+| Check identity | `sc whoami` |
+| Discover broker portfolios | `sc broker portfolios` |
+| Select a portfolio | `sc broker context select --portfolio-id <PORTFOLIO_ID>` |
+| View portfolio overview | `sc broker overview --json` |
+| View historical portfolio chart | `sc broker chart --timeframe 1y --json` |
+| View cash, buying power, and credit | `sc broker cash-breakdown --json` |
+| List holdings | `sc broker holdings --json` |
+| List transactions | `sc broker transactions --json` |
+| View a transaction | `sc broker transaction details --transaction-id <TRANSACTION_ID> --json` |
+| Find a security | `sc broker search "apple" --json` |
+| Get a quote | `sc broker quote --isin US0378331005 --json` |
+| Discover execution venues | `sc broker order-venues` |
+| View portfolio groups | `sc broker portfolio-groups` |
+| List savings plans | `sc broker savings-plans` |
+| View Overnight savings | `sc overnight` |
+| List Fixed-Term accounts | `sc fixed-term list` |
+| End the local session | `sc logout` |
 
-```bash
-sc whoami
-sc logout
-```
+Broker commands use the resolved portfolio. If selection is required, discover
+its ID with `sc broker portfolios`, then select it with `sc broker context select`.
 
-### Overnight savings
+`sc broker chart` returns historical portfolio valuation and monetary absolute
+return. Use `--portfolio-id` to select a portfolio or `--isin` for security price
+history. See [Portfolio and market data](public-docs/commands.md#portfolio-and-market-data)
+for timeframes and output details.
 
-```bash
-sc overnight
-sc overnight --savings-account-id <SAVINGS_ACCOUNT_ID>
-sc overnight transactions --page-size 50 --type-filter interest
-sc overnight transactions --savings-account-id <SAVINGS_ACCOUNT_ID> --json
-```
+`cash-breakdown` distinguishes `cash_balance`, buying power with and without
+credit, `available_credit_line`, and `loaned`. Unavailable values are `null`;
+do not interpret them as zero. See [Cash and buying power](public-docs/commands.md#cash-and-buying-power).
 
-`sc overnight` shows the dedicated overnight savings summary. It
-auto-resolves the savings account when exactly one active account is accessible;
-otherwise, provide `--savings-account-id`.
-
-`sc overnight transactions` lists the deposits, withdrawals, interest, and
-other cash transactions for the selected overnight account. It supports cursor
-pagination, repeatable `--type-filter`, text search, and time-window filters.
-Run `sc overnight transactions --help` for all available filters.
-
-### Portfolio and market data
-
-```bash
-sc broker overview
-sc broker analytics
-sc broker transactions
-sc broker transaction details --transaction-id <TRANSACTION_ID>
-sc broker holdings
-sc broker portfolio-groups
-sc broker portfolio-groups --group-id <GROUP_ID>
-sc broker chart --isin US0378331005 --timeframe 1m
-sc broker quote --isin US0378331005
-sc broker watchlist
-sc broker search "apple"
-sc broker derivatives search --underlying US0378331005 --type knockout --strategy long
-sc broker security-news --isin US0378331005 --locale en_DE
-```
-
-`sc broker overview` reports the absolute return (`simpleAbsoluteReturn`) for
-each available timeframe. It does not report a relative return percentage.
-
-`sc broker portfolio-groups` returns all groups, their items, group-level since-buy
-performance, and ungrouped holdings. Add `--group-id <GROUP_ID>` to narrow the
-result to one existing group; filtered reads keep the same JSON shape but return
-an empty `ungrouped_items` list.
-
-Manage group metadata with lifecycle commands. `update` changes only the supplied
-fields; use `--clear-description` to remove an existing description.
-
-```bash
-sc broker portfolio-groups create --name "AI portfolio" --description "tracked by agent"
-sc broker portfolio-groups update --group-id <GROUP_ID> --name "Long-term portfolio"
-sc broker portfolio-groups update --group-id <GROUP_ID> --clear-description
-sc broker portfolio-groups delete --group-id <GROUP_ID>
-sc broker portfolio-groups assign --group-id <GROUP_ID> --isin US0378331005 --isin IE00B4ND3602
-sc broker portfolio-groups unassign --group-id <GROUP_ID> --isin US0378331005
-```
-
-`assign` moves each supplied holding into the target group, automatically removing it
-from any other group. `unassign` removes holdings from the named group and returns them
-to the ungrouped holdings list. Assigning a holding already in the target group, or
-unassigning one that is not in it, returns a validation error.
-
-`sc broker derivatives search` supports derivative discovery for a known
-underlying ISIN. The selected derivative ISIN can then be quoted with
-`sc broker quote --isin ...`. The CLI also verifies trade buy phase-1 input
-acceptance for derivative-style ISINs.
-
-### Watchlist, alerts and savings plans
-
-```bash
-sc broker watchlist add --isin US0378331005
-sc broker watchlist remove --isin US0378331005
-sc broker price-alerts --active-only
-sc broker price-alerts add --isin US0378331005 --price 180.00
-sc broker price-alerts add --ticker BTC --price 45000.00
-sc broker price-alerts remove --alert-id <ALERT_ID>
-sc broker savings-plans
-sc broker savings-plans config --isin US0378331005
-# Phase 1: preview; this does not create or update a plan.
-sc broker savings-plans add --isin US0378331005 --amount 100
-# Phase 2: run only after a separate affirmative client confirmation.
-sc broker savings-plans add --isin US0378331005 --amount 100 --confirm <CONFIRMATION_ID>
-sc broker savings-plans remove --isin US0378331005
-```
-
-Savings-plan additions and updates are intentionally two-step. Phase 1 returns
-the full ex-ante cost disclosure calculated for `SEIX`, together with a
-short-lived confirmation ID. Present every value in that disclosure to the
-client, obtain an explicit affirmative response in a separate interaction,
-then repeat the exact arguments with `--confirm <CONFIRMATION_ID>`.
-
-If phase 2 has an unknown outcome, do not retry it. Run
-`sc broker savings-plans` for the same account and portfolio to inspect the
-result; only that successful list clears the local safety gate for a later,
-deliberately new preview.
-
-### Broker context
-
-```bash
-sc broker context show
-sc broker context select --portfolio-id <PORTFOLIO_ID>
-```
+See the [command reference](public-docs/commands.md) for full examples, filters,
+account coverage, portfolio groups, derivatives, alerts, and savings-plan changes.
+Transaction documents are available in the Scalable app and are not exposed by
+the CLI. Portfolio analytics (`sc broker analytics`) is unavailable in this version.
 
 ## Trading
 
-Buy and sell flows are intentionally two-step.
+Buy and sell orders use two steps:
 
-Run the command once to preview the order and receive a confirmation ID:
+1. Preview the order and review its details and disclosures.
+2. Obtain an explicit affirmative client response in a separate interaction,
+   then repeat the exact arguments with the returned `--confirm` ID.
 
 ```bash
+# Phase 1: preview only.
 sc broker trade buy --isin US0378331005 --amount 500 --order-type market
-sc broker trade buy --isin US0378331005 --shares 2 --order-type market
-```
-
-Submit the exact same order with `--confirm` to place it:
-
-```bash
+# Phase 2: run only after separate affirmative client confirmation.
 sc broker trade buy --isin US0378331005 --amount 500 --order-type market \
   --confirm <CONFIRMATION_ID>
-sc broker trade buy --isin US0378331005 --shares 2 --order-type market \
-  --confirm <CONFIRMATION_ID>
 ```
 
-If phase 1 explicitly requires acknowledgement of an appropriateness warning for
-the buy order, set `--acknowledge-appropriateness-warning` only after reviewing
-the warning and confirming that you understand the risks and want to proceed.
+Supported order types are `market`, `limit`, `stop`, and `stop-limit`.
+Stop-limit orders require both `--stop-price` and `--limit-price`; see the
+[trading examples](public-docs/commands.md#trading).
 
-Buy orders require exactly one sizing input: `--amount` or `--shares`. Buy-side
-share input currently accepts whole shares only.
+Trade confirmation IDs expire after 15 minutes. If the preview requires an
+appropriateness-warning acknowledgement, review and acknowledge it before submission.
 
-The same confirmation model applies to sell orders:
+A failed submission can have an unknown outcome. Check transactions or orders
+in the Scalable app before retrying. Do not submit another order while the
+outcome is unresolved. Follow the [trade recovery procedure](public-docs/commands.md#recovering-from-a-failed-submission).
 
-```bash
-sc broker trade sell --isin US0378331005 --shares 1 --order-type market
-sc broker trade cancel --order-id <ORDER_ID>
-```
-
-Supported order types:
-
-- `market`
-- `limit`
-- `stop`
-
-Trade cancellation is a separate single-step command for pending orders. Use
-the `order_id` returned by `sc broker trade buy` or `sc broker trade sell`; it
-is the same ID shown in `sc broker transactions`.
-
-Optional local trade controls can be configured in `config.toml` for CLI-based
-trading:
-
-- `allowed_isins`
-- `denied_isins`
-- `max_order_notional`
-
-These controls are enforced locally by the CLI only. They do not change your
-account permissions or backend trading permissions.
+Savings-plan changes have their own [inspection and recovery procedure](public-docs/commands.md#watchlist-alerts-and-savings-plans).
+See [Trading](public-docs/commands.md#trading) for sell orders, sizing, venues,
+order types, and cancellation.
 
 ## Automation
 
-- `sc capabilities --json` exposes the supported machine-readable command surface.
-- `sc capabilities --json` also exposes the parsed local trade-control state in
-  `local_trade_controls`.
-- Broker commands support `--json` for compact structured output.
-- `sc login` remains human-oriented in the current version.
+Use `--json` for structured output and `sc capabilities --json` to discover the
+installed command surface and local trade-control state. Login requires human
+interaction.
 
-## Help
+- **Session limits:** access tokens last 20 minutes and refresh automatically.
+  Authenticated requests, including reads, reset a 24-hour idle timeout. A new
+  interactive login is required after at most seven days from the original login.
+- **Rate limits:** limits vary by operation and can change; fixed thresholds
+  are not published. Rate-limited backend requests are not automatically retried.
+  Respect retry guidance and check trade outcomes before retrying submissions.
+- **JSON compatibility:** compatibility across releases is not guaranteed.
+  Review release notes and verify the fields your integration needs before upgrading.
+
+See the [automation guide](public-docs/automation.md) for session refresh and
+revocation, rate-limit errors, JSON handling, and upgrade guidance.
+
+## Configuration
+
+`config.toml` is optional. Its location is:
+
+- macOS: `~/.config/scalable-cli/config.toml`
+- Linux: `$XDG_CONFIG_HOME/scalable-cli/config.toml` when `XDG_CONFIG_HOME` is
+  set, otherwise `~/.config/scalable-cli/config.toml`
+
+Sessions default to `keyring` on macOS and Linux. Signing keys default to
+`secure_enclave` on macOS and `file` on Linux.
+
+On a Linux server or container without Secret Service, use file-based session
+storage by adding this to `config.toml`:
+
+```toml
+[auth]
+session_backend = "file"
+```
+
+Then run `sc login` and `sc whoami`. Session secrets are stored in local files;
+keep them private to the Unix account running the CLI. Prefer keyring-backed
+storage where available.
+
+See [Configuration](public-docs/configuration.md) for backend options, local
+read-only mode, trade controls, PKCS#11, and dedicated Unix-user setups.
+
+## Further reading and help
+
+| Guide | Covers |
+| --- | --- |
+| [Command reference](public-docs/commands.md) | Command examples, product behavior, trading, and recovery |
+| [Automation](public-docs/automation.md) | Session limits, rate limits, JSON, and upgrades |
+| [Configuration](public-docs/configuration.md) | Storage, local controls, and advanced setups |
+| [Verify release artifacts](public-docs/verify-releases.md) | Provenance, signed checksums, and macOS verification |
+
+### Help
 
 ```bash
 sc --help
 sc broker --help
 sc broker trade buy --help
 ```
-
-## Configuration
-
-`config.toml` is optional local runtime config for storage backends. The default
-configuration is platform-specific.
-
-Example:
-
-```toml
-[auth]
-session_backend = "keyring"
-signing_key_backend = "secure_enclave"
-```
-
-Configuration options:
-
-- session_backend: where the login session is stored. Supported values: `keyring`, `file`. Default is `keyring` on macOS/Linux.
-- signing_key_backend: where the authentication signing key is stored. Supported values: `file`, `secure_enclave`, `pkcs11`. Default is `secure_enclave` on macOS and `file` on Linux. `secure_enclave` is macOS-only. `pkcs11` is Linux-only and opt-in.
-
-### Local trade controls
-
-You can optionally define local trade controls for the CLI:
-
-```toml
-[trade_controls]
-allowed_isins = ["US0378331005", "IE00B4L5Y983"]
-denied_isins = ["US88160R1014"]
-max_order_notional = "1000"
-```
-
-Trade-control behavior:
-
-- If a control is not configured, it is inactive.
-- If neither `allowed_isins` nor `denied_isins` is configured, ISIN controls are inactive.
-- If `allowed_isins = []`, no ISIN can be traded through the CLI.
-- If both `allowed_isins` and `denied_isins` are configured, the effective set is `allowed_isins - denied_isins`.
-- `max_order_notional` is checked against the prepared order notional before submission.
-
-These controls apply only when trading through `sc`.
-
-### Linux PKCS#11 signing key
-
-PKCS#11 lets the CLI use an existing hardware token, smartcard, or HSM-backed
-key for its authentication signing key. The CLI does not create, import, rotate,
-delete, export, or store PKCS#11 private keys.
-
-```toml
-[auth]
-signing_key_backend = "pkcs11"
-
-[auth.pkcs11]
-module_path = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
-key_uri = "pkcs11:token=YubiKey%20PIV;id=%01"
-```
-
-PKCS#11 options:
-
-- module_path: required path to the PKCS#11 provider library.
-- key_uri: required PKCS#11 URI for the existing key.
-
-The URI must start with `pkcs11:` and identify exactly one EC P-256 private
-key. Use `id=` or `object=` to identify the key; add `token=`, `serial=`,
-`manufacturer=`, or `model=` if needed to make token selection unambiguous.
-Percent-encode binary IDs and spaces.
-
-If the token requires login, use either the token/provider protected
-authentication path or set `SC_PKCS11_PIN` in the environment. The CLI does not
-prompt for or store the PIN.
-
-PKCS#11 failures do not fall back to `file`. Switching signing backends changes
-the authentication key identity, so run `sc login` again after changing this
-setting.
-
-Config file locations:
-
-- macOS: ~/.config/scalable-cli/config.toml
-- Linux: $XDG_CONFIG_HOME/scalable-cli/config.toml, falling back to ~/.config/scalable-cli/config.toml
-
-## Build from source
-
-Building from source is useful for inspection, local development, and advanced
-users. A locally built binary is self-built; it is not an official
-Scalable-distributed release artifact unless it was built and published by
-Scalable Capital through the official release process above.
-
-Build the production-channel binary:
-
-```bash
-cargo build --locked --release --features channel-prod --bin sc
-```
-
-The binary is written to:
-
-```bash
-target/release/sc
-```
-
-Verify the build:
-
-```bash
-target/release/sc --version
-target/release/sc --help
-```
-
-## Run as a dedicated Unix user
-
-If another local service needs to invoke `sc`, it can be useful to run the CLI as
-a separate Unix user with a narrowly scoped `sudoers` rule.
-
-This lets the application use the CLI without gaining direct access to files
-created by the CLI, such as session or configuration data owned by
-`scalable-cli-user`. That separation is useful for limiting data exposure and
-reducing the blast radius if the calling application account is compromised.
-
-### Create the user
-
-Create the dedicated account:
-
-```bash
-sudo useradd -m -s /bin/bash scalable-cli-user
-```
-
-If the user should not be able to log in interactively, use a non-login shell
-instead:
-
-```bash
-sudo useradd -m -s /usr/sbin/nologin scalable-cli-user
-```
-
-Verify that the user exists:
-
-```bash
-id scalable-cli-user
-```
-
-### Configure `sudoers`
-
-Assume the main application runs as Unix user `app-user` and should be allowed
-to execute exactly the `sc` CLI as `scalable-cli-user`.
-
-Create a dedicated `sudoers` file such as `/etc/sudoers.d/app-cli` with:
-
-```sudoers
-app-user ALL=(scalable-cli-user) NOPASSWD: /usr/local/bin/sc
-```
-
-This means:
-
-- `app-user` may use `sudo` without a password.
-- The command runs as `scalable-cli-user`.
-- Only `/usr/local/bin/sc` is allowed.
-
-Set the required permissions on the file:
-
-```bash
-sudo chmod 440 /etc/sudoers.d/app-cli
-```
-
-Validate the `sudoers` configuration:
-
-```bash
-sudo visudo -cf /etc/sudoers.d/app-cli
-```
-
-### Result
-
-With that setup, `app-user` can run:
-
-```bash
-sudo -n -u scalable-cli-user /usr/local/bin/sc
-```
-
-The same rule does not allow arbitrary commands to run as
-`scalable-cli-user`.
-
-In practice, this means `app-user` can trigger `sc`, but does not automatically
-get read access to files owned by `scalable-cli-user`. The CLI remains usable
-while its local files stay isolated behind normal Unix file ownership.

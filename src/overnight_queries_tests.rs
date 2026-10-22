@@ -161,7 +161,6 @@ fn overnight_transactions_query_requests_cash_transaction_fields() {
         "cashTransactionType",
         "relatedIsin",
         "custodian",
-        "documents",
     ] {
         assert!(OVERNIGHT_TRANSACTIONS_QUERY.contains(field));
     }

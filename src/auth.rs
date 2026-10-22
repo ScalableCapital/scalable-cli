@@ -20,7 +20,9 @@ use crate::session::{
     LoginSource, SecretWriteBackend, Session, SessionManager, SessionMode,
     StorageBackendDiagnostics, StoredSession,
 };
-use crate::token_verifier::{verify_access_token_allow_expired, verify_access_token_strict};
+use crate::token_verifier::{
+    AccessTokenVerificationError, verify_access_token_allow_expired, verify_access_token_strict,
+};
 use crate::transport_security::{
     RUNTIME_HTTP_TIMEOUT, build_blocking_client_https_only_with_timeout,
     validate_env_transport_security, validate_https_url,
@@ -35,6 +37,61 @@ struct TokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+/// The point at which a refresh attempt failed. A transport error after
+/// `RequestSent` is ambiguous: the issuer may have rotated the credential
+/// even though the CLI did not receive a usable response.
+#[derive(Debug)]
+enum RefreshExchangeError {
+    BeforeRequest(anyhow::Error),
+    RequestSent(anyhow::Error),
+}
+
+/// Controls refresh cleanup independently of user-facing error text. Issuer
+/// unavailability before an exchange is retryable only for a recovery record;
+/// post-response failures are classified at the stage where they occur.
+#[derive(Debug)]
+pub(crate) enum RefreshFailure {
+    /// The previously verified token could not be checked because issuer
+    /// discovery or signing material is unavailable. No refresh request was
+    /// sent, so a persisted recovery record remains safe to retry.
+    IssuerMaterialUnavailable(anyhow::Error),
+    /// The local record is rejected, or a refresh request was sent without a
+    /// usable response. The caller must remove a matching session.
+    ReloginRequired(anyhow::Error),
+    /// A rotated credential is already durable. Preserve it for another command.
+    Retryable(anyhow::Error),
+    /// A local setup failure or incompatible concurrent replacement. Preserve
+    /// the active record without claiming the recovery retry contract applies.
+    Other(anyhow::Error),
+}
+
+impl RefreshFailure {
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::IssuerMaterialUnavailable(error)
+            | Self::ReloginRequired(error)
+            | Self::Retryable(error)
+            | Self::Other(error) => error,
+        }
+    }
+}
+
+impl RefreshExchangeError {
+    fn before_request(error: anyhow::Error) -> Self {
+        Self::BeforeRequest(error)
+    }
+
+    fn request_sent(error: anyhow::Error) -> Self {
+        Self::RequestSent(error)
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::BeforeRequest(error) | Self::RequestSent(error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,10 +155,6 @@ impl AuthDpopContext {
         Self::from_key_material(key_material).context(DPOP_SESSION_KEY_RELOGIN_MESSAGE)
     }
 
-    pub(crate) fn jwk_thumbprint(&self) -> &str {
-        &self.jwk_thumbprint
-    }
-
     #[cfg(test)]
     fn with_key_material_for_tests(key_material: DpopKeyMaterial) -> Self {
         Self::from_key_material(key_material).expect("test DPoP key should have thumbprint")
@@ -147,6 +200,7 @@ const BROWSER_CONFIRMATION_WAIT_MESSAGE: &str = "Waiting for browser confirmatio
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(125);
 pub(crate) const REFRESH_RELOGIN_REQUIRED_PREFIX: &str = "REFRESH_RELOGIN_REQUIRED:";
+pub(crate) const REFRESH_RETRYABLE_PREFIX: &str = "REFRESH_RETRYABLE:";
 const REVOKE_AUTH_ACCESS_TOKEN_MUTATION: &str = r#"
 mutation revokeAuthAccessToken($input: AuthAccessTokenInput!) {
   revokeAuthAccessToken(input: $input)
@@ -497,6 +551,7 @@ pub fn login_with_device_code(
                     session,
                     dpop_jwk_thumbprint: Some(dpop.jwk_thumbprint.clone()),
                     mode: session_mode,
+                    refresh_recovery_pending: false,
                 });
             }
             DevicePollState::Pending => {
@@ -525,25 +580,45 @@ pub(crate) fn refresh_session_if_needed(
 ) -> Result<Option<Session>> {
     validate_env_transport_security(env_cfg)?;
     let dpop = AuthDpopContext::from_runtime_options_for_authenticated_session(dpop_options)?;
-    refresh_session_if_needed_with_dpop(env_cfg, session, &dpop)
+    begin_refresh_session_if_needed_at(env_cfg, session, current_epoch_seconds(), &dpop)
+        .map_err(RefreshFailure::into_error)?
+        .map(|pending| {
+            pending
+                .verify(env_cfg, session)
+                .map_err(RefreshFailure::into_error)
+        })
+        .transpose()
 }
 
 pub(crate) fn refresh_session_if_needed_with_dpop(
     env_cfg: &EnvConfig,
     session: &Session,
     dpop: &AuthDpopContext,
-) -> Result<Option<Session>> {
-    validate_env_transport_security(env_cfg)?;
-    refresh_session_if_needed_at(env_cfg, session, current_epoch_seconds(), dpop)
+) -> std::result::Result<Option<PendingSessionRefresh>, RefreshFailure> {
+    validate_env_transport_security(env_cfg).map_err(RefreshFailure::Other)?;
+    begin_refresh_session_if_needed_at(env_cfg, session, current_epoch_seconds(), dpop)
+}
+
+pub(crate) fn session_refresh_is_due_at(session: &Session, now_epoch_seconds: i64) -> bool {
+    is_expiring_soon(session.expires_at, now_epoch_seconds)
+}
+
+pub(crate) fn session_access_token_is_expired_at(
+    session: &Session,
+    now_epoch_seconds: i64,
+) -> bool {
+    session
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_epoch_seconds)
 }
 
 pub(crate) fn refresh_session_with_dpop(
     env_cfg: &EnvConfig,
     session: &Session,
     dpop: &AuthDpopContext,
-) -> Result<Session> {
-    validate_env_transport_security(env_cfg)?;
-    refresh_session_at(env_cfg, session, current_epoch_seconds(), dpop)
+) -> std::result::Result<PendingSessionRefresh, RefreshFailure> {
+    validate_env_transport_security(env_cfg).map_err(RefreshFailure::Other)?;
+    begin_refresh_session_at(env_cfg, session, current_epoch_seconds(), dpop)
 }
 
 pub fn revoke_tokens_on_logout_best_effort(
@@ -559,12 +634,29 @@ pub fn revoke_tokens_on_logout_best_effort(
         revoke_access_token_on_logout(env_cfg, &session.access_token, session_mode, dpop_options);
 }
 
+#[cfg(test)]
 fn refresh_session_if_needed_at(
     env_cfg: &EnvConfig,
     session: &Session,
     now_epoch_seconds: i64,
     dpop: &AuthDpopContext,
 ) -> Result<Option<Session>> {
+    begin_refresh_session_if_needed_at(env_cfg, session, now_epoch_seconds, dpop)
+        .map_err(RefreshFailure::into_error)?
+        .map(|pending| {
+            pending
+                .verify(env_cfg, session)
+                .map_err(RefreshFailure::into_error)
+        })
+        .transpose()
+}
+
+fn begin_refresh_session_if_needed_at(
+    env_cfg: &EnvConfig,
+    session: &Session,
+    now_epoch_seconds: i64,
+    dpop: &AuthDpopContext,
+) -> std::result::Result<Option<PendingSessionRefresh>, RefreshFailure> {
     if !is_expiring_soon(session.expires_at, now_epoch_seconds) {
         return Ok(None);
     }
@@ -574,58 +666,141 @@ fn refresh_session_if_needed_at(
             .expires_at
             .is_some_and(|exp| exp <= now_epoch_seconds)
         {
-            bail!(
+            return Err(RefreshFailure::Other(anyhow::anyhow!(
                 "Session access token is expired and no refresh token is available. Run 'sc login'."
-            );
+            )));
         }
         return Ok(None);
     }
 
-    let refreshed = refresh_session_at(env_cfg, session, now_epoch_seconds, dpop)?;
-    Ok(Some(refreshed))
+    let pending = begin_refresh_session_at(env_cfg, session, now_epoch_seconds, dpop)?;
+    Ok(Some(pending))
 }
 
-fn refresh_session_at(
+fn begin_refresh_session_at(
     env_cfg: &EnvConfig,
     session: &Session,
     now_epoch_seconds: i64,
     dpop: &AuthDpopContext,
-) -> Result<Session> {
+) -> std::result::Result<PendingSessionRefresh, RefreshFailure> {
     let refresh_token = session
         .refresh_token
         .as_deref()
-        .context("No refresh token is available for this session")?;
-    let session_id = session_id_claim_from_access_token(env_cfg, &session.access_token)
-        .context("Existing access token failed verification during refresh")?;
+        .context("No refresh token is available for this session")
+        .map_err(RefreshFailure::Other)?;
+    let session_id = match session_id_claim_from_access_token(env_cfg, &session.access_token) {
+        Ok(session_id) => session_id,
+        Err(AccessTokenVerificationError::Unavailable(error)) => {
+            return Err(RefreshFailure::IssuerMaterialUnavailable(error));
+        }
+        Err(AccessTokenVerificationError::Rejected(error)) => {
+            return Err(refresh_relogin_required_with_error(
+                "Existing access token failed verification during refresh",
+                error,
+            ));
+        }
+    };
 
-    let client = build_blocking_client_https_only_with_timeout(RUNTIME_HTTP_TIMEOUT)?;
-    let token = refresh_access_token(&client, env_cfg, refresh_token, session_id.as_deref(), dpop)?;
-
-    let rotated_refresh_token = token
-        .refresh_token
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            refresh_relogin_required(
-                "Token refresh succeeded but no usable replacement refresh token was returned",
+    let client =
+        build_blocking_client_https_only_with_timeout(RUNTIME_HTTP_TIMEOUT).map_err(|error| {
+            RefreshFailure::Other(
+                error.context("Token refresh could not be prepared before a request was sent"),
             )
         })?;
-    let verified = verify_access_token_strict(&token.access_token, env_cfg).map_err(|_| {
-        refresh_relogin_required(
-            "Token refresh succeeded but the refreshed access token failed verification",
-        )
-    })?;
+    let token =
+        match refresh_access_token(&client, env_cfg, refresh_token, session_id.as_deref(), dpop) {
+            Ok(token) => token,
+            Err(RefreshExchangeError::BeforeRequest(error)) => {
+                return Err(RefreshFailure::Other(error.context(
+                    "Token refresh could not be started before a request was sent",
+                )));
+            }
+            Err(RefreshExchangeError::RequestSent(error)) => {
+                return Err(refresh_relogin_required_with_error(
+                    "Token refresh did not yield a usable response after the request was sent",
+                    error,
+                ));
+            }
+        };
 
-    Ok(Session {
-        access_token: token.access_token,
-        refresh_token: Some(rotated_refresh_token),
-        id_token: token.id_token.or_else(|| session.id_token.clone()),
-        expires_at: token
-            .expires_in
-            .map(|s| now_epoch_seconds + s)
-            .or(verified.expires_at),
-        person_id: verified.person_id,
-        source: session.source.clone(),
-    })
+    PendingSessionRefresh::new(token, now_epoch_seconds)
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingSessionRefresh {
+    access_token: String,
+    refresh_token: String,
+    id_token: Option<String>,
+    expires_at: Option<i64>,
+}
+
+impl PendingSessionRefresh {
+    fn new(
+        token: TokenResponse,
+        now_epoch_seconds: i64,
+    ) -> std::result::Result<Self, RefreshFailure> {
+        let refresh_token = token
+            .refresh_token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                refresh_relogin_required(
+                    "Token refresh succeeded but no usable replacement refresh token was returned",
+                )
+            })?;
+
+        Ok(Self {
+            access_token: token.access_token,
+            refresh_token,
+            id_token: token.id_token,
+            expires_at: token.expires_in.map(|seconds| now_epoch_seconds + seconds),
+        })
+    }
+
+    pub(crate) fn recovery_session(&self, current: &Session) -> Session {
+        let mut recovery = current.clone();
+        recovery.refresh_token = Some(self.refresh_token.clone());
+        // Older binaries do not understand the recovery marker. Make the
+        // preserved, last-verified access token refresh-due for them too.
+        recovery.expires_at = Some(0);
+        recovery
+    }
+
+    pub(crate) fn verify(
+        self,
+        env_cfg: &EnvConfig,
+        current: &Session,
+    ) -> std::result::Result<Session, RefreshFailure> {
+        let verified = match verify_access_token_strict(&self.access_token, env_cfg) {
+            Ok(verified) => verified,
+            Err(AccessTokenVerificationError::Unavailable(error)) => {
+                return Err(refresh_retryable_with_error(
+                    "Token refresh succeeded, but verification of the refreshed access token is temporarily unavailable. Retry the command",
+                    error,
+                ));
+            }
+            Err(AccessTokenVerificationError::Rejected(error)) => {
+                return Err(refresh_relogin_required_with_error(
+                    "Token refresh succeeded but the refreshed access token failed verification",
+                    error,
+                ));
+            }
+        };
+
+        if verified.person_id != current.person_id {
+            return Err(refresh_relogin_required(
+                "Token refresh succeeded but the refreshed access token belongs to another person",
+            ));
+        }
+
+        Ok(Session {
+            access_token: self.access_token,
+            refresh_token: Some(self.refresh_token),
+            id_token: self.id_token.or_else(|| current.id_token.clone()),
+            expires_at: self.expires_at.or(verified.expires_at),
+            person_id: verified.person_id,
+            source: current.source.clone(),
+        })
+    }
 }
 
 fn is_expiring_soon(expires_at: Option<i64>, now_epoch_seconds: i64) -> bool {
@@ -722,8 +897,8 @@ fn refresh_access_token(
     refresh_token: &str,
     session_id: Option<&str>,
     dpop: &AuthDpopContext,
-) -> Result<TokenResponse> {
-    let issuer = validated_auth_issuer(env_cfg)?;
+) -> std::result::Result<TokenResponse, RefreshExchangeError> {
+    let issuer = validated_auth_issuer(env_cfg).map_err(RefreshExchangeError::before_request)?;
 
     let mut form = HashMap::new();
     form.insert("grant_type", "refresh_token");
@@ -733,15 +908,19 @@ fn refresh_access_token(
         form.insert("session_id", value);
     }
 
-    send_oauth_form(
+    send_oauth_form_with_attempt_stage(
         client,
         &format!("{issuer}/oauth/token"),
         &form,
         "Token refresh",
         dpop,
-    )?
-    .json()
-    .context("Failed parsing refresh token response")
+    )
+    .and_then(|response| {
+        response
+            .json()
+            .context("Failed parsing refresh token response")
+            .map_err(RefreshExchangeError::request_sent)
+    })
 }
 
 fn revoke_refresh_token_on_logout(
@@ -792,7 +971,7 @@ fn revoke_access_token_on_logout(
 fn session_id_claim_from_access_token(
     env_cfg: &EnvConfig,
     access_token: &str,
-) -> Result<Option<String>> {
+) -> std::result::Result<Option<String>, AccessTokenVerificationError> {
     let verified = verify_access_token_allow_expired(access_token, env_cfg)?;
     Ok(verified.session_id)
 }
@@ -804,8 +983,20 @@ fn send_oauth_form(
     action: &str,
     dpop: &AuthDpopContext,
 ) -> Result<reqwest::blocking::Response> {
+    send_oauth_form_with_attempt_stage(client, url, form, action, dpop)
+        .map_err(RefreshExchangeError::into_error)
+}
+
+fn send_oauth_form_with_attempt_stage(
+    client: &Client,
+    url: &str,
+    form: &HashMap<&str, &str>,
+    action: &str,
+    dpop: &AuthDpopContext,
+) -> std::result::Result<reqwest::blocking::Response, RefreshExchangeError> {
     let validated_url = validate_https_url(url, "auth endpoint URL")
-        .with_context(|| format!("Invalid URL for {action}: {url}"))?
+        .with_context(|| format!("Invalid URL for {action}: {url}"))
+        .map_err(RefreshExchangeError::before_request)?
         .to_string();
     let mut nonce = None::<String>;
     for attempt in 0..2 {
@@ -813,12 +1004,14 @@ fn send_oauth_form(
         let proof = dpop
             .key_material
             .proof_for_request("POST", &validated_url, nonce.as_deref(), None)
-            .with_context(|| format!("Failed generating DPoP proof for {action}"))?;
+            .with_context(|| format!("Failed generating DPoP proof for {action}"))
+            .map_err(RefreshExchangeError::before_request)?;
         request = request.header("DPoP", proof);
 
         let response = request
             .send()
-            .with_context(|| format!("Failed performing {action}"))?;
+            .with_context(|| format!("Failed performing {action}"))
+            .map_err(RefreshExchangeError::request_sent)?;
 
         if response.status().is_success() {
             return Ok(response);
@@ -833,7 +1026,9 @@ fn send_oauth_form(
         }
 
         let message = format_oauth_error(action, status, &body);
-        bail!(with_dpop_troubleshooting_hint(message, status, &body));
+        return Err(RefreshExchangeError::request_sent(anyhow::anyhow!(
+            with_dpop_troubleshooting_hint(message, status, &body)
+        )));
     }
 
     unreachable!("OAuth form retry loop should always return");
@@ -987,15 +1182,27 @@ fn sanitize_post_login_mfa_error(_: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(TRUSTED_DEVICE_2FA_FAILURE_MESSAGE)
 }
 
-fn current_epoch_seconds() -> i64 {
+pub(crate) fn current_epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-fn refresh_relogin_required(detail: &str) -> anyhow::Error {
-    anyhow::anyhow!("{REFRESH_RELOGIN_REQUIRED_PREFIX} {detail}. Run 'sc login'.")
+pub(crate) fn refresh_relogin_required(detail: &str) -> RefreshFailure {
+    RefreshFailure::ReloginRequired(anyhow::anyhow!(
+        "{REFRESH_RELOGIN_REQUIRED_PREFIX} {detail}. Run 'sc login'."
+    ))
+}
+
+fn refresh_relogin_required_with_error(detail: &str, error: anyhow::Error) -> RefreshFailure {
+    RefreshFailure::ReloginRequired(error.context(format!(
+        "{REFRESH_RELOGIN_REQUIRED_PREFIX} {detail}. Run 'sc login'."
+    )))
+}
+
+pub(crate) fn refresh_retryable_with_error(detail: &str, error: anyhow::Error) -> RefreshFailure {
+    RefreshFailure::Retryable(error.context(format!("{REFRESH_RETRYABLE_PREFIX} {detail}.")))
 }
 
 #[cfg(test)]
@@ -1195,6 +1402,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
             session: sample_session(env_cfg, expires_at, refresh_token),
             dpop_jwk_thumbprint: dpop_jwk_thumbprint.map(ToString::to_string),
             mode: None,
+            refresh_recovery_pending: false,
         }
     }
 

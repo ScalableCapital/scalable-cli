@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn broker_portfolio_groups_variables_map_input() {
-        let input = BrokerInput::new("acc-1", "port-1", false, None).expect("input");
+        let input = BrokerInput::new("acc-1", "port-1", false).expect("input");
 
         let variables = broker_portfolio_groups_variables(&input).expect("variables");
 

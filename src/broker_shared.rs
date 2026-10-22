@@ -48,14 +48,8 @@ pub(crate) fn fingerprint_payload_for_transactions_input(normalized_input: &Valu
 pub(crate) fn validated_broker_input(
     ids: &ResolvedBrokerIds,
     include_year_to_date: bool,
-    quote_source: Option<&str>,
 ) -> Result<BrokerInput> {
-    BrokerInput::new(
-        &ids.account_id,
-        &ids.portfolio_id,
-        include_year_to_date,
-        quote_source,
-    )
+    BrokerInput::new(&ids.account_id, &ids.portfolio_id, include_year_to_date)
 }
 
 pub(crate) fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> Value {
@@ -68,6 +62,53 @@ pub(crate) fn broker_result_envelope(ids: &ResolvedBrokerIds, result: Value) -> 
         },
         "result": result,
     })
+}
+
+pub(crate) fn project_accessible_broker_portfolios_response(response: &Value) -> Result<Value> {
+    let account = response
+        .get("account")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Broker response invalid: missing account"))?;
+    let broker_portfolios = account
+        .get("brokerPortfolios")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Broker response invalid: missing account.brokerPortfolios")
+        })?;
+
+    let portfolio_ids = broker_portfolios
+        .iter()
+        .map(|portfolio| {
+            portfolio
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Broker response invalid: account.brokerPortfolios[].id must be a string"
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let portfolio_ids = normalize_portfolio_ids(portfolio_ids);
+
+    let (status, auto_resolved_portfolio_id) = match portfolio_ids.as_slice() {
+        [] => ("none_available", None),
+        [portfolio_id] => ("auto_resolved", Some(portfolio_id.clone())),
+        _ => ("selection_required", None),
+    };
+    let portfolios = portfolio_ids
+        .into_iter()
+        .map(|portfolio_id| json!({ "portfolio_id": portfolio_id }))
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "portfolios": portfolios,
+        "resolution": {
+            "status": status,
+            "auto_resolved_portfolio_id": auto_resolved_portfolio_id,
+        },
+    }))
 }
 
 pub(crate) fn resolve_broker_ids(
@@ -173,10 +214,19 @@ pub(crate) fn resolve_broker_ids(
     })
 }
 
-fn resolve_portfolio_id_from_candidates(mut candidates: Vec<String>) -> Result<Option<String>> {
-    candidates.retain(|candidate| !candidate.trim().is_empty());
-    candidates.sort();
-    candidates.dedup();
+fn normalize_portfolio_ids(portfolio_ids: Vec<String>) -> Vec<String> {
+    let mut portfolio_ids = portfolio_ids
+        .into_iter()
+        .map(|portfolio_id| portfolio_id.trim().to_string())
+        .filter(|portfolio_id| !portfolio_id.is_empty())
+        .collect::<Vec<_>>();
+    portfolio_ids.sort();
+    portfolio_ids.dedup();
+    portfolio_ids
+}
+
+fn resolve_portfolio_id_from_candidates(candidates: Vec<String>) -> Result<Option<String>> {
+    let candidates = normalize_portfolio_ids(candidates);
 
     match candidates.len() {
         0 => Ok(None),
@@ -185,5 +235,131 @@ fn resolve_portfolio_id_from_candidates(mut candidates: Vec<String>) -> Result<O
             "Unable to resolve broker portfolio id: multiple portfolios found [{}]. Provide --portfolio-id or set one via `sc broker context select --portfolio-id ...`",
             candidates.join(", ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accessible_broker_portfolios_reports_none_available() {
+        let projected = project_accessible_broker_portfolios_response(&json!({
+            "account": {
+                "id": "person-1",
+                "brokerPortfolios": [],
+            }
+        }))
+        .expect("project accessible portfolios");
+
+        assert_eq!(projected["portfolios"], json!([]));
+        assert_eq!(projected["resolution"]["status"], "none_available");
+        assert_eq!(
+            projected["resolution"]["auto_resolved_portfolio_id"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn accessible_broker_portfolios_auto_resolves_one_distinct_id() {
+        let projected = project_accessible_broker_portfolios_response(&json!({
+            "account": {
+                "id": "person-1",
+                "brokerPortfolios": [
+                    {"id": " portfolio-1 "},
+                    {"id": "portfolio-1"},
+                    {"id": ""},
+                ],
+            }
+        }))
+        .expect("project accessible portfolios");
+
+        assert_eq!(
+            projected["portfolios"],
+            json!([{"portfolio_id": "portfolio-1"}])
+        );
+        assert_eq!(projected["resolution"]["status"], "auto_resolved");
+        assert_eq!(
+            projected["resolution"]["auto_resolved_portfolio_id"],
+            "portfolio-1"
+        );
+    }
+
+    #[test]
+    fn accessible_broker_portfolios_requires_selection_for_multiple_ids() {
+        let projected = project_accessible_broker_portfolios_response(&json!({
+            "account": {
+                "id": "person-1",
+                "brokerPortfolios": [
+                    {"id": "portfolio-2"},
+                    {"id": "portfolio-1"},
+                    {"id": "portfolio-2"},
+                ],
+            }
+        }))
+        .expect("project accessible portfolios");
+
+        assert_eq!(
+            projected["portfolios"],
+            json!([
+                {"portfolio_id": "portfolio-1"},
+                {"portfolio_id": "portfolio-2"},
+            ])
+        );
+        assert_eq!(projected["resolution"]["status"], "selection_required");
+        assert_eq!(
+            projected["resolution"]["auto_resolved_portfolio_id"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn broker_portfolio_resolution_normalizes_whitespace_equivalent_duplicates() {
+        let resolved = resolve_portfolio_id_from_candidates(vec![
+            " portfolio-1 ".to_string(),
+            "portfolio-1".to_string(),
+        ])
+        .expect("resolve portfolio id");
+
+        assert_eq!(resolved.as_deref(), Some("portfolio-1"));
+    }
+
+    #[test]
+    fn accessible_broker_portfolios_rejects_malformed_upstream_shapes() {
+        let cases = [
+            (json!({"account": null}), "missing account"),
+            (
+                json!({"account": {"id": "person-1"}}),
+                "missing account.brokerPortfolios",
+            ),
+            (
+                json!({
+                    "account": {
+                        "id": "person-1",
+                        "brokerPortfolios": {"id": "portfolio-1"},
+                    }
+                }),
+                "missing account.brokerPortfolios",
+            ),
+            (
+                json!({
+                    "account": {
+                        "id": "person-1",
+                        "brokerPortfolios": [{"id": 123}],
+                    }
+                }),
+                "account.brokerPortfolios[].id must be a string",
+            ),
+        ];
+
+        for (response, expected_message) in cases {
+            let error = project_accessible_broker_portfolios_response(&response)
+                .expect_err("malformed upstream response should fail closed");
+            assert!(error.to_string().contains(expected_message));
+            assert_eq!(
+                crate::machine::classify_error(&error).code,
+                "broker_response_invalid"
+            );
+        }
     }
 }

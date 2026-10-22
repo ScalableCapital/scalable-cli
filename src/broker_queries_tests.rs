@@ -2,8 +2,8 @@ use super::*;
 use graphql_parser::query::parse_query;
 use serde_json::json;
 
-fn broker_input(include_year_to_date: bool, quote_source: Option<&str>) -> BrokerInput {
-    BrokerInput::new("acc-1", "port-1", include_year_to_date, quote_source).expect("input")
+fn broker_input(include_year_to_date: bool) -> BrokerInput {
+    BrokerInput::new("acc-1", "port-1", include_year_to_date).expect("input")
 }
 
 fn sample_derivatives_search_args() -> crate::cli::BrokerDerivativesSearchArgs {
@@ -38,10 +38,28 @@ fn sample_derivatives_search_args() -> crate::cli::BrokerDerivativesSearchArgs {
 
 #[test]
 fn broker_overview_variables_map_input() {
-    let vars = broker_overview_variables(&broker_input(true, None)).expect("vars");
+    let vars = broker_overview_variables(&broker_input(true)).expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
     assert_eq!(vars["includeYearToDate"], true);
+}
+
+#[test]
+fn broker_order_venues_query_and_variables_use_portfolio_scope() {
+    let parsed = parse_query::<&str>(BROKER_ORDER_VENUES_QUERY).expect("valid query");
+    assert!(!parsed.definitions.is_empty());
+    assert!(BROKER_ORDER_VENUES_QUERY.contains("venues(portfolioId: $portfolioId)"));
+    assert!(BROKER_ORDER_VENUES_QUERY.contains("\n      mic\n"));
+    assert!(BROKER_ORDER_VENUES_QUERY.contains("\n      emic\n"));
+
+    let variables = broker_order_venues_variables(" portfolio-1 ").expect("variables");
+    assert_eq!(variables, json!({ "portfolioId": "portfolio-1" }));
+}
+
+#[test]
+fn broker_order_venues_variables_reject_blank_portfolio_id() {
+    let error = broker_order_venues_variables("  ").expect_err("blank portfolio id");
+    assert!(error.to_string().contains("portfolio_id"));
 }
 
 #[test]
@@ -56,30 +74,159 @@ fn broker_transactions_variables_map_input() {
     let normalized = normalize_broker_transactions_query_input(
         50,
         Some("cursor-1"),
+        Some("crypto-cursor-1"),
         &["buy".to_string(), "reinvestmentDistribution".to_string()],
         &["filled".to_string(), "settled".to_string()],
         Some("apple"),
         Some("2026-03-01T00:00:00Z"),
         Some("2026-03-10T23:59:59Z"),
         Some("US0378331005"),
+        Some(" btc "),
         true,
     )
     .expect("normalized");
-    let vars =
-        broker_transactions_variables_from_normalized(&broker_input(false, None), &normalized);
+    let vars = broker_transactions_variables_from_normalized(&broker_input(false), &normalized);
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
-    assert_eq!(vars["input"]["pageSize"], 50);
-    assert_eq!(vars["input"]["cursor"], "cursor-1");
-    assert_eq!(vars["input"]["type"][0], "BUY");
-    assert_eq!(vars["input"]["type"][1], "REINVESTMENT_DISTRIBUTION");
-    assert_eq!(vars["input"]["status"][0], "FILLED");
-    assert_eq!(vars["input"]["status"][1], "SETTLED");
-    assert_eq!(vars["input"]["searchTerm"], "apple");
-    assert_eq!(vars["input"]["isin"], "US0378331005");
-    assert_eq!(vars["input"]["fromTime"], 1772323200_i64);
-    assert_eq!(vars["input"]["toTime"], 1773187199_i64);
-    assert_eq!(vars["input"]["includeReinvestmentSubtypes"], true);
+    assert_eq!(vars["brokerInput"]["pageSize"], 50);
+    assert_eq!(vars["brokerInput"]["cursor"], "cursor-1");
+    assert_eq!(vars["brokerInput"]["type"][0], "BUY");
+    assert_eq!(vars["brokerInput"]["type"][1], "REINVESTMENT_DISTRIBUTION");
+    assert_eq!(vars["brokerInput"]["status"][0], "FILLED");
+    assert_eq!(vars["brokerInput"]["status"][1], "SETTLED");
+    assert_eq!(vars["brokerInput"]["searchTerm"], "apple");
+    assert_eq!(vars["brokerInput"]["isin"], "US0378331005");
+    assert_eq!(vars["brokerInput"]["fromTime"], 1772323200_i64);
+    assert_eq!(vars["brokerInput"]["toTime"], 1773187199_i64);
+    assert_eq!(vars["brokerInput"]["includeReinvestmentSubtypes"], true);
+    assert_eq!(vars["cryptoInput"]["cursor"], "crypto-cursor-1");
+    assert_eq!(vars["cryptoInput"]["coin"], "BTC");
+    assert_eq!(vars["cryptoInput"]["type"][0], "BUY");
+    assert!(vars["cryptoInput"].get("isin").is_none());
+}
+
+#[test]
+fn broker_transactions_status_filters_are_scoped_to_each_backend() {
+    for (statuses, expected_broker, expected_crypto, include_crypto) in [
+        (vec![" created "], json!(["CREATED"]), json!([]), false),
+        (
+            vec!["created", "requested", "filled"],
+            json!(["CREATED", "FILLED", "REQUESTED"]),
+            json!(["FILLED", "REQUESTED"]),
+            true,
+        ),
+        (
+            vec![
+                "REQUESTED",
+                "PENDING",
+                "PARTIAL_FILLED",
+                "FILLED",
+                "SETTLED",
+                "CANCELLED",
+                "CANCEL_REQUESTED",
+                "EXPIRED",
+                "REJECTED",
+                "CONFIRMED",
+            ],
+            json!([
+                "CANCELLED",
+                "CANCEL_REQUESTED",
+                "CONFIRMED",
+                "EXPIRED",
+                "FILLED",
+                "PARTIAL_FILLED",
+                "PENDING",
+                "REJECTED",
+                "REQUESTED",
+                "SETTLED"
+            ]),
+            json!([
+                "CANCELLED",
+                "CANCEL_REQUESTED",
+                "CONFIRMED",
+                "EXPIRED",
+                "FILLED",
+                "PARTIAL_FILLED",
+                "PENDING",
+                "REJECTED",
+                "REQUESTED",
+                "SETTLED"
+            ]),
+            true,
+        ),
+        (vec![], Value::Null, Value::Null, true),
+    ] {
+        let statuses: Vec<_> = statuses.into_iter().map(str::to_string).collect();
+        let normalized = normalize_broker_transactions_query_input(
+            1,
+            Some("securities-page"),
+            Some("crypto-page"),
+            &[],
+            &statuses,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("normalized");
+        let variables =
+            broker_transactions_variables_from_normalized(&broker_input(false), &normalized);
+        assert_eq!(variables["brokerInput"]["status"], expected_broker);
+        assert_eq!(variables["cryptoInput"]["status"], expected_crypto);
+        assert_eq!(variables["includeCrypto"], include_crypto);
+        assert_eq!(variables["brokerInput"]["pageSize"], 1);
+        assert_eq!(variables["cryptoInput"]["pageSize"], 1);
+        assert_eq!(variables["brokerInput"]["cursor"], "securities-page");
+        assert_eq!(variables["cryptoInput"]["cursor"], "crypto-page");
+    }
+}
+
+#[test]
+fn broker_transactions_query_conditionally_fetches_crypto() {
+    use graphql_parser::query::{Definition, OperationDefinition, Selection, Value as QueryValue};
+    let document = parse_query::<&str>(BROKER_TRANSACTIONS_QUERY).expect("valid query");
+    let Definition::Operation(OperationDefinition::Query(query)) = &document.definitions[0] else {
+        panic!("expected query");
+    };
+    let mut selection_set = &query.selection_set;
+    for name in ["account", "brokerPortfolio"] {
+        let field = selection_set
+            .items
+            .iter()
+            .find_map(|selection| match selection {
+                Selection::Field(field) if field.name == name => Some(field),
+                _ => None,
+            })
+            .expect("field");
+        selection_set = &field.selection_set;
+    }
+    for name in ["moreTransactions", "crypto"] {
+        let field = selection_set
+            .items
+            .iter()
+            .find_map(|selection| match selection {
+                Selection::Field(field) if field.name == name => Some(field),
+                _ => None,
+            })
+            .expect("transaction stream");
+        if name == "crypto" {
+            assert!(
+                field
+                    .directives
+                    .iter()
+                    .any(|directive| directive.name == "include"
+                        && directive.arguments
+                            == vec![("if", QueryValue::Variable("includeCrypto"))])
+            );
+        } else {
+            assert!(
+                field.directives.is_empty(),
+                "securities must always be requested"
+            );
+        }
+    }
 }
 
 #[test]
@@ -87,11 +234,13 @@ fn broker_transactions_variables_reject_invalid_range() {
     let err = normalize_broker_transactions_query_input(
         20,
         None,
+        None,
         &[],
         &[],
         None,
         Some("2026-03-11T00:00:00Z"),
         Some("2026-03-10T00:00:00Z"),
+        None,
         None,
         false,
     )
@@ -104,11 +253,13 @@ fn broker_transactions_variables_reject_invalid_fractional_range_within_same_sec
     let err = normalize_broker_transactions_query_input(
         20,
         None,
+        None,
         &[],
         &[],
         None,
         Some("2026-01-01T00:00:00.900Z"),
         Some("2026-01-01T00:00:00.100Z"),
+        None,
         None,
         false,
     )
@@ -121,8 +272,10 @@ fn broker_transactions_variables_reject_page_size_above_max() {
     let err = normalize_broker_transactions_query_input(
         101,
         None,
+        None,
         &[],
         &[],
+        None,
         None,
         None,
         None,
@@ -138,8 +291,10 @@ fn broker_transactions_variables_reject_unsupported_type_filter() {
     let err = normalize_broker_transactions_query_input(
         20,
         None,
+        None,
         &["CASH_TRANSACTION".to_string()],
         &[],
+        None,
         None,
         None,
         None,
@@ -159,8 +314,10 @@ fn broker_transactions_variables_reject_unsupported_status_filter() {
     let err = normalize_broker_transactions_query_input(
         20,
         None,
+        None,
         &[],
         &["DONE".to_string()],
+        None,
         None,
         None,
         None,
@@ -177,8 +334,7 @@ fn broker_transactions_variables_reject_unsupported_status_filter() {
 
 #[test]
 fn broker_transaction_details_variables_map_input() {
-    let vars =
-        broker_transaction_details_variables(&broker_input(false, None), " tx-1 ").expect("vars");
+    let vars = broker_transaction_details_variables(&broker_input(false), " tx-1 ").expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
     assert_eq!(vars["transactionId"], "tx-1");
@@ -186,7 +342,7 @@ fn broker_transaction_details_variables_map_input() {
 
 #[test]
 fn broker_transaction_details_variables_reject_blank_transaction_id() {
-    let err = broker_transaction_details_variables(&broker_input(false, None), "  ").unwrap_err();
+    let err = broker_transaction_details_variables(&broker_input(false), "  ").unwrap_err();
     assert!(err.to_string().contains("transaction_id"));
 }
 
@@ -198,7 +354,7 @@ fn broker_derivatives_search_variables_map_knockout_input() {
 
     let normalized = normalize_broker_derivatives_search_query_input(&args).expect("normalized");
     let vars =
-        broker_derivatives_search_variables(&broker_input(false, None), &normalized).expect("vars");
+        broker_derivatives_search_variables(&broker_input(false), &normalized).expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
     assert_eq!(
@@ -330,7 +486,7 @@ fn broker_derivatives_search_variables_map_warrant_input() {
 
     let normalized = normalize_broker_derivatives_search_query_input(&args).expect("normalized");
     let vars =
-        broker_derivatives_search_variables(&broker_input(false, None), &normalized).expect("vars");
+        broker_derivatives_search_variables(&broker_input(false), &normalized).expect("vars");
 
     assert_eq!(
         vars["input"]["warrantInput"]["underlyingIsin"],
@@ -366,7 +522,7 @@ fn broker_derivatives_search_variables_map_factor_input() {
 
     let normalized = normalize_broker_derivatives_search_query_input(&args).expect("normalized");
     let vars =
-        broker_derivatives_search_variables(&broker_input(false, None), &normalized).expect("vars");
+        broker_derivatives_search_variables(&broker_input(false), &normalized).expect("vars");
 
     assert_eq!(
         vars["input"]["factorCertificateInput"]["underlyingIsin"],
@@ -432,23 +588,54 @@ fn broker_transaction_details_query_aliases_conflicting_fields() {
 }
 
 #[test]
-fn broker_holdings_variables_map_input() {
-    let vars = broker_holdings_variables(&broker_input(true, Some("CONSOLIDATED"))).expect("vars");
-    assert_eq!(vars["accountId"], "acc-1");
-    assert_eq!(vars["portfolioId"], "port-1");
-    assert_eq!(vars["includeYearToDate"], true);
-    assert_eq!(vars["quoteSource"], "CONSOLIDATED");
+fn broker_quote_bearing_read_variables_use_consolidated_source() {
+    let input = broker_input(true);
+    let holdings = broker_holdings_variables(&input).expect("holdings vars");
+    let watchlist = broker_watchlist_variables(&input).expect("watchlist vars");
+    let search = broker_search_variables(&input, "apple").expect("search vars");
+    let quote = broker_quote_variables(&input, " US0378331005 ").expect("quote vars");
+
+    for vars in [&holdings, &watchlist, &search, &quote] {
+        assert_eq!(vars["quoteSource"], "CONSOLIDATED");
+    }
+
+    assert_eq!(holdings["accountId"], "acc-1");
+    assert_eq!(holdings["portfolioId"], "port-1");
+    assert_eq!(holdings["includeYearToDate"], true);
+    assert_eq!(quote["isin"], "US0378331005");
 }
 
 #[test]
-fn broker_quote_variables_map_input() {
-    let vars = broker_quote_variables(&broker_input(true, Some("CONSOLIDATED")), " US0378331005 ")
-        .expect("vars");
-    assert_eq!(vars["accountId"], "acc-1");
-    assert_eq!(vars["portfolioId"], "port-1");
-    assert_eq!(vars["includeYearToDate"], true);
-    assert_eq!(vars["quoteSource"], "CONSOLIDATED");
-    assert_eq!(vars["isin"], "US0378331005");
+fn broker_holdings_query_requests_crypto_coin_and_etp_positions() {
+    for required in [
+        "crypto",
+        "coins",
+        "ticker",
+        "sellable",
+        "etpSecurity",
+        "inventory",
+    ] {
+        assert!(
+            BROKER_HOLDINGS_QUERY.contains(required),
+            "holdings query should contain {required}"
+        );
+    }
+}
+
+#[test]
+fn broker_transactions_query_requests_independent_crypto_activity() {
+    for required in [
+        "$cryptoInput: CryptoTransactionInput!",
+        "moreTransactions(input: $cryptoInput)",
+        "CryptoSecurityTransactionSummary",
+        "CryptoNonTradeSecurityTransactionSummary",
+        "coinQuantity",
+    ] {
+        assert!(
+            BROKER_TRANSACTIONS_QUERY.contains(required),
+            "transactions query should contain {required}"
+        );
+    }
 }
 
 #[test]
@@ -491,27 +678,27 @@ fn broker_chart_variables_normalize_lowercase_isin() {
 
 #[test]
 fn broker_quote_variables_reject_blank_isin() {
-    let err = broker_quote_variables(&broker_input(false, None), "  ").unwrap_err();
+    let err = broker_quote_variables(&broker_input(false), "  ").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
 }
 
 #[test]
 fn broker_quote_variables_reject_invalid_isin_checksum() {
-    let err = broker_quote_variables(&broker_input(false, None), "US0378331006").unwrap_err();
+    let err = broker_quote_variables(&broker_input(false), "US0378331006").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
     assert!(err.to_string().contains("valid ISIN"));
 }
 
 #[test]
 fn broker_quote_variables_reject_non_isin_shape() {
-    let err = broker_quote_variables(&broker_input(false, None), "000000000000").unwrap_err();
+    let err = broker_quote_variables(&broker_input(false), "000000000000").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
     assert!(err.to_string().contains("valid ISIN"));
 }
 
 #[test]
 fn broker_quote_variables_normalize_lowercase_isin() {
-    let vars = broker_quote_variables(&broker_input(false, None), "us0378331005").expect("vars");
+    let vars = broker_quote_variables(&broker_input(false), "us0378331005").expect("vars");
     assert_eq!(vars["isin"], "US0378331005");
 }
 
@@ -618,7 +805,7 @@ fn broker_remove_savings_plan_variables_normalize_lowercase_isin() {
 
 #[test]
 fn broker_savings_plans_variables_map_input() {
-    let vars = broker_savings_plans_variables(&broker_input(false, None)).expect("vars");
+    let vars = broker_savings_plans_variables(&broker_input(false)).expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
 }
@@ -626,7 +813,7 @@ fn broker_savings_plans_variables_map_input() {
 #[test]
 fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_use_execution_venue() {
     let variables = broker_savings_plan_ex_ante_cost_variables(
-        &broker_input(false, None),
+        &broker_input(false),
         "us0378331005",
         "MONTHLY",
         "100.50",
@@ -643,8 +830,8 @@ fn broker_savings_plan_ex_ante_cost_variables_preserve_amount_and_use_execution_
 
 #[test]
 fn broker_savings_plan_config_variables_map_input() {
-    let vars = broker_savings_plan_config_variables(&broker_input(false, None), "US0378331005")
-        .expect("vars");
+    let vars =
+        broker_savings_plan_config_variables(&broker_input(false), "US0378331005").expect("vars");
     assert_eq!(vars["accountId"], "acc-1");
     assert_eq!(vars["portfolioId"], "port-1");
     assert_eq!(vars["isin"], "US0378331005");
@@ -652,23 +839,23 @@ fn broker_savings_plan_config_variables_map_input() {
 
 #[test]
 fn broker_savings_plan_config_variables_reject_invalid_isin_checksum() {
-    let err = broker_savings_plan_config_variables(&broker_input(false, None), "US0378331006")
-        .unwrap_err();
+    let err =
+        broker_savings_plan_config_variables(&broker_input(false), "US0378331006").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
     assert!(err.to_string().contains("valid ISIN"));
 }
 
 #[test]
 fn broker_savings_plan_config_variables_normalize_lowercase_isin() {
-    let vars = broker_savings_plan_config_variables(&broker_input(false, None), "us0378331005")
-        .expect("vars");
+    let vars =
+        broker_savings_plan_config_variables(&broker_input(false), "us0378331005").expect("vars");
     assert_eq!(vars["isin"], "US0378331005");
 }
 
 #[test]
 fn broker_savings_plan_by_isin_variables_reject_invalid_isin_checksum() {
-    let err = broker_savings_plan_by_isin_variables(&broker_input(false, None), "US0378331006")
-        .unwrap_err();
+    let err =
+        broker_savings_plan_by_isin_variables(&broker_input(false), "US0378331006").unwrap_err();
     assert!(err.to_string().contains("field 'isin'"));
     assert!(err.to_string().contains("valid ISIN"));
 }
@@ -864,6 +1051,14 @@ fn broker_query_documents_parse_as_graphql_documents() {
     for query in queries {
         parse_query::<String>(query).expect("query should parse as valid GraphQL");
     }
+    for query in [
+        BROKER_HOLDINGS_QUERY,
+        BROKER_WATCHLIST_QUERY,
+        BROKER_SEARCH_QUERY,
+        BROKER_QUOTE_QUERY,
+    ] {
+        assert!(query.contains("$quoteSource: MarketDataSource!"));
+    }
 }
 
 #[test]
@@ -904,4 +1099,92 @@ fn broker_derivatives_search_query_uses_non_conflicting_warrant_expiry_shape() {
 
     assert!(warrant_fragment.contains("expiryDate {\n              epochDay\n            }"));
     assert!(!warrant_fragment.contains("expiryDate {\n              date"));
+}
+
+#[test]
+fn portfolio_chart_query_and_variables_match_historical_contract() {
+    use graphql_parser::query::{Definition, OperationDefinition, Selection, Value as QueryValue};
+    let document = parse_query::<&str>(BROKER_PORTFOLIO_CHART_QUERY).expect("valid query");
+    let Definition::Operation(OperationDefinition::Query(query)) = &document.definitions[0] else {
+        panic!("named query")
+    };
+    assert_eq!(query.name, Some("BrokerPortfolioChart"));
+    assert_eq!(
+        query
+            .variable_definitions
+            .iter()
+            .map(|v| v.name)
+            .collect::<Vec<_>>(),
+        vec!["accountId", "portfolioId"]
+    );
+    fn field<'a>(
+        set: &'a graphql_parser::query::SelectionSet<'a, &'a str>,
+        name: &str,
+    ) -> &'a graphql_parser::query::Field<'a, &'a str> {
+        set.items
+            .iter()
+            .find_map(|item| match item {
+                Selection::Field(field) if field.name == name => Some(field),
+                _ => None,
+            })
+            .expect("selected field")
+    }
+    let account = field(&query.selection_set, "account");
+    assert_eq!(
+        account.arguments,
+        vec![("id", QueryValue::Variable("accountId"))]
+    );
+    field(&account.selection_set, "id");
+    let portfolio = field(&account.selection_set, "brokerPortfolio");
+    assert_eq!(
+        portfolio.arguments,
+        vec![("id", QueryValue::Variable("portfolioId"))]
+    );
+    field(&portfolio.selection_set, "id");
+    let series = field(&portfolio.selection_set, "timeseries");
+    assert_eq!(
+        series.arguments,
+        vec![("includeYearToDate", QueryValue::Boolean(true))]
+    );
+    field(&series.selection_set, "timeframe");
+    for name in ["closingReferencePoint", "dataPoints"] {
+        let point = field(&series.selection_set, name);
+        field(&point.selection_set, "valuation");
+        field(&point.selection_set, "absoluteReturn");
+        field(
+            &field(&point.selection_set, "timestampUtc").selection_set,
+            "time",
+        );
+    }
+    assert_eq!(
+        broker_portfolio_chart_variables(&broker_input(true)),
+        json!({"accountId": "acc-1", "portfolioId": "port-1"})
+    );
+}
+
+#[test]
+fn portfolio_chart_target_normalizes_and_rejects_invalid_input() {
+    assert!(matches!(
+        normalize_broker_chart_target(None, None).unwrap(),
+        BrokerChartTarget::Portfolio { portfolio_id: None }
+    ));
+    assert!(
+        matches!(normalize_broker_chart_target(None, Some(" port-1 ")).unwrap(), BrokerChartTarget::Portfolio { portfolio_id: Some(id) } if id == "port-1")
+    );
+    assert!(
+        matches!(normalize_broker_chart_target(Some(" us0378331005 "), None).unwrap(), BrokerChartTarget::Security { isin } if isin == "US0378331005")
+    );
+    for (isin, portfolio) in [
+        (None, Some(" ")),
+        (Some(""), None),
+        (Some("US0378331006"), None),
+        (Some("US0378331005"), Some("port-1")),
+    ] {
+        let Err(err) = normalize_broker_chart_target(isin, portfolio) else {
+            panic!("invalid target")
+        };
+        let classified = crate::machine::classify_error(&err);
+        assert_eq!(classified.code, "broker_input_invalid");
+        assert_eq!(classified.exit_code, 10);
+    }
 }

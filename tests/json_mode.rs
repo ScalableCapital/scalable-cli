@@ -28,17 +28,50 @@ fn capabilities_returns_machine_json_envelope() {
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
     let envelope: Value = serde_json::from_str(&stdout).expect("machine json envelope");
+    assert_eq!(stdout.lines().count(), 1, "stdout must be one JSON line");
+    assert!(
+        assert.get_output().stderr.is_empty(),
+        "machine commands must not write to stderr"
+    );
     let data = &envelope["data"];
     let commands = data["commands"]
         .as_array()
         .expect("capabilities commands array");
     let buy_workflow = &data["workflows"]["broker.trade.buy"];
+    for (side, keys) in [
+        (
+            "buy",
+            vec![
+                "phase_1_command_template_json",
+                "phase_2_command_template_json",
+                "phase_1_command_template_json_shares",
+                "phase_2_command_template_json_shares",
+            ],
+        ),
+        (
+            "sell",
+            vec![
+                "phase_1_command_template_json",
+                "phase_2_command_template_json",
+            ],
+        ),
+    ] {
+        let workflow = &data["workflows"][format!("broker.trade.{side}")];
+        for key in keys {
+            let template = workflow[key].as_str().expect("trade template");
+            assert!(template.contains("<market|limit|stop|stop-limit>"));
+            assert!(template.contains("--limit-price <LIMIT_PRICE>"));
+            assert!(template.contains("--stop-price <STOP_PRICE>"));
+        }
+    }
 
     assert_eq!(envelope["ok"], json!(true));
     assert_eq!(envelope["command"], json!("capabilities"));
     assert!(commands.contains(&json!("login")));
     assert!(commands.contains(&json!("overnight")));
+    assert!(commands.contains(&json!("broker.portfolios")));
     assert!(commands.contains(&json!("broker.overview")));
+    assert!(commands.contains(&json!("broker.order-venues")));
     assert!(commands.contains(&json!("broker.watchlist.add")));
     assert!(commands.contains(&json!("broker.watchlist.remove")));
     assert!(commands.contains(&json!("broker.portfolio-groups")));
@@ -54,6 +87,10 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(commands.contains(&json!("broker.trade.buy")));
     assert!(commands.contains(&json!("broker.trade.sell")));
     assert!(commands.contains(&json!("broker.trade.cancel")));
+    assert_eq!(
+        data["command_metadata"]["broker.chart"],
+        json!({"targets": ["security", "portfolio"], "historical_only": true})
+    );
     assert_eq!(data["auth"]["modes"], json!(["device"]));
     assert_eq!(data["auth"]["non_interactive_modes"], json!([]));
     assert_eq!(
@@ -311,4 +348,30 @@ fn unsupported_json_flag_on_login_stays_human_facing() {
         .code(2)
         .stdout("")
         .stderr(predicate::str::contains("unexpected argument '--json'"));
+}
+
+#[test]
+fn portfolio_chart_parse_errors_keep_machine_command_attribution() {
+    for args in [
+        vec!["broker", "chart", "--json"],
+        vec!["broker", "chart", "--timeframe", "nope", "--json"],
+        vec![
+            "broker",
+            "chart",
+            "--json",
+            "--timeframe",
+            "1y",
+            "--isin",
+            "US0378331005",
+            "--portfolio-id",
+            "port-1",
+        ],
+    ] {
+        let output = sc_command().args(args).assert().failure().code(10);
+        let envelope: Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("envelope");
+        assert_eq!(envelope["command"], "broker.chart");
+        assert_eq!(envelope["error"]["code"], "invalid_input");
+        assert!(output.get_output().stderr.is_empty());
+    }
 }

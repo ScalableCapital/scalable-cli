@@ -2,25 +2,31 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::active_session::load_active_session;
+use crate::broker_projections::project_broker_portfolio_chart_response;
+use crate::broker_queries::{
+    BROKER_PORTFOLIO_CHART_QUERY, BrokerChartTarget, broker_portfolio_chart_variables,
+    normalize_broker_chart_target,
+};
 use crate::broker_shared::{
-    broker_result_envelope, fingerprint_payload_for_transactions_input, resolve_broker_ids,
-    validated_broker_input,
+    broker_result_envelope, fingerprint_payload_for_transactions_input,
+    project_accessible_broker_portfolios_response, resolve_broker_ids, validated_broker_input,
 };
 use crate::config::AppConfig;
 use crate::graphql::execute_graphql;
 use crate::helpers::{
     BROKER_CHART_QUERY, BROKER_DERIVATIVES_SEARCH_QUERY, BROKER_HOLDINGS_QUERY,
-    BROKER_LIMITS_QUERY, BROKER_OVERVIEW_QUERY, BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY,
-    BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY, BROKER_SECURITY_NEWS_QUERY,
-    BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY, BROKER_WATCHLIST_QUERY,
-    broker_chart_variables, broker_derivatives_search_variables, broker_holdings_variables,
-    broker_limits_variables, broker_overview_variables, broker_price_alerts_variables,
-    broker_quote_variables, broker_savings_plans_variables, broker_search_variables,
-    broker_transaction_details_variables, broker_transactions_variables_from_normalized,
-    broker_watchlist_variables, normalize_broker_derivatives_search_query_input,
-    normalize_broker_transactions_query_input, project_broker_cash_breakdown_response,
-    project_broker_chart_response, project_broker_derivatives_search_response,
-    project_broker_holdings_response, project_broker_overview_response,
+    BROKER_LIMITS_QUERY, BROKER_ORDER_VENUES_QUERY, BROKER_OVERVIEW_QUERY,
+    BROKER_PRICE_ALERTS_QUERY, BROKER_QUOTE_QUERY, BROKER_SAVINGS_PLANS_QUERY, BROKER_SEARCH_QUERY,
+    BROKER_SECURITY_NEWS_QUERY, BROKER_TRANSACTION_DETAILS_QUERY, BROKER_TRANSACTIONS_QUERY,
+    BROKER_WATCHLIST_QUERY, broker_chart_variables, broker_derivatives_search_variables,
+    broker_holdings_variables, broker_limits_variables, broker_order_venues_variables,
+    broker_overview_variables, broker_price_alerts_variables, broker_quote_variables,
+    broker_savings_plans_variables, broker_search_variables, broker_transaction_details_variables,
+    broker_transactions_variables_from_normalized, broker_watchlist_variables,
+    normalize_broker_derivatives_search_query_input, normalize_broker_transactions_query_input,
+    project_broker_cash_breakdown_response, project_broker_chart_response,
+    project_broker_derivatives_search_response, project_broker_holdings_response,
+    project_broker_order_venues_response, project_broker_overview_response,
     project_broker_price_alerts_response, project_broker_quote_response,
     project_broker_savings_plans_response, project_broker_search_response,
     project_broker_security_news_response, project_broker_transaction_details_response,
@@ -31,6 +37,47 @@ use crate::resolve_active_env;
 use crate::savings_plan_confirmation::inspect_and_clear_matching;
 use crate::session::SessionManager;
 use crate::session_refresh::execute_with_refresh_retry;
+
+pub(crate) fn execute_broker_portfolios(
+    _args: crate::cli::BrokerPortfoliosArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    let env_cfg = crate::channel::current_env_config();
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
+    let account_id = session.person_id.trim().to_string();
+    if account_id.is_empty() {
+        return Err(anyhow!(
+            "Broker context invalid: session person id must be a non-empty string"
+        ));
+    }
+    let variables = json!({ "id": account_id });
+    let response = execute_with_refresh_retry(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        |token| {
+            execute_graphql(
+                &env_cfg.graphql_url,
+                token,
+                crate::broker_shared::RESOLVE_BROKER_IDS_QUERY,
+                &variables,
+                Some("ResolveBrokerIds"),
+                access_context,
+                dpop_options,
+            )
+        },
+    )?;
+
+    project_accessible_broker_portfolios_response(&response)
+}
 
 pub(crate) fn execute_broker_overview(
     args: crate::cli::BrokerOverviewArgs,
@@ -52,7 +99,7 @@ pub(crate) fn execute_broker_overview(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, args.include_year_to_date, None)?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?;
     let variables = broker_overview_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -84,12 +131,14 @@ pub(crate) fn execute_broker_transactions(
     let normalized_query = normalize_broker_transactions_query_input(
         args.page_size,
         args.cursor.as_deref(),
+        args.crypto_cursor.as_deref(),
         &args.type_filter,
         &args.status,
         args.search_term.as_deref(),
         args.from_time.as_deref(),
         args.to_time.as_deref(),
         args.isin.as_deref(),
+        args.crypto_ticker.as_deref(),
         args.include_reinvestment_subtypes,
     )?;
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
@@ -107,7 +156,7 @@ pub(crate) fn execute_broker_transactions(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_transactions_variables_from_normalized(&input, &normalized_query);
     let response = execute_with_refresh_retry(
         session_manager,
@@ -129,14 +178,23 @@ pub(crate) fn execute_broker_transactions(
     )?;
     let mut projected = project_broker_transactions_response(&input, &response)?;
 
-    let normalized_input = variables.get("input").cloned().unwrap_or(Value::Null);
+    let normalized_input = variables.get("brokerInput").cloned().unwrap_or(Value::Null);
+    let normalized_crypto_input = variables.get("cryptoInput").cloned().unwrap_or(Value::Null);
     let fingerprint_payload = fingerprint_payload_for_transactions_input(&normalized_input);
     let input_fingerprint = checksum_for_payload(&fingerprint_payload);
+    let crypto_fingerprint_payload =
+        fingerprint_payload_for_transactions_input(&normalized_crypto_input);
+    let crypto_input_fingerprint = checksum_for_payload(&crypto_fingerprint_payload);
     if let Some(result) = projected.as_object_mut() {
         result.insert("input".to_string(), normalized_input);
         result.insert(
             "input_fingerprint".to_string(),
             Value::String(input_fingerprint),
+        );
+        result.insert("crypto_input".to_string(), normalized_crypto_input);
+        result.insert(
+            "crypto_input_fingerprint".to_string(),
+            Value::String(crypto_input_fingerprint),
         );
     }
 
@@ -163,7 +221,7 @@ pub(crate) fn execute_broker_transaction_details(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_transaction_details_variables(&input, &args.transaction_id)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -207,11 +265,7 @@ pub(crate) fn execute_broker_holdings(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(
-        &ids,
-        args.include_year_to_date,
-        args.quote_source.as_deref(),
-    )?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?;
     let variables = broker_holdings_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -235,6 +289,49 @@ pub(crate) fn execute_broker_holdings(
     Ok(broker_result_envelope(&ids, projected))
 }
 
+pub(crate) fn execute_broker_order_venues(
+    args: crate::cli::BrokerOrderVenuesArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    let dpop_options = crate::channel::current_dpop_runtime_options(config);
+    let dpop_options = &dpop_options;
+    let env = resolve_active_env(session_manager)?;
+    let env_cfg = crate::channel::current_env_config();
+    let loaded = load_active_session(session_manager, env, &env_cfg, dpop_options)?;
+    let mut session = loaded.session;
+    let access_context = loaded.access_context;
+    let ids = resolve_broker_ids(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        args.portfolio_id.as_deref(),
+    )?;
+    let variables = broker_order_venues_variables(&ids.portfolio_id)?;
+    let response = execute_with_refresh_retry(
+        session_manager,
+        env,
+        &env_cfg,
+        &mut session,
+        dpop_options,
+        |token| {
+            execute_graphql(
+                &env_cfg.graphql_url,
+                token,
+                BROKER_ORDER_VENUES_QUERY,
+                &variables,
+                Some("BrokerOrderVenues"),
+                access_context,
+                dpop_options,
+            )
+        },
+    )?;
+    let projected = project_broker_order_venues_response(&response)?;
+    Ok(broker_result_envelope(&ids, projected))
+}
+
 pub(crate) fn execute_broker_watchlist(
     args: crate::cli::BrokerWatchlistArgs,
     config: &AppConfig,
@@ -255,11 +352,7 @@ pub(crate) fn execute_broker_watchlist(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(
-        &ids,
-        args.include_year_to_date,
-        args.quote_source.as_deref(),
-    )?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?;
     let variables = broker_watchlist_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -303,11 +396,7 @@ pub(crate) fn execute_broker_search(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(
-        &ids,
-        args.include_year_to_date,
-        args.quote_source.as_deref(),
-    )?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?;
     let query = args.query.trim();
     let variables = broker_search_variables(&input, query)?;
     let response = execute_with_refresh_retry(
@@ -353,7 +442,7 @@ pub(crate) fn execute_broker_derivatives_search(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_derivatives_search_variables(&input, &normalized_query)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -398,11 +487,7 @@ pub(crate) fn execute_broker_quote(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(
-        &ids,
-        args.include_year_to_date,
-        args.quote_source.as_deref(),
-    )?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?;
     let requested_isin = args.isin.trim().to_string();
     let variables = broker_quote_variables(&input, &requested_isin)?;
     let response = execute_with_refresh_retry(
@@ -432,6 +517,7 @@ pub(crate) fn execute_broker_chart(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
+    let target = normalize_broker_chart_target(args.isin.as_deref(), args.portfolio_id.as_deref())?;
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
@@ -440,31 +526,58 @@ pub(crate) fn execute_broker_chart(
     let mut session = loaded.session;
     let access_context = loaded.access_context;
     let requested_timeframe = args.timeframe;
-    let variables = broker_chart_variables(&args.isin, requested_timeframe)?;
-    let requested_isin = variables
-        .get("isin")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Broker input invalid: variables.isin must be a string"))?
-        .to_string();
-    let response = execute_with_refresh_retry(
-        session_manager,
-        env,
-        &env_cfg,
-        &mut session,
-        dpop_options,
-        |token| {
+    let execute_chart = |manager: &mut SessionManager,
+                         session: &mut crate::session::Session,
+                         query: &str,
+                         variables: &Value,
+                         operation: &str| {
+        execute_with_refresh_retry(manager, env, &env_cfg, session, dpop_options, |token| {
             execute_graphql(
                 &env_cfg.graphql_url,
                 token,
-                BROKER_CHART_QUERY,
-                &variables,
-                Some("BrokerChart"),
+                query,
+                variables,
+                Some(operation),
                 access_context,
                 dpop_options,
             )
-        },
-    )?;
-    project_broker_chart_response(&requested_isin, requested_timeframe, &response)
+        })
+    };
+    match target {
+        BrokerChartTarget::Security { isin } => {
+            let variables = broker_chart_variables(&isin, requested_timeframe)?;
+            let response = execute_chart(
+                session_manager,
+                &mut session,
+                BROKER_CHART_QUERY,
+                &variables,
+                "BrokerChart",
+            )?;
+            project_broker_chart_response(&isin, requested_timeframe, &response)
+        }
+        BrokerChartTarget::Portfolio { portfolio_id } => {
+            let ids = resolve_broker_ids(
+                session_manager,
+                env,
+                &env_cfg,
+                &mut session,
+                dpop_options,
+                portfolio_id.as_deref(),
+            )?;
+            let input = validated_broker_input(&ids, true)?;
+            let variables = broker_portfolio_chart_variables(&input);
+            let response = execute_chart(
+                session_manager,
+                &mut session,
+                BROKER_PORTFOLIO_CHART_QUERY,
+                &variables,
+                "BrokerPortfolioChart",
+            )?;
+            let projected =
+                project_broker_portfolio_chart_response(&input, requested_timeframe, &response)?;
+            Ok(broker_result_envelope(&ids, projected))
+        }
+    }
 }
 
 pub(crate) fn execute_broker_security_news(
@@ -539,7 +652,7 @@ pub(crate) fn execute_broker_price_alerts(
         dpop_options,
         portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_price_alerts_variables(&input, active_only)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -583,7 +696,7 @@ pub(crate) fn execute_broker_cash_breakdown(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_limits_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -633,7 +746,7 @@ pub(crate) fn execute_broker_savings_plans(
         dpop_options,
         portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let variables = broker_savings_plans_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -680,8 +793,8 @@ mod tests {
         BrokerCashBreakdownArgs, BrokerChartArgs, BrokerChartTimeframe, BrokerDerivativeIssuer,
         BrokerDerivativeKnockoutSubcategory, BrokerDerivativeSortField, BrokerDerivativeSortOrder,
         BrokerDerivativeStrategy, BrokerDerivativeType, BrokerDerivativesSearchArgs,
-        BrokerOverviewArgs, BrokerQuoteArgs, BrokerSearchArgs, BrokerTransactionDetailsArgs,
-        BrokerTransactionsArgs,
+        BrokerOrderVenuesArgs, BrokerOverviewArgs, BrokerPortfoliosArgs, BrokerQuoteArgs,
+        BrokerSearchArgs, BrokerTransactionDetailsArgs, BrokerTransactionsArgs,
     };
     use crate::config::TargetEnv;
     use crate::machine::classify_error;
@@ -755,6 +868,7 @@ mod tests {
             session: sample_session(),
             dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint()),
             mode: None,
+            refresh_recovery_pending: false,
         }
     }
 
@@ -781,12 +895,22 @@ mod tests {
         }
     }
 
+    fn sample_order_venues_args() -> BrokerOrderVenuesArgs {
+        BrokerOrderVenuesArgs {
+            portfolio_id: Some("portfolio-1".to_string()),
+            json: true,
+        }
+    }
+
+    fn sample_portfolios_args() -> BrokerPortfoliosArgs {
+        BrokerPortfoliosArgs { json: true }
+    }
+
     fn sample_search_args() -> BrokerSearchArgs {
         BrokerSearchArgs {
             query: "tesla".to_string(),
             portfolio_id: Some("portfolio-1".to_string()),
             include_year_to_date: true,
-            quote_source: Some("CONSOLIDATED".to_string()),
             json: true,
         }
     }
@@ -833,14 +957,14 @@ mod tests {
             portfolio_id: Some("portfolio-1".to_string()),
             isin: "US0378331005".to_string(),
             include_year_to_date: true,
-            quote_source: Some("CONSOLIDATED".to_string()),
             json: true,
         }
     }
 
     fn sample_chart_args() -> BrokerChartArgs {
         BrokerChartArgs {
-            isin: "US0378331005".to_string(),
+            isin: Some("US0378331005".to_string()),
+            portfolio_id: None,
             timeframe: BrokerChartTimeframe::OneMonth,
             json: true,
         }
@@ -851,12 +975,14 @@ mod tests {
             portfolio_id: Some("portfolio-1".to_string()),
             page_size: 5,
             cursor: Some("cursor-123".to_string()),
+            crypto_cursor: Some("crypto-cursor-123".to_string()),
             type_filter: vec!["BUY".to_string()],
             status: vec!["FILLED".to_string()],
             search_term: Some("monthly".to_string()),
             from_time: Some("2026-01-01T00:00:00Z".to_string()),
             to_time: Some("2026-02-01T00:00:00Z".to_string()),
             isin: Some("DE0007100000".to_string()),
+            crypto_ticker: Some("btc".to_string()),
             include_reinvestment_subtypes: true,
             json: true,
         }
@@ -876,6 +1002,74 @@ mod tests {
         .expect("load runtime dpop key")
         .jwk_thumbprint()
         .expect("runtime dpop thumbprint")
+    }
+
+    #[test]
+    fn execute_broker_portfolios_returns_mcp_aligned_resolution_without_persisting_context() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        crate::broker_context::save_context(crate::broker_context::BrokerContext {
+            account_id: "selected-account".to_string(),
+            portfolio_id: Some("selected-portfolio".to_string()),
+        })
+        .expect("save existing broker context");
+        let context_before =
+            std::fs::read(crate::broker_context::context_file_path().expect("broker context path"))
+                .expect("read existing broker context");
+
+        let portfolios_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(Matcher::Regex("ResolveBrokerIds".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {"id": "person-1"}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "id": "person-1",
+                            "brokerPortfolios": [
+                                {"id": "portfolio-1"},
+                                {"id": "portfolio-1"}
+                            ]
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload =
+            execute_broker_portfolios(sample_portfolios_args(), &config, &mut session_manager)
+                .expect("accessible portfolios payload");
+
+        assert_eq!(
+            payload["portfolios"],
+            json!([{"portfolio_id": "portfolio-1"}])
+        );
+        assert_eq!(payload["resolution"]["status"], "auto_resolved");
+        assert_eq!(
+            payload["resolution"]["auto_resolved_portfolio_id"],
+            "portfolio-1"
+        );
+        let context_after =
+            std::fs::read(crate::broker_context::context_file_path().expect("broker context path"))
+                .expect("read broker context after discovery");
+        assert_eq!(
+            context_after, context_before,
+            "portfolio discovery must preserve an existing selection"
+        );
+        portfolios_mock.assert();
     }
 
     #[test]
@@ -987,6 +1181,204 @@ mod tests {
     }
 
     #[test]
+    fn execute_broker_order_venues_returns_cli_values_in_resolution_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let venues_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(Matcher::Regex("BrokerOrderVenues".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {"portfolioId": "portfolio-1"}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "venues": {
+                            "venues": [
+                                {"mic": "SEIX", "emic": "MUC2"},
+                                {"mic": "MUNC", "emic": "MUNC"}
+                            ]
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let payload =
+            execute_broker_order_venues(sample_order_venues_args(), &config, &mut session_manager)
+                .expect("order venues payload");
+
+        assert_eq!(payload["portfolio_id"], "portfolio-1");
+        assert_eq!(payload["resolution"]["portfolio"], "explicit");
+        assert_eq!(payload["result"]["count"], 2);
+        assert_eq!(payload["result"]["venues"][0]["venue"], "gettex");
+        assert_eq!(payload["result"]["venues"][1]["venue"], "eix");
+        venues_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_order_venues_errors_when_no_portfolio_is_available() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let resolve_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(Matcher::Regex("ResolveBrokerIds".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "account": {
+                            "id": "account-1",
+                            "brokerPortfolios": []
+                        }
+                    }
+                }"#,
+            )
+            .create();
+
+        let error = execute_broker_order_venues(
+            BrokerOrderVenuesArgs {
+                portfolio_id: None,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect_err("missing portfolio should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unable to resolve broker portfolio id")
+        );
+        assert!(error.to_string().contains("Provide --portfolio-id"));
+        resolve_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_transactions_preserves_backend_status_filters_and_results() {
+        for (statuses, broker_status, crypto_status, include_crypto, security_status) in [
+            (
+                vec!["created"],
+                json!(["CREATED"]),
+                json!([]),
+                false,
+                "CREATED",
+            ),
+            (
+                vec!["created", "requested"],
+                json!(["CREATED", "REQUESTED"]),
+                json!(["REQUESTED"]),
+                true,
+                "CREATED",
+            ),
+            (
+                vec!["requested"],
+                json!(["REQUESTED"]),
+                json!(["REQUESTED"]),
+                true,
+                "REQUESTED",
+            ),
+            (vec![], Value::Null, Value::Null, true, "CREATED"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut session_manager = SessionManager::new(&config).expect("session manager");
+            session_manager
+                .save_active(&sample_stored_session(crate::channel::current_env()))
+                .expect("save session");
+            let mut args = sample_transactions_args();
+            args.page_size = 1;
+            args.status = statuses.into_iter().map(str::to_string).collect();
+
+            let mut portfolio = json!({
+                "moreTransactions": {
+                    "cursor": "securities-next", "total": 2,
+                    "transactions": [{
+                        "__typename": "BrokerEltifTransactionSummary", "id": "eltif-1",
+                        "status": security_status, "securityTransactionType": "BUY"
+                    }]
+                }
+            });
+            if include_crypto {
+                portfolio["crypto"] = json!({"moreTransactions": {
+                    "cursor": "crypto-next", "total": 3,
+                    "transactions": [{
+                        "__typename": "CryptoSecurityTransactionSummary", "id": "crypto-1",
+                        "status": "REQUESTED", "securityTransactionType": "BUY", "ticker": "BTC"
+                    }]
+                }});
+            }
+            let transactions_mock = server.mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({
+                    "operation_name": "BrokerTransactions",
+                    "variables": {
+                        "includeCrypto": include_crypto,
+                        "brokerInput": {"pageSize": 1, "cursor": "cursor-123", "status": broker_status},
+                        "cryptoInput": {"pageSize": 1, "cursor": "crypto-cursor-123", "status": crypto_status}
+                    }
+                })))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(json!({"data": {"account": {"brokerPortfolio": portfolio}}}).to_string())
+                .expect(1)
+                .create();
+
+            let payload = execute_broker_transactions(args, &config, &mut session_manager)
+                .expect("transactions");
+            let result = &payload["result"];
+            assert_eq!(result["input"]["status"], broker_status);
+            assert_eq!(result["crypto_input"]["status"], crypto_status);
+            assert_eq!(result["count"], 1);
+            assert_eq!(result["items"][0]["id"], "eltif-1");
+            assert_eq!(result["items"][0]["status"], security_status);
+            assert_eq!(result["cursor"], "securities-next");
+            assert_eq!(result["total"], 2);
+            if include_crypto {
+                assert_eq!(result["crypto"]["count"], 1);
+                assert_eq!(result["crypto"]["items"][0]["id"], "crypto-1");
+                assert_eq!(result["crypto"]["items"][0]["status"], "REQUESTED");
+                assert_eq!(result["crypto"]["cursor"], "crypto-next");
+                assert_eq!(result["crypto"]["total"], 3);
+            } else {
+                assert_eq!(
+                    result["crypto"],
+                    json!({"count": 0, "items": [], "cursor": null, "total": null})
+                );
+            }
+            transactions_mock.assert();
+        }
+    }
+
+    #[test]
     fn execute_broker_transactions_happy_path_includes_envelope_input_and_fingerprint() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut server = Server::new();
@@ -1009,7 +1401,7 @@ mod tests {
                 "variables": {
                     "accountId": "person-1",
                     "portfolioId": "portfolio-1",
-                    "input": {
+                    "brokerInput": {
                         "pageSize": 5,
                         "cursor": "cursor-123",
                         "type": ["BUY"],
@@ -1018,6 +1410,17 @@ mod tests {
                         "fromTime": 1767225600u64,
                         "toTime": 1769904000u64,
                         "isin": "DE0007100000",
+                        "includeReinvestmentSubtypes": true
+                    },
+                    "cryptoInput": {
+                        "pageSize": 5,
+                        "cursor": "crypto-cursor-123",
+                        "type": ["BUY"],
+                        "status": ["FILLED"],
+                        "searchTerm": "monthly",
+                        "fromTime": 1767225600u64,
+                        "toTime": 1769904000u64,
+                        "coin": "BTC",
                         "includeReinvestmentSubtypes": true
                     }
                 }
@@ -1043,7 +1446,6 @@ mod tests {
                                             "lastEventDateTime": "2026-01-10T12:30:00Z",
                                             "description": "Monthly investment",
                                             "custodian": "BROKER",
-                                            "documents": [],
                                             "isin": "DE0007100000",
                                             "securityTransactionType": "BUY",
                                             "quantity": 2.5,
@@ -1053,6 +1455,27 @@ mod tests {
                                             "stopPrice": null
                                         }
                                     ]
+                                },
+                                "crypto": {
+                                    "moreTransactions": {
+                                        "cursor": "crypto-next-cursor",
+                                        "total": 1,
+                                        "transactions": [{
+                                            "__typename": "CryptoSecurityTransactionSummary",
+                                            "id": "crypto-txn-1",
+                                            "currency": "EUR",
+                                            "type": "SECURITY_TRANSACTION",
+                                            "status": "FILLED",
+                                            "lastEventDateTime": "2026-01-10T12:30:00Z",
+                                            "description": "Bitcoin buy",
+                                            "ticker": "BTC",
+                                            "securityTransactionType": "BUY",
+                                            "coinQuantity": 0.01,
+                                            "quantity": 1,
+                                            "amount": 250.0,
+                                            "side": "BUY"
+                                        }]
+                                    }
                                 }
                             }
                         }
@@ -1079,11 +1502,34 @@ mod tests {
             Some("next-cursor")
         );
         assert_eq!(payload.pointer("/result/count"), Some(&json!(1)));
+        assert_eq!(payload.pointer("/result/crypto/count"), Some(&json!(1)));
         assert_eq!(
             payload
                 .pointer("/result/items/0/isin")
                 .and_then(Value::as_str),
             Some("DE0007100000")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/crypto/items/0/ticker")
+                .and_then(Value::as_str),
+            Some("BTC")
+        );
+        assert_eq!(
+            payload.pointer("/result/crypto/items/0/status"),
+            Some(&json!("FILLED"))
+        );
+        assert_eq!(
+            payload.pointer("/result/crypto/items/0/quantity"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            payload.pointer("/result/crypto/items/0/amount"),
+            Some(&json!(250.0))
+        );
+        assert_eq!(
+            payload.pointer("/result/crypto/items/0/last_event_datetime"),
+            Some(&json!("2026-01-10T12:30:00Z"))
         );
 
         let expected_input = json!({
@@ -1099,6 +1545,22 @@ mod tests {
         });
         assert_eq!(payload.pointer("/result/input"), Some(&expected_input));
 
+        let expected_crypto_input = json!({
+            "cursor": "crypto-cursor-123",
+            "pageSize": 5,
+            "type": ["BUY"],
+            "status": ["FILLED"],
+            "searchTerm": "monthly",
+            "fromTime": 1767225600u64,
+            "toTime": 1769904000u64,
+            "coin": "BTC",
+            "includeReinvestmentSubtypes": true
+        });
+        assert_eq!(
+            payload.pointer("/result/crypto_input"),
+            Some(&expected_crypto_input)
+        );
+
         let expected_fingerprint =
             checksum_for_payload(&fingerprint_payload_for_transactions_input(&expected_input));
         assert_eq!(
@@ -1106,6 +1568,15 @@ mod tests {
                 .pointer("/result/input_fingerprint")
                 .and_then(Value::as_str),
             Some(expected_fingerprint.as_str())
+        );
+        let expected_crypto_fingerprint = checksum_for_payload(
+            &fingerprint_payload_for_transactions_input(&expected_crypto_input),
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/crypto_input_fingerprint")
+                .and_then(Value::as_str),
+            Some(expected_crypto_fingerprint.as_str())
         );
         transactions_mock.assert();
     }
@@ -1611,7 +2082,6 @@ mod tests {
                 portfolio_id: Some("portfolio-1".to_string()),
                 isin: "DE000HSBC121".to_string(),
                 include_year_to_date: false,
-                quote_source: None,
                 json: true,
             },
             &config,
@@ -1769,6 +2239,187 @@ mod tests {
         quote_mock.assert();
     }
 
+    fn portfolio_chart_response(account: &str, portfolio: &str) -> Value {
+        json!({"data": {"account": {"id": account, "brokerPortfolio": {"id": portfolio, "timeseries": [{
+            "timeframe": "ONE_YEAR", "closingReferencePoint": {"valuation": "100.00", "absoluteReturn": 0, "timestampUtc": {"time": "2025-10-09T10:00:00Z"}},
+            "dataPoints": [{"valuation": "90.123", "absoluteReturn": "-9.877", "timestampUtc": {"time": "2026-10-09T10:00:00Z"}}]
+        }]}}}})
+    }
+
+    fn portfolio_chart_args(portfolio_id: Option<&str>) -> BrokerChartArgs {
+        BrokerChartArgs {
+            isin: None,
+            portfolio_id: portfolio_id.map(str::to_string),
+            timeframe: BrokerChartTimeframe::OneYear,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn portfolio_chart_execution_resolves_context_and_explicit_precedence_read_only() {
+        for (
+            selected,
+            explicit,
+            expected_account,
+            expected_portfolio,
+            account_source,
+            portfolio_source,
+        ) in [
+            (
+                false,
+                Some(" portfolio-1 "),
+                "person-1",
+                "portfolio-1",
+                "auto_session_person_id",
+                "explicit",
+            ),
+            (
+                true,
+                Some(" portfolio-1 "),
+                "selected-account",
+                "portfolio-1",
+                "selected_context",
+                "explicit",
+            ),
+            (
+                true,
+                None,
+                "selected-account",
+                "selected-portfolio",
+                "selected_context",
+                "selected_context",
+            ),
+            (
+                false,
+                None,
+                "resolved-account",
+                "portfolio-1",
+                "auto_resolve",
+                "auto_resolve",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut session_manager = SessionManager::new(&config).expect("manager");
+            let mut stored = sample_stored_session(crate::channel::current_env());
+            stored.mode = Some(crate::session::SessionMode::LocalReadOnly);
+            session_manager.save_active(&stored).expect("session");
+            if selected {
+                crate::broker_context::save_context(crate::broker_context::BrokerContext {
+                    account_id: "selected-account".to_string(),
+                    portfolio_id: Some("selected-portfolio".to_string()),
+                })
+                .expect("context");
+            }
+            let context_path = crate::broker_context::context_file_path().expect("path");
+            let context_before = std::fs::read(&context_path).ok();
+            let discovery = server.mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({"operation_name": "ResolveBrokerIds", "variables": {"id": "person-1"}})))
+                .with_header("content-type", "application/json")
+                .with_body(json!({"data": {"account": {"id": "resolved-account", "brokerPortfolios": [{"id": "portfolio-1"}]}}}).to_string())
+                .expect(usize::from(!selected && explicit.is_none())).create();
+            let chart = server.mock("POST", "/")
+                .match_header("authorization", expected_authorization_header())
+                .match_header("dpop", Matcher::Regex(".+".to_string()))
+                .match_body(Matcher::Json(json!({"operation_name": "BrokerPortfolioChart", "query": BROKER_PORTFOLIO_CHART_QUERY, "variables": {"accountId": expected_account, "portfolioId": expected_portfolio}})))
+                .with_header("content-type", "application/json")
+                .with_body(portfolio_chart_response(expected_account, expected_portfolio).to_string()).expect(1).create();
+            let payload = execute_broker_chart(
+                portfolio_chart_args(explicit),
+                &config,
+                &mut session_manager,
+            )
+            .expect("portfolio chart");
+            assert_eq!(payload["account_id"], expected_account);
+            assert_eq!(payload["portfolio_id"], expected_portfolio);
+            assert_eq!(
+                payload["resolution"],
+                json!({"account": account_source, "portfolio": portfolio_source})
+            );
+            assert_eq!(payload["result"]["target"], "portfolio");
+            assert_eq!(payload["result"]["point_count"], 1);
+            assert_eq!(
+                payload["result"]["data_points"][0]["absolute_return"],
+                "-9.877"
+            );
+            assert_eq!(std::fs::read(context_path).ok(), context_before);
+            chart.assert();
+            discovery.assert();
+        }
+    }
+
+    #[test]
+    fn portfolio_chart_execution_reports_missing_or_ambiguous_context() {
+        for candidates in [json!([]), json!([{"id": "p1"}, {"id": "p2"}])] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut manager = SessionManager::new(&config).expect("manager");
+            manager
+                .save_active(&sample_stored_session(crate::channel::current_env()))
+                .expect("session");
+            let discovery = server.mock("POST", "/").match_body(Matcher::PartialJson(json!({"operation_name": "ResolveBrokerIds"})))
+                .with_header("content-type", "application/json").with_body(json!({"data": {"account": {"id": "person-1", "brokerPortfolios": candidates}}}).to_string()).create();
+            let err = execute_broker_chart(portfolio_chart_args(None), &config, &mut manager)
+                .expect_err("context required");
+            assert_eq!(classify_error(&err).code, "broker_context_missing");
+            assert_eq!(classify_error(&err).exit_code, 10);
+            discovery.assert();
+        }
+    }
+
+    #[test]
+    fn portfolio_chart_execution_propagates_backend_and_response_errors() {
+        for (response, expected_code) in [
+            (
+                json!({"errors": [{"message": "forbidden", "extensions": {"code": "FORBIDDEN"}}]}),
+                "internal_error",
+            ),
+            (
+                portfolio_chart_response("other-account", "portfolio-1"),
+                "broker_response_invalid",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut manager = SessionManager::new(&config).expect("manager");
+            manager
+                .save_active(&sample_stored_session(crate::channel::current_env()))
+                .expect("session");
+            let chart = server
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(
+                    json!({"operation_name": "BrokerPortfolioChart"}),
+                ))
+                .with_header("content-type", "application/json")
+                .with_body(response.to_string())
+                .expect(1)
+                .create();
+            let err = execute_broker_chart(
+                portfolio_chart_args(Some("portfolio-1")),
+                &config,
+                &mut manager,
+            )
+            .expect_err("error");
+            assert_eq!(classify_error(&err).code, expected_code, "{err:#}");
+            chart.assert();
+        }
+    }
+
     #[test]
     fn execute_broker_chart_happy_path_returns_direct_payload() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1895,7 +2546,8 @@ mod tests {
 
         let payload = execute_broker_chart(
             BrokerChartArgs {
-                isin: "us0378331005".to_string(),
+                isin: Some("us0378331005".to_string()),
+                portfolio_id: None,
                 timeframe: BrokerChartTimeframe::OneMonth,
                 json: true,
             },
@@ -1909,6 +2561,73 @@ mod tests {
             Some("US0378331005")
         );
         assert_eq!(payload.get("point_count").and_then(Value::as_u64), Some(0));
+        chart_mock.assert();
+    }
+
+    #[test]
+    fn execute_broker_chart_reports_unavailable_requested_timeframe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+        let expected_auth_header = expected_authorization_header();
+
+        let chart_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_auth_header)
+            .match_body(Matcher::Regex("BrokerChart".to_string()))
+            .match_body(Matcher::PartialJson(json!({
+                "variables": {
+                    "isin": "US0378331005",
+                    "timeFrames": ["TWO_DAYS"],
+                    "includeYearToDate": true
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": {
+                        "timeSeriesBySecurity": [
+                            {
+                                "isin": "US0378331005",
+                                "timeFrame": "ONE_MONTH",
+                                "currency": "EUR",
+                                "source": "CONSOLIDATED",
+                                "closingReferencePoint": {},
+                                "dataPoints": []
+                            }
+                        ]
+                    }
+                }"#,
+            )
+            .create();
+
+        let err = execute_broker_chart(
+            BrokerChartArgs {
+                isin: Some("us0378331005".to_string()),
+                portfolio_id: None,
+                timeframe: BrokerChartTimeframe::OneDay,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Chart data is unavailable for ISIN 'US0378331005' in the '1d' timeframe."
+        );
+        let classified = classify_error(&err);
+        assert_eq!(classified.code, "broker_chart_data_unavailable");
+        assert_eq!(classified.exit_code, 10);
         chart_mock.assert();
     }
 
@@ -1964,7 +2683,8 @@ mod tests {
 
         let payload = execute_broker_chart(
             BrokerChartArgs {
-                isin: "US0378331005".to_string(),
+                isin: Some("US0378331005".to_string()),
+                portfolio_id: None,
                 timeframe: BrokerChartTimeframe::YearToDate,
                 json: true,
             },
@@ -2033,7 +2753,6 @@ mod tests {
                 portfolio_id: Some("portfolio-1".to_string()),
                 isin: "LU2903252406".to_string(),
                 include_year_to_date: false,
-                quote_source: None,
                 json: true,
             },
             &config,
@@ -2074,7 +2793,8 @@ mod tests {
 
         let err = execute_broker_chart(
             BrokerChartArgs {
-                isin: "US0378331006".to_string(),
+                isin: Some("US0378331006".to_string()),
+                portfolio_id: None,
                 timeframe: BrokerChartTimeframe::OneMonth,
                 json: true,
             },

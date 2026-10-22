@@ -3,8 +3,12 @@ use serde_json::{Value, json};
 
 use crate::broker_queries::{
     BrokerInput, NormalizedBrokerDerivativesSearchQueryInput, timestamp_value_or_null,
+    validate_broker_chart_amount,
 };
 use crate::cli::BrokerChartTimeframe;
+use crate::trade_venue::TRADE_VENUES;
+
+pub(crate) const BROKER_CHART_DATA_UNAVAILABLE_PREFIX: &str = "Chart data is unavailable for ISIN ";
 
 pub fn project_broker_overview_response(input: &BrokerInput, response: &Value) -> Result<Value> {
     let valuation = response
@@ -57,10 +61,12 @@ pub fn project_broker_overview_response(input: &BrokerInput, response: &Value) -
 }
 
 pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -> Result<Value> {
-    let items = response
+    let portfolio = response
         .get("account")
         .and_then(|v| v.get("brokerPortfolio"))
-        .and_then(|v| v.get("inventory"))
+        .ok_or_else(|| anyhow!("Broker response invalid: missing account.brokerPortfolio"))?;
+    let items = portfolio
+        .get("inventory")
         .and_then(|v| v.get("items"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -82,6 +88,7 @@ pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -
                 .unwrap_or(Value::Null);
 
             json!({
+                "kind": "security",
                 "isin": item.get("isin").cloned().unwrap_or(Value::Null),
                 "name": item.get("name").cloned().unwrap_or(Value::Null),
                 "security_type": item.get("type").cloned().unwrap_or(Value::Null),
@@ -105,25 +112,172 @@ pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -
         a_isin.cmp(b_isin)
     });
 
+    let mut crypto_items = match portfolio.get("crypto") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(crypto) => {
+            let coins = crypto
+                .get("coins")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    anyhow!("Broker response invalid: missing account.brokerPortfolio.crypto.coins")
+                })?;
+
+            coins
+                .iter()
+                .map(|coin| -> Result<Value> {
+                    let etps = coin
+                        .get("inventory")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Broker response invalid: missing account.brokerPortfolio.crypto.coins.inventory"
+                            )
+                        })?;
+                    let mut etp_positions = etps
+                        .iter()
+                        .map(|etp| {
+                            let security = etp.get("etpSecurity");
+                            let position = security
+                                .and_then(|value| value.get("inventory"))
+                                .and_then(|value| value.get("position"));
+                            json!({
+                                "isin": etp.get("isin").cloned().unwrap_or(Value::Null),
+                                "name": security
+                                    .and_then(|value| value.get("name"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                "position": position.map(|value| json!({
+                                    "blocked": value.get("blocked").cloned().unwrap_or(Value::Null),
+                                    "filled": value.get("filled").cloned().unwrap_or(Value::Null),
+                                    "pending": value.get("pending").cloned().unwrap_or(Value::Null),
+                                })).unwrap_or(Value::Null),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    etp_positions.sort_by(|a, b| {
+                        let a_isin = a.get("isin").and_then(Value::as_str).unwrap_or_default();
+                        let b_isin = b.get("isin").and_then(Value::as_str).unwrap_or_default();
+                        a_isin.cmp(b_isin)
+                    });
+
+                    let position = coin.get("position");
+                    Ok(json!({
+                        "kind": "crypto",
+                        "ticker": coin.get("ticker").cloned().unwrap_or(Value::Null),
+                        "name": coin.get("name").cloned().unwrap_or(Value::Null),
+                        "position": {
+                            "filled": position
+                                .and_then(|value| value.get("filled"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "sellable": position
+                                .and_then(|value| value.get("sellable"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "pending": position
+                                .and_then(|value| value.get("pending"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        },
+                        "etp_positions": etp_positions,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    crypto_items.sort_by(|a, b| {
+        let a_ticker = a.get("ticker").and_then(Value::as_str).unwrap_or_default();
+        let b_ticker = b.get("ticker").and_then(Value::as_str).unwrap_or_default();
+        a_ticker.cmp(b_ticker)
+    });
+
     Ok(json!({
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
         "count": projected.len(),
+        "security_count": projected.len(),
+        "crypto_count": crypto_items.len(),
         "items": projected,
+        "crypto_items": crypto_items,
     }))
+}
+
+pub fn project_broker_order_venues_response(response: &Value) -> Result<Value> {
+    let venues = response
+        .get("venues")
+        .and_then(|value| value.get("venues"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Broker response invalid: missing venues.venues"))?;
+
+    let mut available = [false; TRADE_VENUES.len()];
+    for item in venues {
+        let mic = order_venue_code(item, "mic")?;
+        let emic = order_venue_code(item, "emic")?;
+
+        if let Some(index) = TRADE_VENUES
+            .iter()
+            .position(|candidate| candidate.mic == mic && candidate.emic == emic)
+        {
+            if available[index] {
+                return Err(anyhow!(
+                    "Broker response invalid: duplicate supported order venue '{}:{}'",
+                    mic,
+                    emic
+                ));
+            }
+            available[index] = true;
+        }
+    }
+
+    let venues = TRADE_VENUES
+        .iter()
+        .zip(available)
+        .filter(|(_, is_available)| *is_available)
+        .map(|(venue, _)| {
+            json!({
+                "venue": venue.alias,
+                "label": venue.discovery_label,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "count": venues.len(),
+        "venues": venues,
+    }))
+}
+
+fn order_venue_code<'a>(item: &'a Value, field: &str) -> Result<&'a str> {
+    let value = item.get(field).and_then(Value::as_str).ok_or_else(|| {
+        anyhow!(
+            "Broker response invalid: order venue field '{}' must be a string",
+            field
+        )
+    })?;
+    let valid = value.len() == 4
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+    if !valid {
+        return Err(anyhow!(
+            "Broker response invalid: order venue field '{}' must be a four-character uppercase code",
+            field
+        ));
+    }
+    Ok(value)
 }
 
 pub fn project_broker_transactions_response(
     input: &BrokerInput,
     response: &Value,
 ) -> Result<Value> {
-    let summaries = response
+    let portfolio = response
         .get("account")
         .and_then(|v| v.get("brokerPortfolio"))
-        .and_then(|v| v.get("moreTransactions"))
-        .ok_or_else(|| {
-            anyhow!("Broker response invalid: missing account.brokerPortfolio.moreTransactions")
-        })?;
+        .ok_or_else(|| anyhow!("Broker response invalid: missing account.brokerPortfolio"))?;
+    let summaries = portfolio.get("moreTransactions").ok_or_else(|| {
+        anyhow!("Broker response invalid: missing account.brokerPortfolio.moreTransactions")
+    })?;
     let items = summaries
         .get("transactions")
         .and_then(Value::as_array)
@@ -138,6 +292,29 @@ pub fn project_broker_transactions_response(
         .map(map_broker_transaction_summary)
         .collect::<Vec<_>>();
 
+    let crypto_summaries = match portfolio.get("crypto") {
+        None | Some(Value::Null) => None,
+        Some(crypto) => Some(crypto.get("moreTransactions").ok_or_else(|| {
+            anyhow!(
+                "Broker response invalid: missing account.brokerPortfolio.crypto.moreTransactions"
+            )
+        })?),
+    };
+    let crypto_items = match crypto_summaries {
+        None => Vec::new(),
+        Some(summaries) => summaries
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Broker response invalid: missing account.brokerPortfolio.crypto.moreTransactions.transactions"
+                )
+            })?
+            .iter()
+            .map(map_crypto_transaction_summary)
+            .collect::<Vec<_>>(),
+    };
+
     Ok(json!({
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
@@ -145,6 +322,18 @@ pub fn project_broker_transactions_response(
         "total": summaries.get("total").cloned().unwrap_or(Value::Null),
         "count": projected_items.len(),
         "items": projected_items,
+        "crypto": {
+            "cursor": crypto_summaries
+                .and_then(|value| value.get("cursor"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "total": crypto_summaries
+                .and_then(|value| value.get("total"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "count": crypto_items.len(),
+            "items": crypto_items,
+        },
     }))
 }
 
@@ -181,7 +370,6 @@ pub fn project_broker_transaction_details_response(
         "is_pending": transaction.get("isPending").cloned().unwrap_or(Value::Null),
         "is_cancellation": transaction.get("isCancellation").cloned().unwrap_or(Value::Null),
         "security": map_transaction_security_ref(transaction.get("security")),
-        "documents": map_transaction_documents(transaction.get("documents")),
         "linked_transaction_ids": map_linked_transaction_ids(transaction.get("linkedTransactions")),
         "history": map_transaction_history_for_details(transaction),
         "security_trade": map_security_trade_details(transaction, typename),
@@ -436,6 +624,92 @@ pub fn project_broker_quote_response(
     }))
 }
 
+pub fn project_broker_portfolio_chart_response(
+    input: &BrokerInput,
+    timeframe: BrokerChartTimeframe,
+    response: &Value,
+) -> Result<Value> {
+    let account = response
+        .get("account")
+        .ok_or_else(|| anyhow!("Broker response invalid: missing account"))?;
+    if account.get("id") != Some(&input.account_id_value()) {
+        return Err(anyhow!(
+            "Broker response invalid: account.id does not match requested account"
+        ));
+    }
+    let portfolio = account
+        .get("brokerPortfolio")
+        .ok_or_else(|| anyhow!("Broker response invalid: missing account.brokerPortfolio"))?;
+    if portfolio.get("id") != Some(&input.portfolio_id_value()) {
+        return Err(anyhow!(
+            "Broker response invalid: brokerPortfolio.id does not match requested portfolio"
+        ));
+    }
+    let series = portfolio
+        .get("timeseries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Broker response invalid: timeseries must be an array"))?;
+    let mut matches = series.iter().filter(|series| {
+        series.get("timeframe").and_then(Value::as_str) == Some(timeframe.as_graphql())
+    });
+    let selected = matches.next().ok_or_else(|| {
+        anyhow!(
+            "Broker response invalid: requested timeframe '{}' missing from timeseries",
+            timeframe.as_cli_value()
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "Broker response invalid: requested timeframe '{}' duplicated in timeseries",
+            timeframe.as_cli_value()
+        ));
+    }
+    let reference = map_broker_portfolio_chart_point(
+        selected
+            .get("closingReferencePoint")
+            .unwrap_or(&Value::Null),
+    )?;
+    let points = selected
+        .get("dataPoints")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Broker response invalid: dataPoints must be an array"))?
+        .iter()
+        .map(map_broker_portfolio_chart_point)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "target": "portfolio",
+        "timeframe": timeframe.as_cli_value(),
+        "closing_reference_point": reference,
+        "point_count": points.len(),
+        "data_points": points,
+    }))
+}
+
+fn map_broker_portfolio_chart_point(point: &Value) -> Result<Value> {
+    let point = point.as_object().ok_or_else(|| {
+        anyhow!("Broker response invalid: portfolio chart point must be an object")
+    })?;
+    let valuation = validate_broker_chart_amount(point.get("valuation"), "valuation")?;
+    let absolute_return =
+        validate_broker_chart_amount(point.get("absoluteReturn"), "absoluteReturn")?;
+    let timestamp = point
+        .get("timestampUtc")
+        .and_then(|timestamp| timestamp.get("time"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("Broker response invalid: timestampUtc.time must be an RFC3339 string")
+        })?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|_| {
+            anyhow!("Broker response invalid: timestampUtc.time must be an RFC3339 string")
+        })?
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    Ok(
+        json!({ "valuation": valuation, "absolute_return": absolute_return, "timestamp_utc": timestamp }),
+    )
+}
+
 pub fn project_broker_chart_response(
     requested_isin: &str,
     requested_timeframe: BrokerChartTimeframe,
@@ -459,8 +733,28 @@ pub fn project_broker_chart_response(
                 == Some(requested_timeframe_graphql)
         })
         .ok_or_else(|| {
+            for entry in series {
+                if entry
+                    .get("timeFrame")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return anyhow!(
+                        "Broker response invalid: missing or invalid timeSeriesBySecurity[].timeFrame"
+                    );
+                }
+                if entry.get("isin").and_then(Value::as_str).map(str::trim)
+                    != Some(requested_isin)
+                {
+                    return anyhow!(
+                        "Broker response invalid: missing or mismatched timeSeriesBySecurity[].isin"
+                    );
+                }
+            }
             anyhow!(
-                "Broker response invalid: requested timeframe '{requested_timeframe_cli}' missing from timeSeriesBySecurity"
+                "{BROKER_CHART_DATA_UNAVAILABLE_PREFIX}'{requested_isin}' in the '{requested_timeframe_cli}' timeframe."
             )
         })?;
 
@@ -975,25 +1269,6 @@ fn map_transaction_security_ref(raw: Option<&Value>) -> Value {
     }
 }
 
-fn map_transaction_documents(raw: Option<&Value>) -> Value {
-    raw.and_then(Value::as_array)
-        .map(|items| {
-            Value::Array(
-                items
-                    .iter()
-                    .map(|item| {
-                        json!({
-                            "id": item.get("id").cloned().unwrap_or(Value::Null),
-                            "url": item.get("url").cloned().unwrap_or(Value::Null),
-                            "label": item.get("label").cloned().unwrap_or(Value::Null),
-                        })
-                    })
-                    .collect(),
-            )
-        })
-        .unwrap_or_else(|| Value::Array(Vec::new()))
-}
-
 fn map_linked_transaction_ids(raw: Option<&Value>) -> Value {
     raw.and_then(Value::as_array)
         .map(|items| {
@@ -1257,12 +1532,6 @@ fn map_broker_transaction_summary(item: &Value) -> Value {
         "last_event_datetime": timestamp_value_or_null(item.get("lastEventDateTime")),
         "description": item.get("description").cloned().unwrap_or(Value::Null),
         "custodian": item.get("custodian").cloned().unwrap_or(Value::Null),
-        "documents": item
-            .get("documents")
-            .and_then(Value::as_array)
-            .cloned()
-            .map(Value::Array)
-            .unwrap_or_else(|| Value::Array(Vec::new())),
         "unknown_summary_type": false,
     });
 
@@ -1367,6 +1636,42 @@ fn map_broker_transaction_summary(item: &Value) -> Value {
     }
 
     mapped
+}
+
+fn map_crypto_transaction_summary(item: &Value) -> Value {
+    let typename = item
+        .get("__typename")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (kind, transaction_type_field) = match typename {
+        "CryptoSecurityTransactionSummary" => ("security", "securityTransactionType"),
+        "CryptoNonTradeSecurityTransactionSummary" => {
+            ("non_trade_security", "nonTradeSecurityTransactionType")
+        }
+        _ => ("unknown", ""),
+    };
+
+    json!({
+        "id": item.get("id").cloned().unwrap_or(Value::Null),
+        "kind": kind,
+        "summary_type": item.get("__typename").cloned().unwrap_or(Value::Null),
+        "currency": item.get("currency").cloned().unwrap_or(Value::Null),
+        "type": item.get("type").cloned().unwrap_or(Value::Null),
+        "status": item.get("status").cloned().unwrap_or(Value::Null),
+        "last_event_datetime": timestamp_value_or_null(item.get("lastEventDateTime")),
+        "description": item.get("description").cloned().unwrap_or(Value::Null),
+        "ticker": item.get("ticker").cloned().unwrap_or(Value::Null),
+        "transaction_type": if transaction_type_field.is_empty() {
+            Value::Null
+        } else {
+            item.get(transaction_type_field).cloned().unwrap_or(Value::Null)
+        },
+        "coin_quantity": item.get("coinQuantity").cloned().unwrap_or(Value::Null),
+        "quantity": item.get("quantity").cloned().unwrap_or(Value::Null),
+        "amount": item.get("amount").cloned().unwrap_or(Value::Null),
+        "side": item.get("side").cloned().unwrap_or(Value::Null),
+        "unknown_summary_type": kind == "unknown",
+    })
 }
 
 fn project_broker_watchlist_mutation_response(

@@ -315,7 +315,7 @@ fn fetch_portfolio_groups_state(
     context: &mut PortfolioGroupsContext,
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
-    let input = validated_broker_input(&context.ids, false, None)?;
+    let input = validated_broker_input(&context.ids, false)?;
     let variables = broker_portfolio_groups_variables(&input)?;
     execute_portfolio_groups_operation(
         context,
@@ -627,6 +627,7 @@ mod tests {
                 },
                 dpop_jwk_thumbprint: Some(thumbprint),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
         session_manager

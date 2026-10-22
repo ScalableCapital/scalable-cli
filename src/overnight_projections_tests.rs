@@ -343,8 +343,7 @@ fn project_overnight_transactions_maps_cash_transaction_page_in_backend_order() 
                             "cashTransactionType": "INTEREST",
                             "amount": "1.23",
                             "custodian": "BAADER_BANK",
-                            "relatedIsin": null,
-                            "documents": [{"id": "doc-1", "label": "Receipt", "url": "https://example.test/doc-1"}]
+                            "relatedIsin": null
                         },
                         {
                             "id": "tx-1",
@@ -357,8 +356,7 @@ fn project_overnight_transactions_maps_cash_transaction_page_in_backend_order() 
                             "cashTransactionType": "DEPOSIT",
                             "amount": "100.00",
                             "custodian": null,
-                            "relatedIsin": null,
-                            "documents": []
+                            "relatedIsin": null
                         }
                     ]
                 }
@@ -374,7 +372,6 @@ fn project_overnight_transactions_maps_cash_transaction_page_in_backend_order() 
     assert_eq!(projected["items"][0]["id"], "tx-2");
     assert_eq!(projected["items"][1]["id"], "tx-1");
     assert_eq!(projected["items"][0]["cash_transaction_type"], "INTEREST");
-    assert_eq!(projected["items"][0]["documents"][0]["id"], "doc-1");
 }
 
 #[test]
@@ -422,7 +419,6 @@ fn project_overnight_transactions_rejects_malformed_page_shape() {
         json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": 1, "transactions": {}}}}}),
         json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"transactions": []}}}}),
         json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": null, "transactions": []}}}}),
-        json!({"account": {"savingsAccount": {"id": "sav-1", "moreTransactions": {"total": 1, "transactions": [{"documents": {}}]}}}}),
     ];
 
     for response in malformed_responses {

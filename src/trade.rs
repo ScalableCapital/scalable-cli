@@ -102,7 +102,7 @@ query getSecurityTick(
   $isin: ID!
   $portfolioId: ID!
   $includeYearToDate: Boolean
-  $source: MarketDataSource
+  $source: MarketDataSource!
 ) {
   account(id: $personId) {
     id
@@ -1155,13 +1155,14 @@ pub fn trade_security_tick_variables(
     person_id: &str,
     portfolio_id: &str,
     isin: &str,
+    source: &str,
 ) -> Result<Value> {
     Ok(json!({
         "personId": required_non_empty(person_id, "person_id")?,
         "portfolioId": required_non_empty(portfolio_id, "portfolio_id")?,
         "isin": required_non_empty(isin, "isin")?,
         "includeYearToDate": false,
-        "source": "CONSOLIDATED",
+        "source": required_non_empty(source, "source")?,
     }))
 }
 
@@ -1716,6 +1717,34 @@ pub fn trade_estimated_order_price(
                 _ => side_quote,
             })
         }
+        "stop-limit" => {
+            let stop_price = stop_price.ok_or_else(|| {
+                anyhow!("Trade input invalid: stop-limit order requires stop_price for estimate")
+            })?;
+            let limit_price = limit_price.ok_or_else(|| {
+                anyhow!("Trade input invalid: stop-limit order requires limit_price for estimate")
+            })?;
+            let mut selected = side_quote;
+            if match side {
+                TradeSide::Buy => stop_price > selected.price,
+                TradeSide::Sell => stop_price < selected.price,
+            } {
+                selected = TradePriceSelection {
+                    basis: "stop_price",
+                    price: stop_price,
+                };
+            }
+            if match side {
+                TradeSide::Buy => limit_price < selected.price,
+                TradeSide::Sell => limit_price > selected.price,
+            } {
+                selected = TradePriceSelection {
+                    basis: "limit_price",
+                    price: limit_price,
+                };
+            }
+            Ok(selected)
+        }
         unsupported => bail!(
             "Trade input invalid: unsupported order type '{}' for estimate",
             unsupported
@@ -1875,6 +1904,110 @@ mod tests {
     }
 
     #[test]
+    fn trade_estimated_order_price_stop_limit_preserves_ios_price_and_basis() {
+        let quote = SecurityTick {
+            ask_price: Some(101.0),
+            bid_price: Some(99.0),
+            mid_price: 100.0,
+            currency: "EUR".to_string(),
+            is_outdated: false,
+            timestamp_utc: None,
+        };
+        let cases = [
+            (TradeSide::Buy, 105.0, 110.0, 105.0, "stop_price"),
+            (TradeSide::Buy, 105.0, 103.0, 103.0, "limit_price"),
+            (TradeSide::Buy, 105.0, 105.0, 105.0, "stop_price"),
+            (TradeSide::Buy, 100.0, 110.0, 101.0, "ask_price"),
+            (TradeSide::Buy, 100.0, 99.0, 99.0, "limit_price"),
+            (TradeSide::Buy, 101.0, 110.0, 101.0, "ask_price"),
+            (TradeSide::Buy, 100.0, 101.0, 101.0, "ask_price"),
+            (TradeSide::Buy, 100.5, 110.0, 101.0, "ask_price"),
+            (TradeSide::Sell, 95.0, 90.0, 95.0, "stop_price"),
+            (TradeSide::Sell, 95.0, 97.0, 97.0, "limit_price"),
+            (TradeSide::Sell, 95.0, 95.0, 95.0, "stop_price"),
+            (TradeSide::Sell, 100.0, 90.0, 99.0, "bid_price"),
+            (TradeSide::Sell, 100.0, 101.0, 101.0, "limit_price"),
+            (TradeSide::Sell, 99.0, 90.0, 99.0, "bid_price"),
+            (TradeSide::Sell, 100.0, 99.0, 99.0, "bid_price"),
+            (TradeSide::Sell, 99.5, 90.0, 99.0, "bid_price"),
+        ];
+        for (side, stop, limit, price, basis) in cases {
+            assert_eq!(
+                trade_estimated_order_price(side, "stop-limit", Some(limit), Some(stop), &quote)
+                    .expect("combined estimate"),
+                TradePriceSelection { price, basis },
+                "{side:?}: stop={stop}, limit={limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn trade_estimated_order_price_stop_limit_requires_prices_and_side_quote() {
+        let quote = SecurityTick {
+            ask_price: Some(101.0),
+            bid_price: Some(99.0),
+            mid_price: 100.0,
+            currency: "EUR".to_string(),
+            is_outdated: false,
+            timestamp_utc: None,
+        };
+        for side in [TradeSide::Buy, TradeSide::Sell] {
+            for (limit, stop, missing) in [
+                (None, Some(105.0), "limit_price"),
+                (Some(110.0), None, "stop_price"),
+            ] {
+                assert!(
+                    trade_estimated_order_price(side, "stop-limit", limit, stop, &quote)
+                        .expect_err("missing operand")
+                        .to_string()
+                        .contains(missing)
+                );
+            }
+            let mut missing_quote = quote.clone();
+            let missing = match side {
+                TradeSide::Buy => {
+                    missing_quote.ask_price = None;
+                    "askPrice"
+                }
+                TradeSide::Sell => {
+                    missing_quote.bid_price = None;
+                    "bidPrice"
+                }
+            };
+            assert!(
+                trade_estimated_order_price(
+                    side,
+                    "stop-limit",
+                    Some(110.0),
+                    Some(105.0),
+                    &missing_quote
+                )
+                .expect_err("missing side quote")
+                .to_string()
+                .contains(missing)
+            );
+            match side {
+                TradeSide::Buy => missing_quote.ask_price = quote.ask_price,
+                TradeSide::Sell => missing_quote.bid_price = quote.bid_price,
+            }
+            match side {
+                TradeSide::Buy => missing_quote.bid_price = None,
+                TradeSide::Sell => missing_quote.ask_price = None,
+            }
+            assert!(
+                trade_estimated_order_price(
+                    side,
+                    "stop-limit",
+                    Some(110.0),
+                    Some(105.0),
+                    &missing_quote
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn ex_ante_order_volume_rounding_uses_4dp_half_up_for_positive_values() {
         assert_eq!(
             round_estimated_order_volume_for_ex_ante(123.45674),
@@ -1900,6 +2033,15 @@ mod tests {
         assert_eq!(vars["personId"], "person-1");
         assert_eq!(vars["portfolioId"], "portfolio-1");
         assert_eq!(vars["isin"], "US0378331005");
+
+        let quote_vars =
+            trade_security_tick_variables("person-1", "portfolio-1", "US0378331005", " XETR ")
+                .expect("security tick vars");
+        assert_eq!(quote_vars["source"], "XETR");
+
+        let err = trade_security_tick_variables("person-1", "portfolio-1", "US0378331005", " ")
+            .expect_err("blank source should fail");
+        assert!(err.to_string().contains("source"));
 
         let warning_vars = trade_appropriateness_warning_variables("en_DE").expect("warning vars");
         assert_eq!(warning_vars["locale"], "en-DE");
@@ -2049,6 +2191,7 @@ mod tests {
         for query in queries {
             parse_query::<String>(query).expect("query should parse as valid GraphQL");
         }
+        assert!(TRADE_SECURITY_TICK_QUERY.contains("$source: MarketDataSource!"));
     }
 
     #[test]

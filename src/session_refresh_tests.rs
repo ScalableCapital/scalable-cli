@@ -3,13 +3,15 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mockito::{Matcher, Mock, Server};
 use serde_json::json;
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use tempfile::tempdir;
 
 use super::*;
+use crate::auth::REFRESH_RETRYABLE_PREFIX;
 use crate::config::{
     AppConfig, AuthConfig, DpopKeyBackend, EnvConfig, RuntimeAuthConfig, SessionBackendPreference,
 };
-use crate::session::{FileStore, LoginSource, StorageBackend};
+use crate::session::{FileStore, LoginSource, SecretStore, SessionMode, StorageBackend};
 
 const TEST_KID: &str = "test-kid";
 const TEST_RSA_N: &str = "0hw4qSyPOM59HeFtuc2a4X-rWKPeAXmvtNHV86mYXh8TWEGc68MPq3V7NYUN-ZHulHPl2FQAMVFt-jWOQy4nJEPp1ak-P0_3Vn3Tc4lwDJXuIBC8RHPG8XMUTj7QsZPM-pf_TO_JyLrlItRZ_xADF6b_fwOhOnK5_UXLm0ZqfCYfMGFXB9Oag_Xv5yHqrHlpTkn-zYSmsC9Nk_FOsN1Apsa1Kfwj9SvRplAm86Azc3obHjHkdiOKximtWJWGi-a5eq3fYRk_csIIxO0DHGYk9rUlUQUiwr_MqJqSVc_xvi6w8j-0_Ca34BsonihOdGrNuA1yzll51pxywREMc07JkQ";
@@ -108,6 +110,43 @@ fn current_runtime_dpop_thumbprint(config: &AppConfig) -> String {
     .expect("load runtime dpop key")
     .jwk_thumbprint()
     .expect("runtime dpop thumbprint")
+}
+
+/// Common environment, storage, and signing setup. Callers hold the test-env
+/// lock for this fixture's lifetime; mocks and race synchronization stay local.
+struct RefreshTestEnvironment {
+    _channel_guard: crate::channel::TestEnvConfigOverrideGuard,
+    _config_dir_guard: EnvGuard,
+    tempdir: tempfile::TempDir,
+    config: AppConfig,
+    dpop_options: DpopRuntimeOptions,
+    dpop_thumbprint: String,
+}
+
+impl RefreshTestEnvironment {
+    fn new(env_cfg: &EnvConfig) -> Self {
+        let config = sample_config();
+        let tempdir = tempdir().expect("tempdir");
+        let config_dir_guard = EnvGuard::set("SC_CONFIG_DIR", tempdir.path().as_os_str());
+        let channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
+        ensure_runtime_dpop_key(&config);
+        let dpop_options = crate::channel::current_dpop_runtime_options(&config);
+        let dpop_thumbprint = current_runtime_dpop_thumbprint(&config);
+        Self {
+            _channel_guard: channel_guard,
+            _config_dir_guard: config_dir_guard,
+            tempdir,
+            config,
+            dpop_options,
+            dpop_thumbprint,
+        }
+    }
+
+    fn session_manager(&self) -> SessionManager<StorageBackend> {
+        SessionManager::with_store(StorageBackend::File(
+            FileStore::new(self.tempdir.path().to_path_buf()).expect("file store"),
+        ))
+    }
 }
 
 fn spawn_update_after_refresh_start(
@@ -230,6 +269,71 @@ fn make_verified_token(env_cfg: &EnvConfig, extra_claims: serde_json::Value) -> 
     .expect("token should encode")
 }
 
+fn stored_session(
+    access_token: String,
+    refresh_token: Option<&str>,
+    dpop_jwk_thumbprint: String,
+    refresh_recovery_pending: bool,
+) -> StoredSession {
+    StoredSession {
+        env: crate::channel::current_env(),
+        session: Session {
+            access_token,
+            refresh_token: refresh_token.map(ToString::to_string),
+            id_token: None,
+            expires_at: Some(if refresh_recovery_pending {
+                9_999_999_999
+            } else {
+                0
+            }),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(dpop_jwk_thumbprint),
+        mode: None,
+        refresh_recovery_pending,
+    }
+}
+
+struct FailOnWriteStore {
+    value: std::sync::Mutex<Option<String>>,
+    writes: std::sync::Mutex<usize>,
+    fail_on_write: usize,
+    failure: fn() -> anyhow::Error,
+}
+
+impl FailOnWriteStore {
+    fn new(fail_on_write: usize) -> Self {
+        Self {
+            value: std::sync::Mutex::new(None),
+            writes: std::sync::Mutex::new(0),
+            fail_on_write,
+            failure: || anyhow::anyhow!("injected session-store write failure"),
+        }
+    }
+}
+
+impl SecretStore for FailOnWriteStore {
+    fn get(&self, _: &str) -> Result<Option<String>> {
+        Ok(self.value.lock().expect("lock store").clone())
+    }
+
+    fn set(&self, _: &str, value: &str) -> Result<()> {
+        let mut writes = self.writes.lock().expect("lock write count");
+        *writes += 1;
+        if *writes == self.fail_on_write {
+            return Err((self.failure)());
+        }
+        *self.value.lock().expect("lock store") = Some(value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, _: &str) -> Result<()> {
+        *self.value.lock().expect("lock store") = None;
+        Ok(())
+    }
+}
+
 #[test]
 fn unauthorized_detection_accepts_http_401_graphql_errors() {
     let err = anyhow::anyhow!("GraphQL HTTP error 401: unauthorized");
@@ -297,7 +401,9 @@ fn execute_with_refresh_retry_does_not_retry_rate_limited_errors() {
 
 #[test]
 fn save_active_session_preserves_session_mode() {
+    let _lock = crate::lock_test_env();
     let tmp = tempdir().expect("tempdir");
+    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().as_os_str());
     let config = sample_config();
     let store = StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
     let mut session_manager = SessionManager::with_store(store);
@@ -322,6 +428,7 @@ fn save_active_session_preserves_session_mode() {
         },
         dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&base_session)
@@ -329,12 +436,15 @@ fn save_active_session_preserves_session_mode() {
 
     save_active_session(
         &mut session_manager,
-        crate::channel::current_env(),
-        &session,
         &base_session,
-        Some(SessionMode::LocalReadOnly),
+        StoredSession {
+            env: crate::channel::current_env(),
+            session,
+            dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
+            mode: Some(SessionMode::LocalReadOnly),
+            refresh_recovery_pending: false,
+        },
         &dpop_options,
-        "thumbprint-1",
     )
     .expect("save refreshed session");
 
@@ -346,8 +456,43 @@ fn save_active_session_preserves_session_mode() {
 }
 
 #[test]
-fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
+fn refresh_cleanup_does_not_interpret_error_text_as_a_deletion_instruction() {
+    let _lock = crate::lock_test_env();
     let tmp = tempdir().expect("tempdir");
+    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().as_os_str());
+    let mut session_manager = SessionManager::with_store(StorageBackend::File(
+        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
+    ));
+    let current = stored_session(
+        "last-verified-access-token".to_string(),
+        Some("refresh-token-rotated"),
+        "thumbprint-1".to_string(),
+        true,
+    );
+    session_manager
+        .save_active(&current)
+        .expect("save recovery");
+
+    let error = handle_refresh_failure(
+        &mut session_manager,
+        &current,
+        RefreshFailure::Other(anyhow::anyhow!(
+            "local failure mentioning {REFRESH_RELOGIN_REQUIRED_PREFIX}"
+        )),
+    );
+
+    assert!(error.to_string().contains("local failure"));
+    assert_eq!(
+        session_manager.load_active().expect("load active"),
+        Some(current)
+    );
+}
+
+#[test]
+fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
+    let _lock = crate::lock_test_env();
+    let tmp = tempdir().expect("tempdir");
+    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().as_os_str());
     let store = StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
     let mut session_manager = SessionManager::with_store(store);
     let stale = StoredSession {
@@ -362,6 +507,7 @@ fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
         },
         dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
         mode: None,
+        refresh_recovery_pending: false,
     };
     let rotated = StoredSession {
         env: crate::channel::current_env(),
@@ -375,6 +521,7 @@ fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
         },
         dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
         mode: None,
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&stale)
@@ -383,10 +530,10 @@ fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
         .save_active(&rotated)
         .expect("save rotated session");
 
-    let err = clear_active_session_on_refresh_relogin_failure(
+    let err = handle_refresh_failure(
         &mut session_manager,
-        Some(&stale),
-        anyhow::anyhow!("{REFRESH_RELOGIN_REQUIRED_PREFIX} Token refresh requires a new login."),
+        &stale,
+        refresh_relogin_required("Token refresh requires a new login"),
     );
 
     assert!(err.to_string().contains(REFRESH_RELOGIN_REQUIRED_PREFIX));
@@ -401,7 +548,9 @@ fn refresh_relogin_cleanup_keeps_newer_concurrently_saved_session() {
 
 #[test]
 fn refresh_relogin_cleanup_deletes_matching_stale_session() {
+    let _lock = crate::lock_test_env();
     let tmp = tempdir().expect("tempdir");
+    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().as_os_str());
     let store = StorageBackend::File(FileStore::new(tmp.path().to_path_buf()).expect("file store"));
     let mut session_manager = SessionManager::with_store(store);
     let stale = StoredSession {
@@ -416,15 +565,16 @@ fn refresh_relogin_cleanup_deletes_matching_stale_session() {
         },
         dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
         mode: None,
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&stale)
         .expect("save stale session");
 
-    let err = clear_active_session_on_refresh_relogin_failure(
+    let err = handle_refresh_failure(
         &mut session_manager,
-        Some(&stale),
-        anyhow::anyhow!("{REFRESH_RELOGIN_REQUIRED_PREFIX} Token refresh requires a new login."),
+        &stale,
+        refresh_relogin_required("Token refresh requires a new login"),
     );
 
     assert!(err.to_string().contains(REFRESH_RELOGIN_REQUIRED_PREFIX));
@@ -437,7 +587,1007 @@ fn refresh_relogin_cleanup_deletes_matching_stale_session() {
 }
 
 #[test]
-fn refresh_loaded_session_if_needed_keeps_newer_saved_session_on_relogin_failure() {
+fn marked_recovery_without_a_usable_refresh_token_requires_login_and_cleans_up() {
+    let _lock = crate::lock_test_env();
+    let server = Server::new();
+    let env_cfg = sample_env(&server);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        "last-verified-access-token".to_string(),
+        Some("   "),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect_err("corrupt recovery state must not be used");
+
+    assert!(format!("{err:#}").contains(REFRESH_RELOGIN_REQUIRED_PREFIX));
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn marked_recovery_retries_issuer_material_unavailability_without_sending_a_refresh() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let discovery = server
+        .mock("GET", "/.well-known/openid-configuration")
+        .with_status(503)
+        .with_body("issuer-outage-sentinel")
+        // Each verification attempt retries discovery once. Run recovery twice
+        // to prove the marker survives an unchanged outage.
+        .expect(4)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        make_verified_token(
+            &env_cfg,
+            json!({ "https://de.scalable.capital/session_id": "sid-current" }),
+        ),
+        Some("refresh-token-rotated"),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    for _ in 0..2 {
+        let active = session_manager
+            .load_active()
+            .expect("load active")
+            .expect("recovery remains active");
+        let err = refresh_loaded_session_if_needed(
+            &mut session_manager,
+            crate::channel::current_env(),
+            &env_cfg,
+            active,
+            &fixture.dpop_options,
+        )
+        .expect_err("issuer outage before a new exchange is retryable");
+
+        assert_eq!(
+            crate::machine::classify_error(&err).code,
+            "refresh_retryable"
+        );
+        let persisted = session_manager
+            .load_active()
+            .expect("load persisted recovery")
+            .expect("recovery remains active");
+        assert!(persisted.refresh_recovery_pending);
+        assert_eq!(
+            persisted.session.refresh_token.as_deref(),
+            Some("refresh-token-rotated")
+        );
+    }
+
+    discovery.assert();
+}
+
+#[test]
+fn normal_refresh_does_not_claim_durable_recovery_before_any_token_response() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let discovery = server
+        .mock("GET", "/.well-known/openid-configuration")
+        .with_status(503)
+        .expect(2)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let current = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-current"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&current)
+        .expect("save current session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        current.clone(),
+        &fixture.dpop_options,
+    )
+    .expect_err("issuer outage before an exchange should surface normally");
+
+    assert!(!format!("{err:#}").contains(REFRESH_RETRYABLE_PREFIX));
+    assert_ne!(
+        crate::machine::classify_error(&err).code,
+        "refresh_retryable"
+    );
+    assert_eq!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .expect("current session remains"),
+        current
+    );
+    discovery.assert();
+}
+
+#[test]
+fn marked_recovery_with_a_locally_rejected_preserved_token_requires_login() {
+    let _lock = crate::lock_test_env();
+    let server = Server::new();
+    let env_cfg = sample_env(&server);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        "not-a-jwt".to_string(),
+        Some("refresh-token-rotated"),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect_err("locally rejected preserved token must not be retried");
+
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn marked_recovery_deletes_the_matching_session_after_an_ambiguous_exchange_failure() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .with_status(503)
+        .with_body(r#"{"error":"server_error"}"#)
+        .expect(1)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-rotated"),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect_err("a request without a usable response is ambiguous");
+
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn marked_recovery_deletes_the_matching_session_after_a_malformed_token_response() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("not-json")
+        .expect(1)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-rotated"),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect_err("malformed successful response is ambiguous after the request is sent");
+
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn marked_recovery_deletes_the_matching_session_after_a_transport_disconnect() {
+    let _lock = crate::lock_test_env();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind token test server");
+    let addr = listener.local_addr().expect("read server address");
+    let issuer = format!("http://{addr}");
+    let env_cfg = EnvConfig {
+        graphql_url: issuer.clone(),
+        auth: AuthConfig {
+            issuer: issuer.clone(),
+            audience: "aud".to_string(),
+            client_id: "client-id".to_string(),
+        },
+    };
+    let worker = std::thread::spawn(move || {
+        let read_request = |stream: &mut std::net::TcpStream| {
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request closed before headers arrived");
+                request.extend_from_slice(&buffer[..read]);
+            }
+        };
+        let write_json = |stream: &mut std::net::TcpStream, body: String| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write JSON response");
+        };
+
+        let (mut discovery, _) = listener.accept().expect("accept discovery request");
+        read_request(&mut discovery);
+        write_json(
+            &mut discovery,
+            json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks")
+            })
+            .to_string(),
+        );
+
+        let (mut jwks, _) = listener.accept().expect("accept JWKS request");
+        read_request(&mut jwks);
+        write_json(
+            &mut jwks,
+            json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "n": TEST_RSA_N,
+                    "e": TEST_RSA_E
+                }]
+            })
+            .to_string(),
+        );
+
+        let (mut token_request, _) = listener.accept().expect("accept token request");
+        read_request(&mut token_request);
+        // Closing the accepted socket without an HTTP response simulates a
+        // disconnect after the issuer received the refresh request.
+    });
+
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let recovery = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-rotated"),
+        fixture.dpop_thumbprint.clone(),
+        true,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&recovery)
+        .expect("save recovery session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect_err("disconnect after token request is ambiguous");
+    worker.join().expect("join token test server");
+
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn verified_replacement_for_another_person_requires_login() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 2);
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": make_verified_token(&env_cfg, json!({ "person_id": "person-2" })),
+                "refresh_token": "refresh-token-next",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let current = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-current"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    let mut session_manager = fixture.session_manager();
+    session_manager
+        .save_active(&current)
+        .expect("save current session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        current,
+        &fixture.dpop_options,
+    )
+    .expect_err("a verified token for another person must not replace this session");
+
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn recovery_write_failure_requires_login_and_deletes_the_matching_original_record() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (discovery, jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+    let refresh = server
+        .mock("POST", "/oauth/token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": make_verified_token(&env_cfg, json!({ "jti": "replacement" })),
+                "refresh_token": "refresh-token-next",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let current = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-current"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    // The initial save succeeds; the recovery write fails before the new
+    // access token is verified. Cleanup must match the original record.
+    let mut session_manager = SessionManager::with_store(FailOnWriteStore::new(2));
+    session_manager.save_active(&current).expect("save current");
+
+    let error = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        current,
+        &fixture.dpop_options,
+    )
+    .expect_err("a rotated token that could not be saved requires login");
+
+    assert!(
+        error
+            .to_string()
+            .contains("rotated refresh token could not be persisted locally")
+    );
+    assert_eq!(
+        crate::machine::classify_error(&error).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+    discovery.assert();
+    jwks.assert();
+    refresh.assert();
+}
+
+#[test]
+fn typed_final_session_save_failure_preserves_the_rotated_recovery_record() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 2);
+    let refreshed_access_token = make_verified_token(&env_cfg, json!({}));
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": refreshed_access_token,
+                "refresh_token": "refresh-token-next",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let current = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("refresh-token-current"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    // Initial save is write one, recovery persistence is write two, and only
+    // the verified final save is made to fail.
+    let mut store = FailOnWriteStore::new(3);
+    store.failure = || {
+        anyhow::Error::new(
+            crate::session::SessionStorageError::secret_store_unavailable(
+                keyring_core::Error::NoDefaultStore,
+            ),
+        )
+    };
+    let mut session_manager = SessionManager::with_store(store);
+    session_manager
+        .save_active(&current)
+        .expect("save current session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        current.clone(),
+        &fixture.dpop_options,
+    )
+    .expect_err("final persistence failure should be retryable");
+
+    assert!(
+        err.downcast_ref::<crate::session::SessionStorageError>()
+            .is_some()
+    );
+    let classified = crate::machine::classify_error(&err);
+    assert_eq!(classified.code, "refresh_retryable");
+    assert_eq!(classified.exit_code, 30);
+    let recovery = session_manager
+        .load_active()
+        .expect("load persisted recovery")
+        .expect("recovery must remain active");
+    assert!(recovery.refresh_recovery_pending);
+    assert_eq!(recovery.session.access_token, current.session.access_token);
+    assert_eq!(recovery.session.expires_at, Some(0));
+    assert_eq!(
+        recovery.session.refresh_token.as_deref(),
+        Some("refresh-token-next")
+    );
+}
+
+#[test]
+fn refresh_retry_reuses_the_persisted_rotated_refresh_token() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let discovery_body = json!({
+        "issuer": env_cfg.auth.issuer,
+        "jwks_uri": format!("{}/jwks", server.url())
+    })
+    .to_string();
+    let discovery_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = std::sync::Arc::clone(&discovery_calls);
+    let discovery = server
+        .mock("GET", "/.well-known/openid-configuration")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_chunked_body(move |writer| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                writer.write_all(b"invalid-json")
+            } else {
+                writer.write_all(discovery_body.as_bytes())
+            }
+        })
+        .expect(4)
+        .create();
+    let jwks = server
+        .mock("GET", "/jwks")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "n": TEST_RSA_N,
+                    "e": TEST_RSA_E
+                }]
+            })
+            .to_string(),
+        )
+        .expect(3)
+        .create();
+    let refreshed_access_token = make_verified_token(&env_cfg, json!({}));
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+            Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+            Matcher::UrlEncoded("refresh_token".into(), "refresh-token-current".into()),
+            Matcher::UrlEncoded("session_id".into(), "sid-current".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": refreshed_access_token,
+                "refresh_token": "refresh-token-next",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .create();
+    let retried_access_token = make_verified_token(&env_cfg, json!({}));
+    let _retry_refresh = server
+        .mock("POST", "/oauth/token")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+            Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+            Matcher::UrlEncoded("refresh_token".into(), "refresh-token-next".into()),
+            Matcher::UrlEncoded("session_id".into(), "sid-current".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": retried_access_token,
+                "refresh_token": "refresh-token-final",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .create();
+
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
+    let stored_session = StoredSession {
+        env: crate::channel::current_env(),
+        session: Session {
+            access_token: make_verified_token(
+                &env_cfg,
+                json!({ "https://de.scalable.capital/session_id": "sid-current" }),
+            ),
+            refresh_token: Some("refresh-token-current".to_string()),
+            id_token: Some("id-token-current".to_string()),
+            expires_at: Some(0),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(runtime_thumbprint),
+        mode: None,
+        refresh_recovery_pending: false,
+    };
+    session_manager
+        .save_active(&stored_session)
+        .expect("save active session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        stored_session.clone(),
+        &fixture.dpop_options,
+    )
+    .expect_err("post-rotation verification should be retryable");
+
+    assert_eq!(discovery_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(format!("{err:#}").contains(REFRESH_RETRYABLE_PREFIX));
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_retryable"
+    );
+    let mut recovery = session_manager
+        .load_active()
+        .expect("load active")
+        .expect("recovery session should remain");
+    assert_eq!(
+        recovery.session.refresh_token.as_deref(),
+        Some("refresh-token-next")
+    );
+    assert_eq!(
+        recovery.session.access_token,
+        stored_session.session.access_token
+    );
+    assert_eq!(recovery.session.id_token, stored_session.session.id_token);
+    assert!(recovery.refresh_recovery_pending);
+    assert_eq!(
+        recovery.session.expires_at,
+        Some(0),
+        "recovery records remain refresh-due for marker-ignorant older binaries"
+    );
+
+    // The marker, rather than expiry, forces recovery. This also models a
+    // record which has been written by a newer CLI and then inspected after
+    // its deliberately refresh-due compatibility expiry.
+    recovery.session.expires_at = Some(9_999_999_999);
+    session_manager
+        .save_active(&recovery)
+        .expect("persist recovery session with future expiry");
+
+    let recovered = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        recovery,
+        &fixture.dpop_options,
+    )
+    .expect("retry should refresh with the preserved rotated refresh token");
+
+    discovery.assert();
+    jwks.assert();
+    assert_eq!(discovery_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(recovered.access_token, retried_access_token);
+    assert_eq!(
+        recovered.refresh_token.as_deref(),
+        Some("refresh-token-final")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn healthy_session_load_bypasses_a_held_refresh_lock() {
+    let _lock = crate::lock_test_env();
+    let server = Server::new();
+    let env_cfg = sample_env(&server);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let mut stored = stored_session(
+        "healthy-access-token".to_string(),
+        Some("refresh-token-current"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    stored.session.expires_at = Some(9_999_999_999);
+    let mut session_manager = fixture.session_manager();
+    session_manager.save_active(&stored).expect("save session");
+
+    let held_lock = SessionRefreshLock::acquire().expect("hold refresh lock");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let session_dir = fixture.tempdir.path().to_path_buf();
+    let env = crate::channel::current_env();
+    let worker_env_cfg = env_cfg.clone();
+    let worker_options = fixture.dpop_options.clone();
+    let worker_stored = stored.clone();
+    let worker = std::thread::spawn(move || {
+        let mut manager = SessionManager::with_store(StorageBackend::File(
+            FileStore::new(session_dir).expect("file store"),
+        ));
+        result_tx
+            .send(refresh_loaded_session_if_needed(
+                &mut manager,
+                env,
+                &worker_env_cfg,
+                worker_stored,
+                &worker_options,
+            ))
+            .expect("send healthy load result");
+    });
+
+    let result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(held_lock);
+    worker.join().expect("join healthy-session worker");
+
+    let loaded = result
+        .expect("healthy session should not wait for the refresh lock")
+        .expect("healthy session should load");
+    assert_eq!(loaded, stored.session);
+}
+
+#[cfg(unix)]
+#[test]
+fn simultaneous_expiry_refreshes_are_serialized() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+    let refreshed_access_token = make_verified_token(&env_cfg, json!({}));
+    let (first_refresh_started_tx, first_refresh_started_rx) = std::sync::mpsc::channel();
+    let (complete_first_refresh_tx, complete_first_refresh_rx) = std::sync::mpsc::channel();
+    let complete_first_refresh_rx =
+        std::sync::Arc::new(std::sync::Mutex::new(complete_first_refresh_rx));
+    let complete_first_refresh = std::sync::Arc::clone(&complete_first_refresh_rx);
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+            Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+            Matcher::UrlEncoded("refresh_token".into(), "refresh-token-current".into()),
+            Matcher::UrlEncoded("session_id".into(), "sid-current".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_chunked_body(move |writer| {
+            first_refresh_started_tx
+                .send(())
+                .expect("notify first refresh request started");
+            complete_first_refresh
+                .lock()
+                .expect("lock completion receiver")
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("allow first refresh response");
+            writer.write_all(
+                json!({
+                    "access_token": refreshed_access_token,
+                    "refresh_token": "refresh-token-next",
+                    "expires_in": 3600
+                })
+                .to_string()
+                .as_bytes(),
+            )
+        })
+        .expect(1)
+        .create();
+
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let env = crate::channel::current_env();
+    let stored_session = StoredSession {
+        env,
+        session: Session {
+            access_token: make_verified_token(
+                &env_cfg,
+                json!({ "https://de.scalable.capital/session_id": "sid-current" }),
+            ),
+            refresh_token: Some("refresh-token-current".to_string()),
+            id_token: None,
+            expires_at: Some(0),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(runtime_thumbprint),
+        mode: None,
+        refresh_recovery_pending: false,
+    };
+    let mut initial_manager = SessionManager::with_store(StorageBackend::File(
+        FileStore::new(fixture.tempdir.path().to_path_buf()).expect("file store"),
+    ));
+    initial_manager
+        .save_active(&stored_session)
+        .expect("save active session");
+
+    let session_path = fixture.tempdir.path().to_path_buf();
+    let first_env_cfg = env_cfg.clone();
+    let first_dpop_options = fixture.dpop_options.clone();
+    let first_stored_session = stored_session.clone();
+    let first = std::thread::spawn(move || {
+        let mut manager = SessionManager::with_store(StorageBackend::File(
+            FileStore::new(session_path).expect("file store"),
+        ));
+        refresh_loaded_session_if_needed(
+            &mut manager,
+            env,
+            &first_env_cfg,
+            first_stored_session,
+            &first_dpop_options,
+        )
+    });
+
+    first_refresh_started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("wait for first refresh request");
+
+    let second_path = fixture.tempdir.path().to_path_buf();
+    let second_env_cfg = env_cfg.clone();
+    let second_dpop_options = fixture.dpop_options.clone();
+    let second_stored_session = stored_session.clone();
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (second_finished_tx, second_finished_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        second_started_tx
+            .send(())
+            .expect("notify second refresh start");
+        let mut manager = SessionManager::with_store(StorageBackend::File(
+            FileStore::new(second_path).expect("file store"),
+        ));
+        let result = refresh_loaded_session_if_needed(
+            &mut manager,
+            env,
+            &second_env_cfg,
+            second_stored_session,
+            &second_dpop_options,
+        );
+        second_finished_tx
+            .send(())
+            .expect("notify second refresh completion");
+        result
+    });
+
+    second_started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("wait for second refresh attempt");
+    assert!(matches!(
+        second_finished_rx.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    complete_first_refresh_tx
+        .send(())
+        .expect("complete first refresh response");
+    let first_session = first
+        .join()
+        .expect("join first refresh")
+        .expect("first refresh should succeed");
+    let second_session = second
+        .join()
+        .expect("join second refresh")
+        .expect("second refresh should use the completed session");
+
+    assert_eq!(first_session, second_session);
+    assert_eq!(
+        first_session.refresh_token.as_deref(),
+        Some("refresh-token-next")
+    );
+}
+
+#[test]
+fn refresh_discards_recovery_session_when_the_replacement_access_token_is_rejected() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
+    let _refresh = server
+        .mock("POST", "/oauth/token")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+            Matcher::UrlEncoded("client_id".into(), "client-id".into()),
+            Matcher::UrlEncoded("refresh_token".into(), "refresh-token-current".into()),
+            Matcher::UrlEncoded("session_id".into(), "sid-current".into()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "access_token": "not-a-jwt",
+                "refresh_token": "refresh-token-next",
+                "expires_in": 3600
+            })
+            .to_string(),
+        )
+        .create();
+
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
+    let stored_session = StoredSession {
+        env: crate::channel::current_env(),
+        session: Session {
+            access_token: make_verified_token(
+                &env_cfg,
+                json!({ "https://de.scalable.capital/session_id": "sid-current" }),
+            ),
+            refresh_token: Some("refresh-token-current".to_string()),
+            id_token: None,
+            expires_at: Some(0),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(runtime_thumbprint),
+        mode: None,
+        refresh_recovery_pending: false,
+    };
+    session_manager
+        .save_active(&stored_session)
+        .expect("save active session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        stored_session,
+        &fixture.dpop_options,
+    )
+    .expect_err("malformed replacement access token should require relogin");
+
+    assert!(format!("{err:#}").contains(REFRESH_RELOGIN_REQUIRED_PREFIX));
+    assert_eq!(
+        crate::machine::classify_error(&err).code,
+        "refresh_relogin_required"
+    );
+    assert!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .is_none()
+    );
+}
+
+#[test]
+fn refresh_loaded_session_if_needed_reloads_a_compatible_newer_session_under_lock() {
     let _lock = crate::lock_test_env();
     let mut server = Server::new();
     let env_cfg = sample_env(&server);
@@ -459,16 +1609,9 @@ fn refresh_loaded_session_if_needed_keeps_newer_saved_session_on_relogin_failure
         .with_body(r#"{"error":"invalid_grant","error_description":"reuse detected"}"#)
         .create();
 
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let stale = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -481,6 +1624,7 @@ fn refresh_loaded_session_if_needed_keeps_newer_saved_session_on_relogin_failure
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
         mode: None,
+        refresh_recovery_pending: false,
     };
     let rotated = StoredSession {
         env: crate::channel::current_env(),
@@ -494,27 +1638,87 @@ fn refresh_loaded_session_if_needed_keeps_newer_saved_session_on_relogin_failure
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: None,
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&rotated)
         .expect("save rotated session");
 
-    let err = refresh_loaded_session_if_needed(
+    let refreshed = refresh_loaded_session_if_needed(
         &mut session_manager,
         crate::channel::current_env(),
         &env_cfg,
         stale,
-        &dpop_options,
+        &fixture.dpop_options,
     )
-    .expect_err("refresh should require relogin");
+    .expect("a compatible newer session should be used");
 
-    assert!(format!("{err:#}").contains(REFRESH_RELOGIN_REQUIRED_PREFIX));
+    assert_eq!(refreshed, rotated.session);
     assert_eq!(
         session_manager
             .load_active()
             .expect("load active")
             .expect("rotated session should remain"),
         rotated
+    );
+}
+
+#[test]
+fn refresh_loaded_session_if_needed_rejects_an_incompatible_session_replaced_before_lock() {
+    let _lock = crate::lock_test_env();
+    let server = Server::new();
+    let env_cfg = sample_env(&server);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
+    let stale = StoredSession {
+        env: crate::channel::current_env(),
+        session: Session {
+            access_token: "access-token-stale".to_string(),
+            refresh_token: Some("refresh-token-stale".to_string()),
+            id_token: None,
+            expires_at: Some(0),
+            person_id: "person-1".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
+        mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
+    };
+    let replacement = StoredSession {
+        env: crate::channel::current_env(),
+        session: Session {
+            access_token: "access-token-other".to_string(),
+            refresh_token: Some("refresh-token-other".to_string()),
+            id_token: None,
+            expires_at: Some(9_999_999_999),
+            person_id: "person-2".to_string(),
+            source: LoginSource::DeviceCode,
+        },
+        dpop_jwk_thumbprint: Some(runtime_thumbprint),
+        mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
+    };
+    session_manager
+        .save_active(&replacement)
+        .expect("save replacement session");
+
+    let err = refresh_loaded_session_if_needed(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        stale,
+        &fixture.dpop_options,
+    )
+    .expect_err("a different active identity must not be adopted");
+
+    assert!(format!("{err:#}").contains("different identity or session mode"));
+    assert_eq!(
+        session_manager
+            .load_active()
+            .expect("load active")
+            .expect("replacement session should remain"),
+        replacement
     );
 }
 
@@ -528,16 +1732,9 @@ fn refresh_loaded_session_if_needed_uses_authoritative_newer_saved_session_on_su
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -553,6 +1750,7 @@ fn refresh_loaded_session_if_needed_uses_authoritative_newer_saved_session_on_su
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -573,9 +1771,10 @@ fn refresh_loaded_session_if_needed_uses_authoritative_newer_saved_session_on_su
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let refresh_body_token = refreshed_access_token.clone();
     let _refresh = server
         .mock("POST", "/oauth/token")
@@ -613,7 +1812,7 @@ fn refresh_loaded_session_if_needed_uses_authoritative_newer_saved_session_on_su
         crate::channel::current_env(),
         &env_cfg,
         current,
-        &dpop_options,
+        &fixture.dpop_options,
     )
     .expect("refresh should succeed");
     updater.join().expect("join updater");
@@ -658,16 +1857,9 @@ fn execute_with_refresh_retry_uses_stored_session_snapshot_and_preserves_mode() 
         )
         .create();
 
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current_access_token = make_verified_token(
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-current" }),
@@ -685,6 +1877,7 @@ fn execute_with_refresh_retry_uses_stored_session_snapshot_and_preserves_mode() 
             },
             dpop_jwk_thumbprint: Some(runtime_thumbprint),
             mode: Some(SessionMode::LocalReadOnly),
+            refresh_recovery_pending: false,
         })
         .expect("save current session");
 
@@ -706,7 +1899,7 @@ fn execute_with_refresh_retry_uses_stored_session_snapshot_and_preserves_mode() 
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |token| {
             attempts += 1;
             if attempts == 1 {
@@ -741,16 +1934,9 @@ fn execute_with_refresh_retry_keeps_newer_saved_session_on_relogin_failure() {
     let mut server = Server::new();
     let env_cfg = sample_env(&server);
     let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 1);
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -766,6 +1952,7 @@ fn execute_with_refresh_retry_keeps_newer_saved_session_on_relogin_failure() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -786,9 +1973,10 @@ fn execute_with_refresh_retry_keeps_newer_saved_session_on_relogin_failure() {
         },
         dpop_jwk_thumbprint: current.dpop_jwk_thumbprint.clone(),
         mode: current.mode,
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let _refresh = server
         .mock("POST", "/oauth/token")
         .match_body(Matcher::AllOf(vec![
@@ -829,7 +2017,7 @@ fn execute_with_refresh_retry_keeps_newer_saved_session_on_relogin_failure() {
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |_| Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized")),
     );
     let err = result.expect_err("refresh should require relogin");
@@ -855,16 +2043,9 @@ fn execute_with_refresh_retry_uses_authoritative_newer_saved_session_on_success_
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -880,6 +2061,7 @@ fn execute_with_refresh_retry_uses_authoritative_newer_saved_session_on_success_
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -900,9 +2082,10 @@ fn execute_with_refresh_retry_uses_authoritative_newer_saved_session_on_success_
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let refresh_body_token = refreshed_access_token.clone();
     let _refresh = server
         .mock("POST", "/oauth/token")
@@ -953,7 +2136,7 @@ fn execute_with_refresh_retry_uses_authoritative_newer_saved_session_on_success_
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |token| {
             attempts += 1;
             if attempts == 1 {
@@ -988,16 +2171,9 @@ fn execute_with_refresh_retry_fails_if_active_session_disappears_before_refresh_
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -1013,13 +2189,14 @@ fn execute_with_refresh_retry_fails_if_active_session_disappears_before_refresh_
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
         .expect("save current session");
 
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_delete_after_refresh_start(tmp.path().to_path_buf());
+        spawn_delete_after_refresh_start(fixture.tempdir.path().to_path_buf());
     let _refresh = server
         .mock("POST", "/oauth/token")
         .match_body(Matcher::AllOf(vec![
@@ -1069,7 +2246,7 @@ fn execute_with_refresh_retry_fails_if_active_session_disappears_before_refresh_
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |_| {
             attempts += 1;
             Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized"))
@@ -1102,16 +2279,9 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_identity() {
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -1127,6 +2297,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_identity() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -1147,9 +2318,10 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_identity() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let _refresh = server
         .mock("POST", "/oauth/token")
         .match_body(Matcher::AllOf(vec![
@@ -1199,7 +2371,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_identity() {
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |_| {
             attempts += 1;
             Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized"))
@@ -1233,16 +2405,9 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_mode_only() {
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -1258,6 +2423,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_mode_only() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint.clone()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -1278,9 +2444,10 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_mode_only() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: None,
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let _refresh = server
         .mock("POST", "/oauth/token")
         .match_body(Matcher::AllOf(vec![
@@ -1330,7 +2497,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_changes_mode_only() {
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |_| {
             attempts += 1;
             Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized"))
@@ -1364,16 +2531,9 @@ fn execute_with_refresh_retry_fails_if_race_winner_has_unusable_dpop_binding() {
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -1389,6 +2549,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_has_unusable_dpop_binding() {
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -1409,9 +2570,10 @@ fn execute_with_refresh_retry_fails_if_race_winner_has_unusable_dpop_binding() {
         },
         dpop_jwk_thumbprint: Some("different-thumbprint".to_string()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let refresh_body_token = refreshed_access_token.clone();
     let _refresh = server
         .mock("POST", "/oauth/token")
@@ -1462,7 +2624,7 @@ fn execute_with_refresh_retry_fails_if_race_winner_has_unusable_dpop_binding() {
         crate::channel::current_env(),
         &env_cfg,
         &mut in_memory_session,
-        &dpop_options,
+        &fixture.dpop_options,
         |_| {
             attempts += 1;
             Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized"))
@@ -1497,16 +2659,9 @@ fn refresh_loaded_session_if_needed_fails_if_race_winner_has_unusable_dpop_bindi
         &env_cfg,
         json!({ "https://de.scalable.capital/session_id": "sid-refreshed" }),
     );
-    let config = sample_config();
-    let tmp = tempdir().expect("tempdir");
-    let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
-    let _channel_guard = crate::channel::TestEnvConfigOverrideGuard::set(env_cfg.clone());
-    ensure_runtime_dpop_key(&config);
-    let dpop_options = crate::channel::current_dpop_runtime_options(&config);
-    let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
-    let mut session_manager = SessionManager::with_store(StorageBackend::File(
-        FileStore::new(tmp.path().to_path_buf()).expect("file store"),
-    ));
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let runtime_thumbprint = fixture.dpop_thumbprint.clone();
+    let mut session_manager = fixture.session_manager();
     let current = StoredSession {
         env: crate::channel::current_env(),
         session: Session {
@@ -1522,6 +2677,7 @@ fn refresh_loaded_session_if_needed_fails_if_race_winner_has_unusable_dpop_bindi
         },
         dpop_jwk_thumbprint: Some(runtime_thumbprint),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     session_manager
         .save_active(&current)
@@ -1542,9 +2698,10 @@ fn refresh_loaded_session_if_needed_fails_if_race_winner_has_unusable_dpop_bindi
         },
         dpop_jwk_thumbprint: Some("different-thumbprint".to_string()),
         mode: Some(SessionMode::LocalReadOnly),
+        refresh_recovery_pending: false,
     };
     let (refresh_started_tx, updater_done_rx, updater) =
-        spawn_update_after_refresh_start(tmp.path().to_path_buf(), newer.clone());
+        spawn_update_after_refresh_start(fixture.tempdir.path().to_path_buf(), newer.clone());
     let refresh_body_token = refreshed_access_token.clone();
     let _refresh = server
         .mock("POST", "/oauth/token")
@@ -1582,7 +2739,7 @@ fn refresh_loaded_session_if_needed_fails_if_race_winner_has_unusable_dpop_bindi
         crate::channel::current_env(),
         &env_cfg,
         current,
-        &dpop_options,
+        &fixture.dpop_options,
     )
     .expect_err("refresh should fail when the competing session uses an unusable DPoP key");
     updater.join().expect("join updater");
@@ -1595,4 +2752,84 @@ fn refresh_loaded_session_if_needed_fails_if_race_winner_has_unusable_dpop_bindi
             .expect("newer session should remain"),
         newer
     );
+}
+
+#[test]
+fn portfolio_chart_execution_retries_unauthorized_and_preserves_read_only_session() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let (discovery, jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 2);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let mut manager = SessionManager::with_store(StorageBackend::File(
+        FileStore::new(fixture.tempdir.path().to_path_buf()).expect("file store"),
+    ));
+    let current_token = make_verified_token(
+        &env_cfg,
+        json!({"https://de.scalable.capital/session_id": "sid-current"}),
+    );
+    manager
+        .save_active(&StoredSession {
+            env: crate::channel::current_env(),
+            session: Session {
+                access_token: current_token.clone(),
+                refresh_token: Some("refresh-token".to_string()),
+                id_token: None,
+                expires_at: Some(9_999_999_999),
+                person_id: "person-1".to_string(),
+                source: LoginSource::DeviceCode,
+            },
+            dpop_jwk_thumbprint: Some(fixture.dpop_thumbprint.clone()),
+            mode: Some(SessionMode::LocalReadOnly),
+            refresh_recovery_pending: false,
+        })
+        .expect("save session");
+    let refreshed_token = make_verified_token(&env_cfg, json!({}));
+    let refresh = server.mock("POST", "/oauth/token")
+        .match_body(Matcher::AllOf(vec![Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()), Matcher::UrlEncoded("refresh_token".into(), "refresh-token".into())]))
+        .with_header("content-type", "application/json").with_body(json!({"access_token": refreshed_token, "refresh_token": "refresh-token-next", "expires_in": 3600}).to_string()).expect(1).create();
+    let unauthorized = server
+        .mock("POST", "/")
+        .match_header("authorization", format!("DPoP {current_token}").as_str())
+        .match_body(Matcher::PartialJson(
+            json!({"operation_name": "BrokerPortfolioChart"}),
+        ))
+        .with_status(401)
+        .expect(1)
+        .create();
+    let chart = server.mock("POST", "/").match_header("authorization", format!("DPoP {refreshed_token}").as_str())
+        .match_header("dpop", Matcher::Regex(".+".to_string()))
+        .match_body(Matcher::PartialJson(json!({"operation_name": "BrokerPortfolioChart", "variables": {"accountId": "person-1", "portfolioId": "portfolio-1"}})))
+        .with_header("content-type", "application/json").with_body(json!({"data": {"account": {"id": "person-1", "brokerPortfolio": {"id": "portfolio-1", "timeseries": [{
+            "timeframe": "MAX", "dataPoints": [], "closingReferencePoint": {"valuation": "42.00", "absoluteReturn": "-2.00", "timestampUtc": {"time": "2026-10-09T10:00:00Z"}}
+        }]}}}}).to_string()).expect(1).create();
+    let result = crate::broker_query_execution::execute_broker_chart(
+        crate::cli::BrokerChartArgs {
+            isin: None,
+            portfolio_id: Some("portfolio-1".to_string()),
+            timeframe: crate::cli::BrokerChartTimeframe::Max,
+            json: true,
+        },
+        &fixture.config,
+        &mut manager,
+    )
+    .expect("refreshed chart");
+    assert_eq!(
+        result["result"]["closing_reference_point"]["valuation"],
+        "42.00"
+    );
+    let saved = manager
+        .load_active()
+        .expect("session")
+        .expect("saved session");
+    assert_eq!(saved.mode, Some(SessionMode::LocalReadOnly));
+    assert_eq!(
+        saved.session.refresh_token.as_deref(),
+        Some("refresh-token-next")
+    );
+    unauthorized.assert();
+    refresh.assert();
+    chart.assert();
+    discovery.assert();
+    jwks.assert();
 }

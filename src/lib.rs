@@ -44,8 +44,13 @@ mod trade_confirmation;
 mod trade_controls;
 mod trade_execution;
 mod trade_presentation;
+mod trade_venue;
 pub mod transport_security;
+#[cfg(feature = "channel-prod")]
+mod update_check;
 pub use crate::machine::{human_error_message, user_error_message};
+
+use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, error::ErrorKind};
@@ -215,13 +220,12 @@ fn normalize_watchlist_args(
         command,
         portfolio_id,
         include_year_to_date,
-        quote_source,
         json,
     } = args;
 
     match command {
         Some(BrokerWatchlistCommand::Add(mut add_args)) => {
-            reject_watchlist_list_only_flags(include_year_to_date, quote_source.as_deref())?;
+            reject_watchlist_list_only_flags(include_year_to_date)?;
             if add_args.portfolio_id.is_none() {
                 add_args.portfolio_id = portfolio_id;
             }
@@ -230,12 +234,11 @@ fn normalize_watchlist_args(
                 command: Some(BrokerWatchlistCommand::Add(add_args)),
                 portfolio_id: None,
                 include_year_to_date: false,
-                quote_source: None,
                 json: false,
             })
         }
         Some(BrokerWatchlistCommand::Remove(mut remove_args)) => {
-            reject_watchlist_list_only_flags(include_year_to_date, quote_source.as_deref())?;
+            reject_watchlist_list_only_flags(include_year_to_date)?;
             if remove_args.portfolio_id.is_none() {
                 remove_args.portfolio_id = portfolio_id;
             }
@@ -244,7 +247,6 @@ fn normalize_watchlist_args(
                 command: Some(BrokerWatchlistCommand::Remove(remove_args)),
                 portfolio_id: None,
                 include_year_to_date: false,
-                quote_source: None,
                 json: false,
             })
         }
@@ -252,28 +254,17 @@ fn normalize_watchlist_args(
             command: None,
             portfolio_id,
             include_year_to_date,
-            quote_source,
             json,
         }),
     }
 }
 
-fn reject_watchlist_list_only_flags(
-    include_year_to_date: bool,
-    quote_source: Option<&str>,
-) -> Result<()> {
+fn reject_watchlist_list_only_flags(include_year_to_date: bool) -> Result<()> {
     if include_year_to_date {
         bail!(
             "Broker input invalid: `--include-year-to-date` is only supported for `sc broker watchlist` without `add` or `remove`"
         );
     }
-
-    if quote_source.is_some() {
-        bail!(
-            "Broker input invalid: `--quote-source` is only supported for `sc broker watchlist` without `add` or `remove`"
-        );
-    }
-
     Ok(())
 }
 
@@ -525,6 +516,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             BrokerContextCommand::Show(args) => args.json,
             BrokerContextCommand::Select(args) => args.json,
         },
+        BrokerCommand::Portfolios(args) => args.json,
         BrokerCommand::Overview(args) => args.json,
         BrokerCommand::CashBreakdown(args) => args.json,
         BrokerCommand::Transactions(args) => args.json,
@@ -532,6 +524,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             BrokerTransactionCommand::Details(args) => args.json,
         },
         BrokerCommand::Holdings(args) => args.json,
+        BrokerCommand::OrderVenues(args) => args.json,
         BrokerCommand::PortfolioGroups(args) => match &args.command {
             Some(BrokerPortfolioGroupsCommand::Create(create_args)) => create_args.json,
             Some(BrokerPortfolioGroupsCommand::Update(update_args)) => update_args.json,
@@ -589,14 +582,31 @@ fn run_human_command(
             let dpop_options = crate::channel::current_dpop_runtime_options(config);
             let session_mode = args.local_read_only.then_some(SessionMode::LocalReadOnly);
             validate_env_transport_security(&env_cfg)?;
-            login_with_device_code(session_manager, env, &env_cfg, session_mode, &dpop_options)?;
-            finalize_login_human(
+            run_login_with_update_notice(
                 session_manager,
-                env,
-                &env_cfg,
-                &dpop_options,
-                "device code",
-                session_mode,
+                |session_manager| {
+                    login_with_device_code(
+                        session_manager,
+                        env,
+                        &env_cfg,
+                        session_mode,
+                        &dpop_options,
+                    )
+                    .map(|_| ())
+                },
+                |session_manager| {
+                    finalize_login_human(
+                        session_manager,
+                        env,
+                        &env_cfg,
+                        &dpop_options,
+                        "device code",
+                        session_mode,
+                    )
+                },
+                update_notice_after_login,
+                flush_standard_output,
+                write_update_notice_to_standard_error,
             )?;
         }
         Commands::Logout(_) => {
@@ -652,6 +662,58 @@ fn run_human_command(
     }
 
     Ok(())
+}
+
+fn run_login_with_update_notice<State, Login, Finalize, Check, Flush, WriteNotice>(
+    state: &mut State,
+    login: Login,
+    finalize: Finalize,
+    check: Check,
+    flush_stdout: Flush,
+    write_stderr: WriteNotice,
+) -> Result<()>
+where
+    Login: FnOnce(&mut State) -> Result<()>,
+    Finalize: FnOnce(&mut State) -> Result<()>,
+    Check: FnOnce() -> Option<String>,
+    Flush: FnOnce() -> std::io::Result<()>,
+    WriteNotice: FnOnce(&str) -> std::io::Result<()>,
+{
+    login(state)?;
+    finalize(state)?;
+
+    if let Some(notice) = check() {
+        let _ = flush_stdout();
+        let _ = write_stderr(&notice);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "channel-prod")]
+fn update_notice_after_login() -> Option<String> {
+    crate::update_check::check_for_update_after_login()
+        .map(|update| format_update_notice(&update.available_tag(), &update.installed_version()))
+}
+
+#[cfg(feature = "channel-prod")]
+fn format_update_notice(available_tag: &str, installed_version: &str) -> String {
+    format!(
+        "Update available: {available_tag} (installed: v{installed_version}). Download: https://github.com/ScalableCapital/scalable-cli/releases/tag/{available_tag}\n"
+    )
+}
+
+#[cfg(not(feature = "channel-prod"))]
+fn update_notice_after_login() -> Option<String> {
+    None
+}
+
+fn flush_standard_output() -> std::io::Result<()> {
+    std::io::stdout().flush()
+}
+
+fn write_update_notice_to_standard_error(notice: &str) -> std::io::Result<()> {
+    std::io::stderr().write_all(notice.as_bytes())
 }
 
 fn print_human_json(value: &Value, compact: bool) -> Result<()> {
@@ -763,11 +825,13 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "fixed-term.details",
             "broker.context.show",
             "broker.context.select",
+            "broker.portfolios",
             "broker.overview",
             "broker.cash-breakdown",
             "broker.transactions",
             "broker.transaction.details",
             "broker.holdings",
+            "broker.order-venues",
             "broker.portfolio-groups",
             "broker.portfolio-groups.create",
             "broker.portfolio-groups.update",
@@ -795,6 +859,10 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "capabilities"
         ],
         "command_metadata": {
+            "broker.chart": {
+                "targets": ["security", "portfolio"],
+                "historical_only": true
+            },
             "login": {
                 "human_only": true,
                 "json_supported": false
@@ -806,10 +874,10 @@ fn machine_capabilities(config: &AppConfig) -> Value {
                 "phase_1": "Run trade buy args with exactly one of --amount or --shares, and without --confirm, to preview and receive confirmation id.",
                 "phase_2": "Repeat the same trade buy args with exactly one of --amount or --shares and --confirm <id> to submit, and add --acknowledge-appropriateness-warning when phase 1 requires acknowledgement of an appropriateness warning.",
                 "preferred_output": "json",
-                "phase_1_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
-                "phase_1_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
+                "phase_1_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
+                "phase_2_command_template_json": "sc broker trade buy --isin <ISIN> --amount <AMOUNT> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
+                "phase_1_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
+                "phase_2_command_template_json_shares": "sc broker trade buy --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> [--acknowledge-appropriateness-warning] --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -831,8 +899,8 @@ fn machine_capabilities(config: &AppConfig) -> Value {
                 "phase_1": "Run trade sell args without --confirm to preview and receive confirmation id.",
                 "phase_2": "Repeat the same trade sell args with --confirm <id> to submit.",
                 "preferred_output": "json",
-                "phase_1_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> --json",
+                "phase_1_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
+                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -907,6 +975,7 @@ fn broker_machine_command_name(command: &BrokerCommand) -> &'static str {
             BrokerContextCommand::Show(_) => "broker.context.show",
             BrokerContextCommand::Select(_) => "broker.context.select",
         },
+        BrokerCommand::Portfolios(_) => "broker.portfolios",
         BrokerCommand::Overview(_) => "broker.overview",
         BrokerCommand::CashBreakdown(_) => "broker.cash-breakdown",
         BrokerCommand::Transactions(_) => "broker.transactions",
@@ -914,6 +983,7 @@ fn broker_machine_command_name(command: &BrokerCommand) -> &'static str {
             BrokerTransactionCommand::Details(_) => "broker.transaction.details",
         },
         BrokerCommand::Holdings(_) => "broker.holdings",
+        BrokerCommand::OrderVenues(_) => "broker.order-venues",
         BrokerCommand::PortfolioGroups(args) => match &args.command {
             Some(BrokerPortfolioGroupsCommand::Create(_)) => "broker.portfolio-groups.create",
             Some(BrokerPortfolioGroupsCommand::Update(_)) => "broker.portfolio-groups.update",
@@ -1021,7 +1091,9 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::ffi::OsString;
+    use std::rc::Rc;
 
     use mockito::Server;
     use tempfile::tempdir;
@@ -1060,6 +1132,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn recorded_events() -> Rc<RefCell<Vec<String>>> {
+        Rc::new(RefCell::new(Vec::new()))
+    }
+
+    #[test]
+    fn login_failure_skips_finalization_check_and_output() {
+        let events = recorded_events();
+        let login_events = Rc::clone(&events);
+
+        let result = run_login_with_update_notice(
+            &mut (),
+            move |_| {
+                login_events.borrow_mut().push("login".to_string());
+                bail!("login failed")
+            },
+            |_| panic!("finalization must not run"),
+            || panic!("update check must not run"),
+            || panic!("stdout flush must not run"),
+            |_| panic!("stderr write must not run"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(events.borrow().as_slice(), ["login"]);
+    }
+
+    #[test]
+    fn finalization_failure_skips_check_and_output() {
+        let events = recorded_events();
+        let login_events = Rc::clone(&events);
+        let finalize_events = Rc::clone(&events);
+
+        let result = run_login_with_update_notice(
+            &mut (),
+            move |_| {
+                login_events.borrow_mut().push("login".to_string());
+                Ok(())
+            },
+            move |_| {
+                finalize_events.borrow_mut().push("finalize".to_string());
+                bail!("finalization failed")
+            },
+            || panic!("update check must not run"),
+            || panic!("stdout flush must not run"),
+            |_| panic!("stderr write must not run"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(events.borrow().as_slice(), ["login", "finalize"]);
+    }
+
+    #[test]
+    fn completed_login_flushes_then_writes_the_exact_update_notice() {
+        let events = recorded_events();
+        let login_events = Rc::clone(&events);
+        let finalize_events = Rc::clone(&events);
+        let check_events = Rc::clone(&events);
+        let flush_events = Rc::clone(&events);
+        let write_events = Rc::clone(&events);
+        let expected = "Update available: v1.2.0 (installed: v1.1.0). Download: https://github.com/ScalableCapital/scalable-cli/releases/tag/v1.2.0\n";
+
+        let result = run_login_with_update_notice(
+            &mut (),
+            move |_| {
+                login_events.borrow_mut().push("login".to_string());
+                Ok(())
+            },
+            move |_| {
+                finalize_events.borrow_mut().push("finalize".to_string());
+                Ok(())
+            },
+            move || {
+                check_events.borrow_mut().push("check".to_string());
+                Some(expected.to_string())
+            },
+            move || {
+                flush_events.borrow_mut().push("flush".to_string());
+                Ok(())
+            },
+            move |notice| {
+                assert_eq!(notice, expected);
+                write_events.borrow_mut().push("write".to_string());
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["login", "finalize", "check", "flush", "write"]
+        );
+    }
+
+    #[test]
+    fn update_output_failures_do_not_change_a_completed_login() {
+        let result = run_login_with_update_notice(
+            &mut (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Some("notice\n".to_string()),
+            || Err(std::io::Error::other("stdout closed")),
+            |_| Err(std::io::Error::other("stderr closed")),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_update_skips_output_operations_after_a_completed_login() {
+        let result = run_login_with_update_notice(
+            &mut (),
+            |_| Ok(()),
+            |_| Ok(()),
+            || None,
+            || panic!("stdout flush must not run"),
+            |_| panic!("stderr write must not run"),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "channel-prod")]
+    #[test]
+    fn update_notice_has_the_documented_exact_format() {
+        assert_eq!(
+            format_update_notice("v1.2.0", "1.1.0"),
+            "Update available: v1.2.0 (installed: v1.1.0). Download: https://github.com/ScalableCapital/scalable-cli/releases/tag/v1.2.0\n"
+        );
     }
 
     #[test]
@@ -1117,6 +1318,7 @@ mod tests {
                 },
                 dpop_jwk_thumbprint: Some("thumbprint-1".to_string()),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
 
@@ -1201,7 +1403,8 @@ mod tests {
     fn broker_chart_machine_command_name_and_json_flag_are_wired() {
         let command = Commands::Broker(crate::cli::BrokerArgs {
             command: BrokerCommand::Chart(crate::cli::BrokerChartArgs {
-                isin: "US0378331005".to_string(),
+                isin: Some("US0378331005".to_string()),
+                portfolio_id: None,
                 timeframe: crate::cli::BrokerChartTimeframe::OneMonth,
                 json: true,
             }),
@@ -1209,6 +1412,19 @@ mod tests {
 
         assert!(command_requests_json_envelope(&command));
         assert_eq!(machine_command_name(&command), "broker.chart");
+    }
+
+    #[test]
+    fn broker_order_venues_machine_command_name_and_json_flag_are_wired() {
+        let command = Commands::Broker(crate::cli::BrokerArgs {
+            command: BrokerCommand::OrderVenues(crate::cli::BrokerOrderVenuesArgs {
+                portfolio_id: Some("portfolio-1".to_string()),
+                json: true,
+            }),
+        });
+
+        assert!(command_requests_json_envelope(&command));
+        assert_eq!(machine_command_name(&command), "broker.order-venues");
     }
 
     #[test]
@@ -1524,40 +1740,6 @@ mod tests {
             },
             _ => panic!("expected broker watchlist command"),
         }
-    }
-
-    #[test]
-    fn watchlist_remove_rejects_list_only_flags_on_mutation_path() {
-        let Cli { command } = Cli::parse_from([
-            "sc",
-            "broker",
-            "watchlist",
-            "--quote-source",
-            "CONSOLIDATED",
-            "remove",
-            "--isin",
-            "US0378331005",
-        ]);
-
-        let err = normalize_command(command).unwrap_err();
-        assert!(err.to_string().contains("--quote-source"));
-    }
-
-    #[test]
-    fn watchlist_add_rejects_blank_quote_source_on_mutation_path() {
-        let Cli { command } = Cli::parse_from([
-            "sc",
-            "broker",
-            "watchlist",
-            "--quote-source",
-            "",
-            "add",
-            "--isin",
-            "US0378331005",
-        ]);
-
-        let err = normalize_command(command).unwrap_err();
-        assert!(err.to_string().contains("--quote-source"));
     }
 
     #[test]

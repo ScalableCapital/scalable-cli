@@ -180,6 +180,21 @@ fn help_shows_broker() {
 }
 
 #[test]
+fn broker_help_shows_portfolio_discovery() {
+    let (_tmp, config_dir) = temp_config_dir();
+
+    sc_command()
+        .env("SC_CONFIG_DIR", &config_dir)
+        .args(["broker", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("portfolios"))
+        .stdout(predicate::str::contains(
+            "List accessible broker portfolios and their resolution state",
+        ));
+}
+
+#[test]
 fn broker_transactions_help_lists_valid_filter_values() {
     let (_tmp, config_dir) = temp_config_dir();
 
@@ -566,6 +581,16 @@ fn broker_overview_without_session_fails() {
 #[test]
 fn broker_overview_json_without_session_returns_no_session_code() {
     assert_json_no_session(&["broker", "overview", "--json"], "broker.overview");
+}
+
+#[test]
+fn broker_portfolios_json_without_session_returns_no_session_code() {
+    assert_json_no_session(&["broker", "portfolios", "--json"], "broker.portfolios");
+}
+
+#[test]
+fn broker_order_venues_json_without_session_returns_no_session_code() {
+    assert_json_no_session(&["broker", "order-venues", "--json"], "broker.order-venues");
 }
 
 #[test]
@@ -1172,93 +1197,6 @@ fn broker_savings_plans_remove_json_invalid_isin_returns_savings_plan_input_inva
 }
 
 #[test]
-fn broker_watchlist_add_rejects_list_only_flags_before_subcommand() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config_dir = tmp.path().to_string_lossy().to_string();
-    write_test_config(tmp.path());
-
-    sc_command()
-        .env("SC_CONFIG_DIR", &config_dir)
-        .args([
-            "broker",
-            "watchlist",
-            "--quote-source",
-            "CONSOLIDATED",
-            "add",
-            "--isin",
-            "US0378331005",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--quote-source"));
-}
-
-#[test]
-fn broker_watchlist_add_parent_json_invalid_flags_return_validation_envelope() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config_dir = tmp.path().to_string_lossy().to_string();
-    write_test_config(tmp.path());
-
-    sc_command()
-        .env("SC_CONFIG_DIR", &config_dir)
-        .args([
-            "broker",
-            "watchlist",
-            "--json",
-            "--quote-source",
-            "CONSOLIDATED",
-            "add",
-            "--isin",
-            "US0378331005",
-        ])
-        .assert()
-        .code(10)
-        .stdout(predicate::str::contains(
-            "\"command\":\"broker.watchlist.add\"",
-        ))
-        .stdout(predicate::str::contains(
-            "\"code\":\"broker_input_invalid\"",
-        ))
-        .stdout(predicate::str::contains(
-            "\"hints\":[\"Check broker command inputs and retry.\"]",
-        ))
-        .stderr(predicate::str::is_empty());
-}
-
-#[test]
-fn broker_watchlist_add_parent_json_blank_quote_source_returns_validation_envelope() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config_dir = tmp.path().to_string_lossy().to_string();
-    write_test_config(tmp.path());
-
-    sc_command()
-        .env("SC_CONFIG_DIR", &config_dir)
-        .args([
-            "broker",
-            "watchlist",
-            "--json",
-            "--quote-source",
-            "",
-            "add",
-            "--isin",
-            "US0378331005",
-        ])
-        .assert()
-        .code(10)
-        .stdout(predicate::str::contains(
-            "\"command\":\"broker.watchlist.add\"",
-        ))
-        .stdout(predicate::str::contains(
-            "\"code\":\"broker_input_invalid\"",
-        ))
-        .stdout(predicate::str::contains(
-            "\"hints\":[\"Check broker command inputs and retry.\"]",
-        ))
-        .stdout(predicate::str::contains("--quote-source"))
-        .stderr(predicate::str::is_empty());
-}
-
-#[test]
 fn broker_savings_plans_json_without_session_returns_no_session_code() {
     assert_json_no_session(
         &["broker", "savings-plans", "--json"],
@@ -1544,6 +1482,72 @@ fn broker_trade_buy_with_shares_without_session_fails() {
 }
 
 #[test]
+fn broker_trade_stop_limit_validates_both_prices_before_session_lookup() {
+    for sizing in [
+        vec!["buy", "--amount", "1000"],
+        vec!["buy", "--shares", "9"],
+        vec!["sell", "--shares", "2.5"],
+    ] {
+        for confirm in [false, true] {
+            for (limit, stop, code) in [
+                (Some("110"), Some("105"), "no_session"),
+                (Some("105"), Some("105"), "no_session"),
+                (Some("90"), Some("105"), "no_session"),
+                (None, Some("105"), "trade_input_invalid"),
+                (Some("110"), None, "trade_input_invalid"),
+                (Some(" "), Some("105"), "trade_input_invalid"),
+                (Some("110"), Some(" "), "trade_input_invalid"),
+                (Some("NaN"), Some("105"), "trade_input_invalid"),
+                (Some("110"), Some("inf"), "trade_input_invalid"),
+                (Some("0"), Some("105"), "trade_input_invalid"),
+                (Some("110"), Some("-1"), "trade_input_invalid"),
+                (Some("bad"), Some("105"), "trade_input_invalid"),
+            ] {
+                let code = if confirm && code == "no_session" {
+                    "confirmation_not_found"
+                } else {
+                    code
+                };
+                let tmp = tempfile::tempdir().expect("tempdir");
+                write_test_config(tmp.path());
+                let mut args: Vec<String> = ["broker", "trade"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                args.extend(sizing.iter().map(|arg| arg.to_string()));
+                args.extend(
+                    [
+                        "--isin",
+                        "DE0007100000",
+                        "--order-type",
+                        "stop-limit",
+                        "--json",
+                    ]
+                    .into_iter()
+                    .map(str::to_string),
+                );
+                if let Some(limit) = limit {
+                    args.push(format!("--limit-price={limit}"));
+                }
+                if let Some(stop) = stop {
+                    args.push(format!("--stop-price={stop}"));
+                }
+                if confirm {
+                    args.extend(["--confirm", "scb1_test"].into_iter().map(str::to_string));
+                }
+                sc_command()
+                    .env("SC_CONFIG_DIR", tmp.path())
+                    .env("SC_SESSION_BACKEND", "file")
+                    .args(args)
+                    .assert()
+                    .failure()
+                    .stdout(predicate::str::contains(format!("\"code\":\"{code}\"")));
+            }
+        }
+    }
+}
+
+#[test]
 fn broker_trade_buy_json_without_session_returns_no_session_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_dir = tmp.path().to_string_lossy().to_string();
@@ -1787,4 +1791,41 @@ fn login_rejects_removed_env_flag() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--env"));
+}
+
+#[test]
+fn portfolio_chart_json_without_session_returns_no_session_code() {
+    for args in [
+        vec!["broker", "chart", "--timeframe", "1y", "--json"],
+        vec![
+            "broker",
+            "chart",
+            "--portfolio-id",
+            "port-1",
+            "--timeframe",
+            "max",
+            "--json",
+        ],
+    ] {
+        assert_json_no_session(&args, "broker.chart");
+    }
+}
+
+#[test]
+fn portfolio_chart_blank_id_and_isin_fail_before_session_resolution() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_test_config(tmp.path());
+    for flag in ["--portfolio-id", "--isin"] {
+        let output = sc_command()
+            .env("SC_CONFIG_DIR", tmp.path())
+            .args(["broker", "chart", flag, " ", "--timeframe", "1y", "--json"])
+            .assert()
+            .failure()
+            .code(10);
+        let envelope: Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("envelope");
+        assert_eq!(envelope["command"], "broker.chart");
+        assert_eq!(envelope["error"]["code"], "broker_input_invalid");
+        assert!(output.get_output().stderr.is_empty());
+    }
 }

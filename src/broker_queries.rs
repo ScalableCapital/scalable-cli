@@ -48,16 +48,33 @@ const VALID_BROKER_TRANSACTION_STATUSES: &[&str] = &[
     "CONFIRMED",
 ];
 
+const CRYPTO_TRANSACTION_STATUSES: &[&str] = &[
+    "REQUESTED",
+    "PENDING",
+    "PARTIAL_FILLED",
+    "FILLED",
+    "SETTLED",
+    "CANCELLED",
+    "CANCEL_REQUESTED",
+    "EXPIRED",
+    "REJECTED",
+    "CONFIRMED",
+];
+
+const CONSOLIDATED_MARKET_DATA_SOURCE: &str = "CONSOLIDATED";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NormalizedBrokerTransactionsQueryInput {
     pub(crate) page_size: u16,
     pub(crate) cursor: Option<String>,
+    pub(crate) crypto_cursor: Option<String>,
     pub(crate) type_filter: Option<Vec<String>>,
     pub(crate) status: Option<Vec<String>>,
     pub(crate) search_term: Option<String>,
     pub(crate) from_time_seconds: Option<i64>,
     pub(crate) to_time_seconds: Option<i64>,
     pub(crate) isin: Option<String>,
+    pub(crate) crypto_ticker: Option<String>,
     pub(crate) include_reinvestment_subtypes: bool,
 }
 
@@ -153,7 +170,7 @@ query BrokerHoldings(
   $accountId: ID!
   $portfolioId: ID!
   $includeYearToDate: Boolean!
-  $quoteSource: MarketDataSource
+  $quoteSource: MarketDataSource!
 ) {
   account(id: $accountId) {
     brokerPortfolio(id: $portfolioId) {
@@ -184,6 +201,41 @@ query BrokerHoldings(
           }
         }
       }
+      crypto {
+        coins {
+          ticker
+          name
+          position {
+            filled
+            sellable
+            pending
+          }
+          inventory {
+            isin
+            etpSecurity {
+              name
+              inventory {
+                position {
+                  blocked
+                  filled
+                  pending
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+pub const BROKER_ORDER_VENUES_QUERY: &str = r#"
+query BrokerOrderVenues($portfolioId: ID!) {
+  venues(portfolioId: $portfolioId) {
+    venues {
+      mic
+      emic
     }
   }
 }
@@ -216,11 +268,41 @@ query BrokerChart($isin: String!, $timeFrames: [TimeFrame!]!, $includeYearToDate
 }
 "#;
 
+pub const BROKER_PORTFOLIO_CHART_QUERY: &str = r#"
+query BrokerPortfolioChart($accountId: ID!, $portfolioId: ID!) {
+  account(id: $accountId) {
+    id
+    brokerPortfolio(id: $portfolioId) {
+      id
+      timeseries(includeYearToDate: true) {
+        timeframe
+        closingReferencePoint {
+          valuation
+          absoluteReturn
+          timestampUtc { time }
+        }
+        dataPoints {
+          valuation
+          absoluteReturn
+          timestampUtc { time }
+        }
+      }
+    }
+  }
+}
+"#;
+
 pub const BROKER_TRANSACTIONS_QUERY: &str = r#"
-query BrokerTransactions($accountId: ID!, $portfolioId: ID!, $input: BrokerTransactionInput!) {
+query BrokerTransactions(
+  $accountId: ID!
+  $portfolioId: ID!
+  $brokerInput: BrokerTransactionInput!
+  $cryptoInput: CryptoTransactionInput!
+  $includeCrypto: Boolean!
+) {
   account(id: $accountId) {
     brokerPortfolio(id: $portfolioId) {
-      moreTransactions(input: $input) {
+      moreTransactions(input: $brokerInput) {
         cursor
         total
         transactions {
@@ -233,11 +315,6 @@ query BrokerTransactions($accountId: ID!, $portfolioId: ID!, $input: BrokerTrans
           lastEventDateTime
           description
           custodian
-          documents {
-            id
-            url
-            label
-          }
           ... on BrokerSecurityTransactionSummary {
             isin
             securityTransactionType
@@ -267,6 +344,35 @@ query BrokerTransactions($accountId: ID!, $portfolioId: ID!, $input: BrokerTrans
           }
         }
       }
+      crypto @include(if: $includeCrypto) {
+        moreTransactions(input: $cryptoInput) {
+          cursor
+          total
+          transactions {
+            __typename
+            id
+            currency
+            type
+            status
+            lastEventDateTime
+            description
+            ... on CryptoSecurityTransactionSummary {
+              ticker
+              securityTransactionType
+              coinQuantity
+              quantity
+              amount
+              side
+            }
+            ... on CryptoNonTradeSecurityTransactionSummary {
+              nonTradeSecurityTransactionType
+              coinQuantity
+              quantity
+              amount
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -281,11 +387,6 @@ query BrokerTransactionDetails($accountId: ID!, $portfolioId: ID!, $transactionI
         id
         currency
         type
-        documents {
-          id
-          url
-          label
-        }
         lastEventDateTime
         isPending
         isCancellation
@@ -442,7 +543,7 @@ query BrokerWatchlist(
   $accountId: ID!
   $portfolioId: ID!
   $includeYearToDate: Boolean!
-  $quoteSource: MarketDataSource
+  $quoteSource: MarketDataSource!
 ) {
   account(id: $accountId) {
     brokerPortfolio(id: $portfolioId) {
@@ -502,7 +603,7 @@ query BrokerSecuritySearch(
   $portfolioId: ID!
   $searchTerm: String!
   $includeYearToDate: Boolean!
-  $quoteSource: MarketDataSource
+  $quoteSource: MarketDataSource!
 ) {
   account(id: $accountId) {
     brokerPortfolio(id: $portfolioId) {
@@ -629,7 +730,7 @@ query BrokerQuote(
   $portfolioId: ID!
   $isin: ID!
   $includeYearToDate: Boolean!
-  $quoteSource: MarketDataSource
+  $quoteSource: MarketDataSource!
 ) {
   account(id: $accountId) {
     brokerPortfolio(id: $portfolioId) {
@@ -1010,16 +1111,10 @@ pub struct BrokerInput {
     account_id: String,
     portfolio_id: String,
     include_year_to_date: bool,
-    quote_source: Option<String>,
 }
 
 impl BrokerInput {
-    pub fn new(
-        account_id: &str,
-        portfolio_id: &str,
-        include_year_to_date: bool,
-        quote_source: Option<&str>,
-    ) -> Result<Self> {
+    pub fn new(account_id: &str, portfolio_id: &str, include_year_to_date: bool) -> Result<Self> {
         let account_id = account_id.trim();
         let portfolio_id = portfolio_id.trim();
         if account_id.is_empty() {
@@ -1033,16 +1128,10 @@ impl BrokerInput {
             ));
         }
 
-        let quote_source = quote_source
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string);
-
         Ok(Self {
             account_id: account_id.to_string(),
             portfolio_id: portfolio_id.to_string(),
             include_year_to_date,
-            quote_source,
         })
     }
 
@@ -1121,8 +1210,19 @@ pub fn broker_holdings_variables(input: &BrokerInput) -> Result<Value> {
         "accountId": input.account_id,
         "portfolioId": input.portfolio_id,
         "includeYearToDate": input.include_year_to_date,
-        "quoteSource": input.quote_source,
+        "quoteSource": CONSOLIDATED_MARKET_DATA_SOURCE,
     }))
+}
+
+pub fn broker_order_venues_variables(portfolio_id: &str) -> Result<Value> {
+    let portfolio_id = portfolio_id.trim();
+    if portfolio_id.is_empty() {
+        return Err(anyhow!(
+            "Broker input invalid: field 'portfolio_id' must be a non-empty string"
+        ));
+    }
+
+    Ok(json!({ "portfolioId": portfolio_id }))
 }
 
 pub fn broker_chart_variables(isin: &str, timeframe: BrokerChartTimeframe) -> Result<Value> {
@@ -1135,16 +1235,70 @@ pub fn broker_chart_variables(isin: &str, timeframe: BrokerChartTimeframe) -> Re
     }))
 }
 
+pub(crate) enum BrokerChartTarget {
+    Security { isin: String },
+    Portfolio { portfolio_id: Option<String> },
+}
+
+pub(crate) fn normalize_broker_chart_target(
+    isin: Option<&str>,
+    portfolio_id: Option<&str>,
+) -> Result<BrokerChartTarget> {
+    match (isin, portfolio_id) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "Broker input invalid: 'isin' and 'portfolio_id' are mutually exclusive"
+        )),
+        (Some(isin), None) => Ok(BrokerChartTarget::Security {
+            isin: normalize_broker_isin(isin, "isin")?,
+        }),
+        (None, portfolio_id) => {
+            let portfolio_id = portfolio_id
+                .map(|id| {
+                    let id = id.trim();
+                    if id.is_empty() {
+                        Err(anyhow!(
+                            "Broker input invalid: field 'portfolio_id' must be a non-empty string"
+                        ))
+                    } else {
+                        Ok(id.to_string())
+                    }
+                })
+                .transpose()?;
+            Ok(BrokerChartTarget::Portfolio { portfolio_id })
+        }
+    }
+}
+
+pub fn broker_portfolio_chart_variables(input: &BrokerInput) -> Value {
+    json!({ "accountId": input.account_id, "portfolioId": input.portfolio_id })
+}
+
+pub(crate) fn validate_broker_chart_amount(value: Option<&Value>, field: &str) -> Result<Value> {
+    match value {
+        Some(Value::Number(number)) => Ok(Value::Number(number.clone())),
+        Some(Value::String(raw))
+            if parse_decimal_components(raw, field, true, "decimal").is_ok() =>
+        {
+            Ok(Value::String(raw.clone()))
+        }
+        _ => Err(anyhow!(
+            "Broker response invalid: {field} must be a decimal number or string"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn normalize_broker_transactions_query_input(
     page_size: u16,
     cursor: Option<&str>,
+    crypto_cursor: Option<&str>,
     type_filter: &[String],
     status: &[String],
     search_term: Option<&str>,
     from_time: Option<&str>,
     to_time: Option<&str>,
     isin: Option<&str>,
+    crypto_ticker: Option<&str>,
     include_reinvestment_subtypes: bool,
 ) -> Result<NormalizedBrokerTransactionsQueryInput> {
     if page_size == 0 || page_size > 100 {
@@ -1154,6 +1308,7 @@ pub(crate) fn normalize_broker_transactions_query_input(
     }
 
     let normalized_cursor = normalize_optional_non_empty_string(cursor);
+    let normalized_crypto_cursor = normalize_optional_non_empty_string(crypto_cursor);
     let normalized_type_filter = normalize_enum_filter_values(type_filter, "type_filter")?;
     validate_enum_filter_values(
         normalized_type_filter.as_deref(),
@@ -1168,6 +1323,8 @@ pub(crate) fn normalize_broker_transactions_query_input(
     )?;
     let normalized_search_term = normalize_optional_non_empty_string(search_term);
     let normalized_isin = normalize_optional_non_empty_string(isin);
+    let normalized_crypto_ticker =
+        normalize_optional_non_empty_string(crypto_ticker).map(|value| value.to_ascii_uppercase());
 
     let from_time_parsed = from_time
         .map(|value| parse_iso_8601_timestamp(value, "from_time"))
@@ -1188,12 +1345,14 @@ pub(crate) fn normalize_broker_transactions_query_input(
     Ok(NormalizedBrokerTransactionsQueryInput {
         page_size,
         cursor: normalized_cursor,
+        crypto_cursor: normalized_crypto_cursor,
         type_filter: normalized_type_filter,
         status: normalized_status,
         search_term: normalized_search_term,
         from_time_seconds,
         to_time_seconds,
         isin: normalized_isin,
+        crypto_ticker: normalized_crypto_ticker,
         include_reinvestment_subtypes,
     })
 }
@@ -1202,7 +1361,18 @@ pub(crate) fn broker_transactions_variables_from_normalized(
     input: &BrokerInput,
     normalized: &NormalizedBrokerTransactionsQueryInput,
 ) -> Value {
-    let query_input = json!({
+    let crypto_status: Option<Vec<&str>> = normalized.status.as_ref().map(|statuses| {
+        statuses
+            .iter()
+            .map(String::as_str)
+            .filter(|status| CRYPTO_TRANSACTION_STATUSES.contains(status))
+            .collect()
+    });
+    // An unsupported-only filter must skip crypto, never become an unfiltered request.
+    let include_crypto = crypto_status
+        .as_ref()
+        .is_none_or(|statuses| !statuses.is_empty());
+    let broker_input = json!({
         "pageSize": normalized.page_size,
         "cursor": normalized.cursor.clone(),
         "type": normalized.type_filter.clone(),
@@ -1213,11 +1383,24 @@ pub(crate) fn broker_transactions_variables_from_normalized(
         "isin": normalized.isin.clone(),
         "includeReinvestmentSubtypes": normalized.include_reinvestment_subtypes,
     });
+    let crypto_input = json!({
+        "pageSize": normalized.page_size,
+        "cursor": normalized.crypto_cursor.clone(),
+        "type": normalized.type_filter.clone(),
+        "status": crypto_status,
+        "searchTerm": normalized.search_term.clone(),
+        "fromTime": normalized.from_time_seconds,
+        "toTime": normalized.to_time_seconds,
+        "coin": normalized.crypto_ticker.clone(),
+        "includeReinvestmentSubtypes": normalized.include_reinvestment_subtypes,
+    });
 
     json!({
         "accountId": input.account_id,
         "portfolioId": input.portfolio_id,
-        "input": query_input,
+        "brokerInput": broker_input,
+        "cryptoInput": crypto_input,
+        "includeCrypto": include_crypto,
     })
 }
 

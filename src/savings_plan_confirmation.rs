@@ -613,13 +613,18 @@ mod tests {
 
     struct EnvGuard {
         previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(path: &Path) -> Self {
+            let lock = crate::lock_test_env();
             let previous = std::env::var("SC_CONFIG_DIR").ok();
             unsafe { std::env::set_var("SC_CONFIG_DIR", path) };
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -632,11 +637,28 @@ mod tests {
         }
     }
 
-    fn setup() -> (TempDir, EnvGuard, std::sync::MutexGuard<'static, ()>) {
-        let lock = crate::lock_test_env();
+    fn setup() -> (TempDir, EnvGuard) {
         let temp = tempfile::tempdir().expect("temp config dir");
         let guard = EnvGuard::set(temp.path());
-        (temp, guard, lock)
+        (temp, guard)
+    }
+
+    #[test]
+    fn config_dir_guard_holds_environment_lock_until_restoration() {
+        let (temp, guard) = setup();
+        let previous = guard.previous.clone();
+        assert!(matches!(
+            crate::test_env_mutex().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert_eq!(
+            std::env::var_os("SC_CONFIG_DIR").as_deref(),
+            Some(temp.path().as_os_str())
+        );
+
+        drop(guard);
+        let _lock = crate::lock_test_env();
+        assert_eq!(std::env::var("SC_CONFIG_DIR").ok(), previous);
     }
 
     fn sample_confirmation(id: &str) -> SavingsPlanConfirmation {
@@ -656,7 +678,7 @@ mod tests {
 
     #[test]
     fn pending_confirmation_round_trips_and_replaces_prior_pending_state() {
-        let (_temp, _guard, _lock) = setup();
+        let (_temp, _guard) = setup();
         store_pending(sample_confirmation("scsp1_first")).expect("save first");
         store_pending(sample_confirmation("scsp1_second")).expect("replace pending");
 
@@ -667,7 +689,7 @@ mod tests {
 
     #[test]
     fn submission_started_blocks_preview_until_matching_list_inspection_after_guard_releases() {
-        let (_temp, _guard, _lock) = setup();
+        let (_temp, _guard) = setup();
         let confirmation = sample_confirmation("scsp1_started");
         let checksum = confirmation.snapshot_checksum.clone();
         store_pending(confirmation).expect("save pending");
@@ -691,7 +713,7 @@ mod tests {
 
     #[test]
     fn unknown_submission_survives_logout_and_clears_only_for_matching_binding() {
-        let (_temp, _guard, _lock) = setup();
+        let (_temp, _guard) = setup();
         let confirmation = sample_confirmation("scsp1_unknown");
         let checksum = confirmation.snapshot_checksum.clone();
         store_pending(confirmation).expect("save pending");
@@ -723,7 +745,7 @@ mod tests {
 
     #[test]
     fn corrupt_store_fails_with_stable_error_prefix() {
-        let (_temp, _guard, _lock) = setup();
+        let (_temp, _guard) = setup();
         let path = confirmation_file_path().expect("path");
         fs::write(path, "not-json").expect("write corrupt fixture");
 
@@ -736,7 +758,7 @@ mod tests {
 
     #[test]
     fn tampered_pending_snapshot_fails_checksum_validation() {
-        let (_temp, _guard, _lock) = setup();
+        let (_temp, _guard) = setup();
         store_pending(sample_confirmation("scsp1_tampered")).expect("save pending");
         let path = confirmation_file_path().expect("path");
         let mut stored: Value =

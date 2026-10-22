@@ -21,7 +21,9 @@ use crate::broker_query_execution::{
     execute_broker_chart as execute_broker_chart_query,
     execute_broker_derivatives_search as execute_broker_derivatives_search_query,
     execute_broker_holdings as execute_broker_holdings_query,
+    execute_broker_order_venues as execute_broker_order_venues_query,
     execute_broker_overview as execute_broker_overview_query,
+    execute_broker_portfolios as execute_broker_portfolios_query,
     execute_broker_price_alerts as execute_broker_price_alerts_query,
     execute_broker_quote as execute_broker_quote_query,
     execute_broker_savings_plans as execute_broker_savings_plans_query,
@@ -252,6 +254,13 @@ pub(crate) fn run_broker_command_human(
                 }
             }
         },
+        BrokerCommand::Portfolios(portfolios_args) => {
+            let payload =
+                execute_broker_portfolios_query(portfolios_args, config, session_manager)?;
+            Ok(HumanBrokerOutput::Text(render_broker_portfolios_text(
+                &payload,
+            )))
+        }
         BrokerCommand::Overview(overview_args) => {
             let compact = overview_args.json;
             let payload = execute_broker_overview(overview_args, config, session_manager)?;
@@ -291,6 +300,11 @@ pub(crate) fn run_broker_command_human(
         BrokerCommand::Holdings(holdings_args) => {
             let compact = holdings_args.json;
             let payload = execute_broker_holdings(holdings_args, config, session_manager)?;
+            Ok(HumanBrokerOutput::Json(payload, compact))
+        }
+        BrokerCommand::OrderVenues(order_venues_args) => {
+            let compact = order_venues_args.json;
+            let payload = execute_broker_order_venues(order_venues_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
         }
         BrokerCommand::PortfolioGroups(portfolio_groups_args) => {
@@ -376,7 +390,6 @@ pub(crate) fn run_broker_command_human(
                 command,
                 portfolio_id,
                 include_year_to_date,
-                quote_source,
                 json,
             } = watchlist_args;
             match command {
@@ -397,7 +410,6 @@ pub(crate) fn run_broker_command_human(
                             command: None,
                             portfolio_id,
                             include_year_to_date,
-                            quote_source,
                             json,
                         },
                         config,
@@ -421,13 +433,14 @@ pub(crate) fn run_broker_command_human(
             }
         },
         BrokerCommand::Chart(chart_args) => {
-            let compact = chart_args.json;
             let payload = execute_broker_chart(chart_args, config, session_manager)?;
-            if compact {
-                Ok(HumanBrokerOutput::Json(payload, true))
-            } else {
-                Ok(HumanBrokerOutput::Text(render_broker_chart_text(&payload)))
-            }
+            let lines =
+                if payload.pointer("/result/target").and_then(Value::as_str) == Some("portfolio") {
+                    render_broker_portfolio_chart_text(&payload)
+                } else {
+                    render_broker_chart_text(&payload)
+                };
+            Ok(HumanBrokerOutput::Text(lines))
         }
         BrokerCommand::Quote(quote_args) => {
             let compact = quote_args.json;
@@ -590,6 +603,9 @@ pub(crate) fn run_broker_command_machine(
                 }))
             }
         },
+        BrokerCommand::Portfolios(args) => {
+            execute_broker_portfolios_query(args, config, session_manager)
+        }
         BrokerCommand::Overview(args) => execute_broker_overview(args, config, session_manager),
         BrokerCommand::CashBreakdown(args) => {
             execute_broker_cash_breakdown(args, config, session_manager)
@@ -603,6 +619,9 @@ pub(crate) fn run_broker_command_machine(
             }
         },
         BrokerCommand::Holdings(args) => execute_broker_holdings(args, config, session_manager),
+        BrokerCommand::OrderVenues(args) => {
+            execute_broker_order_venues(args, config, session_manager)
+        }
         BrokerCommand::PortfolioGroups(args) => {
             let crate::cli::BrokerPortfolioGroupsArgs {
                 command,
@@ -643,7 +662,6 @@ pub(crate) fn run_broker_command_machine(
                 command,
                 portfolio_id,
                 include_year_to_date,
-                quote_source,
                 json,
             } = args;
             match command {
@@ -658,7 +676,6 @@ pub(crate) fn run_broker_command_machine(
                         command: None,
                         portfolio_id,
                         include_year_to_date,
-                        quote_source,
                         json,
                     },
                     config,
@@ -744,6 +761,43 @@ pub(crate) fn run_broker_command_machine(
     }
 }
 
+fn render_broker_portfolios_text(payload: &Value) -> Vec<String> {
+    let status = payload
+        .pointer("/resolution/status")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let auto_resolved_portfolio_id = payload
+        .pointer("/resolution/auto_resolved_portfolio_id")
+        .and_then(Value::as_str);
+    let portfolios = payload
+        .get("portfolios")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let mut lines = vec![format!("resolution: {status}")];
+    if let Some(portfolio_id) = auto_resolved_portfolio_id {
+        lines.push(format!("auto_resolved_portfolio_id: {portfolio_id}"));
+    }
+    if portfolios.is_empty() {
+        lines.push("portfolios: <none>".to_string());
+    } else {
+        lines.push("portfolios:".to_string());
+        lines.extend(portfolios.iter().filter_map(|portfolio| {
+            portfolio
+                .get("portfolio_id")
+                .and_then(Value::as_str)
+                .map(|portfolio_id| format!("- {portfolio_id}"))
+        }));
+    }
+    if status == "selection_required" {
+        lines.push(
+            "Select one with `sc broker context select --portfolio-id <PORTFOLIO_ID>`.".to_string(),
+        );
+    }
+    lines
+}
+
 pub(crate) fn execute_broker_overview(
     args: crate::cli::BrokerOverviewArgs,
     config: &AppConfig,
@@ -774,6 +828,14 @@ pub(crate) fn execute_broker_holdings(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     execute_broker_holdings_query(args, config, session_manager)
+}
+
+pub(crate) fn execute_broker_order_venues(
+    args: crate::cli::BrokerOrderVenuesArgs,
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<Value> {
+    execute_broker_order_venues_query(args, config, session_manager)
 }
 
 fn render_broker_cash_breakdown_text(payload: &Value) -> Vec<String> {
@@ -935,13 +997,6 @@ fn render_broker_transaction_details_text(payload: &Value) -> Vec<String> {
         Some("eltif") => render_eltif_transaction_text(&mut lines, result, currency),
         _ => {}
     }
-
-    let document_count = result
-        .get("documents")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    lines.push(format!("documents: {document_count}"));
 
     let linked_ids = result
         .get("linked_transaction_ids")
@@ -1269,6 +1324,62 @@ fn display_money(value: Option<&Value>, currency: Option<&str>) -> String {
     }
 }
 
+fn render_broker_portfolio_chart_text(payload: &Value) -> Vec<String> {
+    let result = &payload["result"];
+    let mut points = result
+        .get("data_points")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|point| {
+            let time = point.get("timestamp_utc")?.as_str()?;
+            Some((chrono::DateTime::parse_from_rfc3339(time).ok()?, point))
+        })
+        .collect::<Vec<_>>();
+    // Stable sorting keeps equal-instant endpoints in backend order.
+    points.sort_by_key(|(time, _)| *time);
+    let first = points.first().map(|(_, point)| *point);
+    let last = points.last().map(|(_, point)| *point);
+    let reference = result.get("closing_reference_point");
+    let mut lines = vec![
+        format!("account_id: {}", display_value(payload.get("account_id"))),
+        format!(
+            "portfolio_id: {}",
+            display_value(payload.get("portfolio_id"))
+        ),
+        "target: portfolio".to_string(),
+        format!("timeframe: {}", display_value(result.get("timeframe"))),
+        format!("point_count: {}", display_value(result.get("point_count"))),
+        format!(
+            "range_start: {}",
+            display_value(first.and_then(|point| point.get("timestamp_utc")))
+        ),
+        format!(
+            "range_end: {}",
+            display_value(last.and_then(|point| point.get("timestamp_utc")))
+        ),
+    ];
+    for (label, point) in [
+        ("first", first),
+        ("last", last),
+        ("closing_reference", reference),
+    ] {
+        for field in ["valuation", "absolute_return"] {
+            lines.push(format!(
+                "{label}_{field}: {}",
+                display_value(point.and_then(|point| point.get(field)))
+            ));
+        }
+    }
+    lines.push(format!(
+        "closing_reference_timestamp_utc: {}",
+        display_value(reference.and_then(|point| point.get("timestamp_utc")))
+    ));
+    lines.push("note: historical data only; no live updates included".to_string());
+    lines.push("hint: rerun with --json to get the full point set".to_string());
+    lines
+}
+
 fn render_broker_chart_text(payload: &Value) -> Vec<String> {
     let result = payload.get("result").unwrap_or(payload);
     let data_points = result
@@ -1531,7 +1642,7 @@ pub(crate) fn execute_broker_price_alert_add(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
 
     let requested_price = args.price.trim().to_string();
 
@@ -1638,7 +1749,7 @@ pub(crate) fn execute_broker_price_alert_remove(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let requested_alert_id = args.alert_id.trim().to_string();
 
     let resolved = lookup_price_alert_by_id(
@@ -1996,7 +2107,7 @@ fn load_broker_savings_plan_config_response_with_session(
         dpop_options,
         portfolio_id,
     )?;
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
 
     let config_variables = broker_savings_plan_config_variables(&input, &requested_isin)
         .map_err(|err| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {err}"))?;
@@ -2273,7 +2384,7 @@ fn execute_broker_savings_plan_add_phase2(
         anyhow!("SAVINGS_PLAN_SUBMISSION_UNKNOWN: mutation acknowledgement was received but local state could not be finalized; inspect `sc broker savings-plans`")
     })?;
 
-    let input = validated_broker_input(&prepared.ids, false, None)?;
+    let input = validated_broker_input(&prepared.ids, false)?;
     let readback_variables = broker_savings_plan_by_isin_variables(&input, &prepared.isin)
         .map_err(|error| anyhow!("SAVINGS_PLAN_INPUT_INVALID: {error}"))?;
     let readback = execute_with_refresh_retry(
@@ -2383,7 +2494,7 @@ fn prepare_savings_plan_add(
     validate_amount_against_config(amount_value, &parsed_config)?;
     let effective = resolve_effective_savings_plan_add_config(args, &parsed_config)?;
     let effective_configuration = effective_savings_plan_config_value(&effective);
-    let input = validated_broker_input(&ids, false, None)?;
+    let input = validated_broker_input(&ids, false)?;
     let cost_variables = broker_savings_plan_ex_ante_cost_variables(
         &input,
         &isin,
@@ -2902,7 +3013,7 @@ fn parse_broker_savings_plan_schedule(value: &Value) -> Result<ParsedBrokerSavin
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
+                .and_then(|value| normalize_year_month_for_savings(value).ok())
         })
         .collect::<Vec<_>>();
 
@@ -2946,13 +3057,51 @@ fn parse_string_array_for_savings(raw: Option<&Value>, error: &str) -> Result<Ve
 fn resolve_default_savings_plan_config(
     config: &ParsedBrokerSavingsPlanConfig,
 ) -> Result<ResolvedSavingsPlanAddConfig> {
+    let (frequency, dynamization_rate, payment_method) =
+        resolve_common_savings_plan_defaults(config)?;
+    let selected_schedule = select_default_savings_plan_schedule(config)?;
+    let year_month = earliest_available_savings_plan_year_month(selected_schedule)?;
+
+    Ok(ResolvedSavingsPlanAddConfig {
+        frequency,
+        day_of_month: selected_schedule.day_of_month,
+        year_month,
+        dynamization_rate,
+        payment_method,
+    })
+}
+
+fn resolve_common_savings_plan_defaults(
+    config: &ParsedBrokerSavingsPlanConfig,
+) -> Result<(String, String, String)> {
     let frequency = if config.frequencies.iter().any(|f| f == "MONTHLY") {
         "MONTHLY".to_string()
     } else {
         config.frequencies[0].clone()
     };
 
-    let selected_schedule = config
+    let dynamization_rate = normalize_non_negative_decimal_for_savings(
+        config.default_dynamization_rate.as_str(),
+        "dynamization_rate",
+    )?;
+
+    let payment_method = if config
+        .payment_methods
+        .iter()
+        .any(|method| method == "REFERENCE_ACCOUNT")
+    {
+        "REFERENCE_ACCOUNT".to_string()
+    } else {
+        config.payment_methods[0].clone()
+    };
+
+    Ok((frequency, dynamization_rate, payment_method))
+}
+
+fn select_default_savings_plan_schedule(
+    config: &ParsedBrokerSavingsPlanConfig,
+) -> Result<&ParsedBrokerSavingsPlanSchedule> {
+    config
         .schedules
         .iter()
         .find(|schedule| schedule.is_default)
@@ -2970,39 +3119,20 @@ fn resolve_default_savings_plan_config(
         })
         .ok_or_else(|| {
             anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no valid schedule found in config")
-        })?;
+        })
+}
 
-    let year_month = selected_schedule
+fn earliest_available_savings_plan_year_month(
+    schedule: &ParsedBrokerSavingsPlanSchedule,
+) -> Result<String> {
+    schedule
         .available_year_months
         .iter()
         .min()
         .cloned()
         .ok_or_else(|| {
             anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no available yearMonth for selected schedule")
-        })?;
-
-    let dynamization_rate = normalize_non_negative_decimal_for_savings(
-        config.default_dynamization_rate.as_str(),
-        "dynamization_rate",
-    )?;
-
-    let payment_method = if config
-        .payment_methods
-        .iter()
-        .any(|method| method == "REFERENCE_ACCOUNT")
-    {
-        "REFERENCE_ACCOUNT".to_string()
-    } else {
-        config.payment_methods[0].clone()
-    };
-
-    Ok(ResolvedSavingsPlanAddConfig {
-        frequency,
-        day_of_month: selected_schedule.day_of_month,
-        year_month,
-        dynamization_rate,
-        payment_method,
-    })
+        })
 }
 
 fn project_public_broker_savings_plan_config_response(
@@ -3075,7 +3205,8 @@ fn resolve_effective_savings_plan_add_config(
     args: &crate::cli::BrokerSavingsPlanAddArgs,
     config: &ParsedBrokerSavingsPlanConfig,
 ) -> Result<ResolvedSavingsPlanAddConfig> {
-    let defaults = resolve_default_savings_plan_config(config)?;
+    let (default_frequency, default_dynamization_rate, default_payment_method) =
+        resolve_common_savings_plan_defaults(config)?;
 
     let frequency = match args.frequency {
         Some(value) => {
@@ -3085,7 +3216,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             gql
         }
-        None => defaults.frequency.clone(),
+        None => default_frequency,
     };
 
     let selected_schedule = match args.day_of_month {
@@ -3096,13 +3227,7 @@ fn resolve_effective_savings_plan_add_config(
             .ok_or_else(|| {
                 anyhow!("SAVINGS_PLAN_INPUT_INVALID: field 'day_of_month' is not allowed")
             })?,
-        None => config
-            .schedules
-            .iter()
-            .find(|schedule| schedule.day_of_month == defaults.day_of_month)
-            .ok_or_else(|| {
-                anyhow!("SAVINGS_PLAN_CONFIG_UNAVAILABLE: no valid schedule found in config")
-            })?,
+        None => select_default_savings_plan_schedule(config)?,
     };
 
     let year_month = match args.year_month.as_deref() {
@@ -3119,7 +3244,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             normalized
         }
-        None => defaults.year_month.clone(),
+        None => earliest_available_savings_plan_year_month(selected_schedule)?,
     };
 
     let dynamization_rate = match args.dynamization_rate.as_deref() {
@@ -3136,7 +3261,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             normalized
         }
-        None => defaults.dynamization_rate.clone(),
+        None => default_dynamization_rate,
     };
 
     let payment_method = match args.payment_method {
@@ -3147,7 +3272,7 @@ fn resolve_effective_savings_plan_add_config(
             }
             gql
         }
-        None => defaults.payment_method.clone(),
+        None => default_payment_method,
     };
 
     Ok(ResolvedSavingsPlanAddConfig {
@@ -3174,6 +3299,72 @@ mod tests {
     use crate::session::{Session, StoredSession};
     use mockito::Server;
     use serde_json::json;
+
+    #[test]
+    fn broker_portfolios_text_covers_none_available() {
+        let lines = render_broker_portfolios_text(&json!({
+            "portfolios": [],
+            "resolution": {
+                "status": "none_available",
+                "auto_resolved_portfolio_id": null,
+            },
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resolution: none_available".to_string(),
+                "portfolios: <none>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn broker_portfolios_text_covers_auto_resolved() {
+        let lines = render_broker_portfolios_text(&json!({
+            "portfolios": [{"portfolio_id": "portfolio-1"}],
+            "resolution": {
+                "status": "auto_resolved",
+                "auto_resolved_portfolio_id": "portfolio-1",
+            },
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resolution: auto_resolved".to_string(),
+                "auto_resolved_portfolio_id: portfolio-1".to_string(),
+                "portfolios:".to_string(),
+                "- portfolio-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn broker_portfolios_text_covers_selection_required() {
+        let lines = render_broker_portfolios_text(&json!({
+            "portfolios": [
+                {"portfolio_id": "portfolio-1"},
+                {"portfolio_id": "portfolio-2"},
+            ],
+            "resolution": {
+                "status": "selection_required",
+                "auto_resolved_portfolio_id": null,
+            },
+        }));
+
+        assert_eq!(
+            lines,
+            vec![
+                "resolution: selection_required".to_string(),
+                "portfolios:".to_string(),
+                "- portfolio-1".to_string(),
+                "- portfolio-2".to_string(),
+                "Select one with `sc broker context select --portfolio-id <PORTFOLIO_ID>`."
+                    .to_string(),
+            ]
+        );
+    }
 
     fn sample_args() -> crate::cli::BrokerSavingsPlanAddArgs {
         crate::cli::BrokerSavingsPlanAddArgs {
@@ -3210,6 +3401,17 @@ mod tests {
                 available_year_months: vec!["2026-04".to_string(), "2026-05".to_string()],
             }],
         }
+    }
+
+    fn sample_selected_day_config() -> ParsedBrokerSavingsPlanConfig {
+        let mut config = sample_config();
+        config.schedules.push(ParsedBrokerSavingsPlanSchedule {
+            day_of_month: 1,
+            is_default: false,
+            is_earliest: false,
+            available_year_months: vec!["2026-10".to_string(), "2026-09".to_string()],
+        });
+        config
     }
 
     fn sample_savings_plan_costs() -> Value {
@@ -3270,6 +3472,22 @@ mod tests {
         }"#
     }
 
+    fn selected_day_savings_plan_config_response(year_months: &str) -> String {
+        let mut response: Value = serde_json::from_str(sample_savings_plan_config_response())
+            .expect("sample config response");
+        response["data"]["account"]["brokerPortfolio"]["security"]["savingsPlanConfiguration"]
+            ["schedules"]
+            .as_array_mut()
+            .expect("schedules")
+            .push(json!({
+                "dayOfTheMonth": 1,
+                "isDefault": false,
+                "isEarliest": false,
+                "yearMonths": serde_json::from_str::<Value>(year_months).expect("year months"),
+            }));
+        response.to_string()
+    }
+
     fn savings_plan_cost_response(costs: Value) -> String {
         json!({
             "data": {
@@ -3290,6 +3508,7 @@ mod tests {
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(config)),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
     }
@@ -3486,7 +3705,12 @@ mod tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(sample_savings_plan_config_response())
+            .with_body(selected_day_savings_plan_config_response(
+                r#"[
+                    { "yearMonth": "2026-10", "isAvailable": true },
+                    { "yearMonth": "2026-09", "isAvailable": true }
+                ]"#,
+            ))
             .expect(2)
             .create();
         let costs_mock = server
@@ -3502,9 +3726,25 @@ mod tests {
         let mutation_mock = server
             .mock("POST", "/")
             .match_header("x-sc-order-origin", "CLI")
-            .match_body(mockito::Matcher::Regex(
-                "BrokerCreateOrUpdateSavingsPlan".to_string(),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("BrokerCreateOrUpdateSavingsPlan".to_string()),
+                mockito::Matcher::PartialJson(json!({
+                    "variables": {
+                        "portfolioId": "portfolio-1",
+                        "input": {
+                            "isin": "US0378331005",
+                            "amount": "100",
+                            "configuration": {
+                                "frequency": "MONTHLY",
+                                "dayOfTheMonth": 1,
+                                "yearMonth": "2026-09",
+                                "dynamizationRate": "0",
+                                "paymentMethod": "REFERENCE_ACCOUNT"
+                            }
+                        }
+                    }
+                })),
+            ]))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"data":{"createOrUpdateSavingsPlan":{"id":"mutation-1"}}}"#)
@@ -3528,10 +3768,10 @@ mod tests {
                                         "isin": "US0378331005",
                                         "amount": "100",
                                         "frequency": "MONTHLY",
-                                        "dayOfTheMonth": 5,
+                                        "dayOfTheMonth": 1,
                                         "dynamizationRate": "0",
                                         "paymentMethod": "REFERENCE_ACCOUNT",
-                                        "nextExecutionDate": {"date": "2026-04-05", "epochDay": 20548}
+                                        "nextExecutionDate": {"date": "2026-09-01", "epochDay": 20697}
                                     }
                                 }
                             }
@@ -3548,19 +3788,29 @@ mod tests {
         save_active_test_session(&mut session_manager, &config);
         let mut phase1 = sample_args();
         phase1.portfolio_id = Some("portfolio-1".to_string());
+        phase1.day_of_month = Some(1);
         let preview = execute_broker_savings_plan_add(phase1, &config, &mut session_manager)
             .expect("preview");
+        assert_eq!(
+            preview["result"]["effective_configuration"]["year_month"],
+            "2026-09"
+        );
         let confirmation_id = preview["result"]["confirmation"]["id"]
             .as_str()
             .expect("confirmation id")
             .to_string();
         let mut phase2 = sample_args();
         phase2.portfolio_id = Some("portfolio-1".to_string());
+        phase2.day_of_month = Some(1);
         phase2.confirm = Some(confirmation_id.clone());
 
         let payload = execute_broker_savings_plan_add(phase2, &config, &mut session_manager)
             .expect("confirmation submission");
         assert_eq!(payload["result"]["action"], "create_or_update");
+        assert_eq!(
+            payload["result"]["effective_configuration"]["year_month"],
+            "2026-09"
+        );
         assert_eq!(payload["result"]["mutation_id"], "mutation-1");
         assert_eq!(
             payload["result"]["confirmation"],
@@ -3584,6 +3834,140 @@ mod tests {
         costs_mock.assert();
         mutation_mock.assert();
         readback_mock.assert();
+    }
+
+    #[test]
+    fn savings_plan_confirmation_rejects_selected_day_month_drift_before_submission() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let phase1_config = selected_day_savings_plan_config_response(
+            r#"[{ "yearMonth": "2026-09", "isAvailable": true }]"#,
+        );
+        let phase2_config = selected_day_savings_plan_config_response(
+            r#"[{ "yearMonth": "2026-10", "isAvailable": true }]"#,
+        );
+        let phase1_config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(phase1_config)
+            .expect(1)
+            .create();
+        let phase2_config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(phase2_config)
+            .expect(1)
+            .create();
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(savings_plan_cost_response(sample_savings_plan_costs()))
+            .expect(2)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .expect(0)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut phase1 = sample_args();
+        phase1.portfolio_id = Some("portfolio-1".to_string());
+        phase1.day_of_month = Some(1);
+        let preview = execute_broker_savings_plan_add(phase1, &config, &mut session_manager)
+            .expect("preview");
+        let confirmation_id = preview["result"]["confirmation"]["id"]
+            .as_str()
+            .expect("confirmation id")
+            .to_string();
+
+        let mut phase2 = sample_args();
+        phase2.portfolio_id = Some("portfolio-1".to_string());
+        phase2.day_of_month = Some(1);
+        phase2.confirm = Some(confirmation_id.clone());
+        let err = execute_broker_savings_plan_add(phase2, &config, &mut session_manager)
+            .expect_err("fresh selected schedule drift must fail before submission");
+        assert!(
+            err.to_string()
+                .contains("SAVINGS_PLAN_CONFIRMATION_FIELDS_MISMATCH:")
+        );
+        load_savings_plan_confirmation(&confirmation_id, current_epoch_seconds())
+            .expect("mismatch must preserve the pending confirmation");
+
+        phase1_config_mock.assert();
+        phase2_config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
+    }
+
+    #[test]
+    fn selected_day_without_valid_month_fails_before_costs_confirmation_or_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanConfig".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(selected_day_savings_plan_config_response(
+                r#"[{ "yearMonth": "invalid", "isAvailable": true }]"#,
+            ))
+            .expect(1)
+            .create();
+        let costs_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerSavingsPlanExAnteCost".to_string(),
+            ))
+            .expect(0)
+            .create();
+        let mutation_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                "BrokerCreateOrUpdateSavingsPlan".to_string(),
+            ))
+            .expect(0)
+            .create();
+
+        let config = sample_runtime_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        save_active_test_session(&mut session_manager, &config);
+        let mut args = sample_args();
+        args.portfolio_id = Some("portfolio-1".to_string());
+        args.day_of_month = Some(1);
+
+        let err = execute_broker_savings_plan_add(args, &config, &mut session_manager)
+            .expect_err("invalid selected schedule must fail before phase one side effects");
+        assert!(err.to_string().contains("SAVINGS_PLAN_CONFIG_UNAVAILABLE:"));
+        assert_preview_allowed().expect("no confirmation should have been stored");
+
+        config_mock.assert();
+        costs_mock.assert();
+        mutation_mock.assert();
     }
 
     #[test]
@@ -3725,6 +4109,94 @@ mod tests {
         assert_eq!(resolved.day_of_month, 5);
         assert_eq!(resolved.year_month, "2026-04");
         assert_eq!(resolved.payment_method, "REFERENCE_ACCOUNT");
+    }
+
+    #[test]
+    fn resolve_effective_savings_plan_add_config_uses_selected_day_month_when_omitted() {
+        let mut args = sample_args();
+        args.day_of_month = Some(1);
+        let config = sample_selected_day_config();
+
+        let resolved = resolve_effective_savings_plan_add_config(&args, &config).expect("resolve");
+
+        assert_eq!(resolved.day_of_month, 1);
+        assert_eq!(resolved.year_month, "2026-09");
+    }
+
+    #[test]
+    fn resolve_effective_savings_plan_add_config_day_override_ignores_unusable_default_schedule() {
+        let mut args = sample_args();
+        args.day_of_month = Some(1);
+        let mut config = sample_selected_day_config();
+        config.schedules[0].available_year_months.clear();
+
+        let resolved = resolve_effective_savings_plan_add_config(&args, &config).expect("resolve");
+
+        assert_eq!(resolved.day_of_month, 1);
+        assert_eq!(resolved.year_month, "2026-09");
+    }
+
+    #[test]
+    fn resolve_effective_savings_plan_add_config_rejects_selected_day_without_available_month() {
+        let mut args = sample_args();
+        args.day_of_month = Some(1);
+        let mut config = sample_selected_day_config();
+        config.schedules[1].available_year_months.clear();
+
+        let err = resolve_effective_savings_plan_add_config(&args, &config)
+            .expect_err("selected day without a month must fail closed");
+
+        assert!(err.to_string().contains(
+            "SAVINGS_PLAN_CONFIG_UNAVAILABLE: no available yearMonth for selected schedule"
+        ));
+    }
+
+    #[test]
+    fn resolve_effective_savings_plan_add_config_preserves_explicit_selected_day_month() {
+        let mut args = sample_args();
+        args.day_of_month = Some(1);
+        args.year_month = Some("2026-10".to_string());
+        let config = sample_selected_day_config();
+
+        let resolved = resolve_effective_savings_plan_add_config(&args, &config).expect("resolve");
+
+        assert_eq!(resolved.year_month, "2026-10");
+    }
+
+    #[test]
+    fn resolve_effective_savings_plan_add_config_rejects_unavailable_explicit_selected_day_month() {
+        let mut args = sample_args();
+        args.day_of_month = Some(1);
+        args.year_month = Some("2026-04".to_string());
+        let config = sample_selected_day_config();
+
+        let err = resolve_effective_savings_plan_add_config(&args, &config)
+            .expect_err("unavailable explicit month must fail");
+
+        assert!(err.to_string().contains(
+            "SAVINGS_PLAN_INPUT_INVALID: field 'year_month' is not available for selected day"
+        ));
+    }
+
+    #[test]
+    fn parse_savings_plan_schedule_discards_malformed_available_months() {
+        let schedule = parse_broker_savings_plan_schedule(&json!({
+            "dayOfTheMonth": 1,
+            "isDefault": false,
+            "isEarliest": false,
+            "yearMonths": [
+                {"yearMonth": "not-a-month", "isAvailable": true},
+                {"yearMonth": "2026-10", "isAvailable": true},
+                {"yearMonth": "2026-09", "isAvailable": true},
+                {"yearMonth": "2026-08", "isAvailable": false}
+            ]
+        }))
+        .expect("parse schedule");
+
+        assert_eq!(
+            schedule.available_year_months,
+            vec!["2026-10".to_string(), "2026-09".to_string()]
+        );
     }
 
     #[test]
@@ -4233,6 +4705,7 @@ mod tests {
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
 
@@ -4331,6 +4804,7 @@ mod tests {
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
 
@@ -4419,6 +4893,7 @@ mod tests {
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
 
@@ -4501,6 +4976,7 @@ mod tests {
                 session: sample_session(),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
                 mode: None,
+                refresh_recovery_pending: false,
             })
             .expect("save session");
 
@@ -4613,6 +5089,75 @@ mod tests {
         assert!(lines.iter().any(|line| {
             line == "schedule_1: day_of_month=1 default=true earliest=true available_year_months=2026-07, 2026-08"
         }));
+    }
+
+    #[test]
+    fn portfolio_chart_summary_orders_instants_and_preserves_tied_endpoints() {
+        let payload = json!({"account_id": "acc-1", "portfolio_id": "port-1", "result": {
+            "target": "portfolio", "timeframe": "1y", "point_count": 4,
+            "closing_reference_point": {"valuation": "10000.000", "absolute_return": "0.00", "timestamp_utc": "2025-10-09T10:00:00Z"},
+            "data_points": [
+                {"valuation": "3.000", "absolute_return": "-3.000", "timestamp_utc": "2026-10-09T10:00:00.100001Z"},
+                {"valuation": 0, "absolute_return": 0, "timestamp_utc": "2026-10-09T12:00:00+02:00"},
+                {"valuation": "2.00", "absolute_return": "-2.00", "timestamp_utc": "2026-10-09T10:00:00.1Z"},
+                {"valuation": "4.000", "absolute_return": "-4.000", "timestamp_utc": "2026-10-09T10:00:00.100001Z"}
+            ]
+        }});
+        let lines = render_broker_portfolio_chart_text(&payload);
+        for expected in [
+            "account_id: acc-1",
+            "portfolio_id: port-1",
+            "target: portfolio",
+            "point_count: 4",
+            "range_start: 2026-10-09T12:00:00+02:00",
+            "range_end: 2026-10-09T10:00:00.100001Z",
+            "first_valuation: 0",
+            "first_absolute_return: 0",
+            "last_valuation: 4.000",
+            "last_absolute_return: -4.000",
+            "closing_reference_valuation: 10000.000",
+            "closing_reference_absolute_return: 0.00",
+            "closing_reference_timestamp_utc: 2025-10-09T10:00:00Z",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "{expected}: {lines:?}"
+            );
+        }
+        let tied = json!({"result": {"data_points": [
+            {"valuation": "first", "absolute_return": "1", "timestamp_utc": "2026-10-09T10:00:00Z"},
+            {"valuation": "last", "absolute_return": "2", "timestamp_utc": "2026-10-09T12:00:00+02:00"}
+        ]}});
+        let lines = render_broker_portfolio_chart_text(&tied);
+        assert!(lines.contains(&"first_valuation: first".to_string()));
+        assert!(lines.contains(&"last_valuation: last".to_string()));
+    }
+
+    #[test]
+    fn portfolio_chart_summary_keeps_reference_only_history_visible() {
+        let lines = render_broker_portfolio_chart_text(
+            &json!({"account_id": "acc-1", "portfolio_id": "port-1", "result": {
+                "target": "portfolio", "timeframe": "max", "point_count": 0, "data_points": [],
+                "closing_reference_point": {"valuation": 42, "absolute_return": -2, "timestamp_utc": "2026-10-09T10:00:00Z"}
+            }}),
+        );
+        for expected in [
+            "point_count: 0",
+            "range_start: <none>",
+            "range_end: <none>",
+            "first_valuation: <none>",
+            "last_absolute_return: <none>",
+            "closing_reference_valuation: 42",
+            "closing_reference_absolute_return: -2",
+            "closing_reference_timestamp_utc: 2026-10-09T10:00:00Z",
+            "note: historical data only; no live updates included",
+            "hint: rerun with --json to get the full point set",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "{expected}: {lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -4798,7 +5343,6 @@ mod tests {
                         "financial_transaction_tax": Value::Null
                     }
                 },
-                "documents": [],
                 "linked_transaction_ids": [],
                 "history": []
             }
@@ -4866,7 +5410,6 @@ mod tests {
                         "financial_transaction_tax": Value::Null
                     }
                 },
-                "documents": [],
                 "linked_transaction_ids": [],
                 "history": []
             }

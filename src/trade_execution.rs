@@ -47,22 +47,17 @@ use crate::trade_presentation::{
     render_trade_buy_text as render_trade_buy_text_from_module,
     render_trade_sell_text as render_trade_sell_text_from_module,
 };
+use crate::trade_venue::normalize_venue_override;
 
 const CONFIRMATION_TTL_SECONDS: i64 = 15 * 60;
 const ORDER_TYPE_MARKET: &str = "market";
 const ORDER_TYPE_LIMIT: &str = "limit";
 const ORDER_TYPE_STOP: &str = "stop";
+const ORDER_TYPE_STOP_LIMIT: &str = "stop-limit";
 pub(crate) const ORDER_SIDE_BUY: &str = "buy";
 pub(crate) const ORDER_SIDE_SELL: &str = "sell";
 const TRADE_WARNING_LOCALE: &str = "en_DE";
 const VALUE_NA: &str = "n/a";
-pub(crate) const VENUE_GETTEX: &str = "GETTEX";
-pub(crate) const VENUE_XETR: &str = "XETR";
-pub(crate) const VENUE_SEIX: &str = "SEIX";
-pub(crate) const VENUE_LABEL_GETTEX: &str = "Börse München (gettex)";
-pub(crate) const VENUE_LABEL_XETRA: &str = "Xetra";
-pub(crate) const VENUE_LABEL_SEIX: &str = "European Investor Exchange (EIX)";
-
 #[derive(Debug, Clone)]
 pub(crate) struct TradeIntent {
     pub(crate) side: TradeSide,
@@ -761,12 +756,7 @@ fn parse_phase1_intent_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Tr
         args.stop_price.as_deref(),
     )?;
 
-    let venue_override = args
-        .venue
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_uppercase());
+    let venue_override = normalize_venue_override(args.venue.as_deref());
     Ok(TradeIntent {
         side: TradeSide::Sell,
         isin,
@@ -855,7 +845,7 @@ fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase
         args.limit_price.as_deref(),
         args.stop_price.as_deref(),
     )?;
-    let venue = optional_trimmed_string(args.venue.as_deref());
+    let venue = normalize_venue_override(args.venue.as_deref());
     let order_type = order_type_label(args.order_type).to_string();
 
     Ok(Phase2Input {
@@ -881,7 +871,7 @@ fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Pha
         args.limit_price.as_deref(),
         args.stop_price.as_deref(),
     )?;
-    let venue = optional_trimmed_string(args.venue.as_deref());
+    let venue = normalize_venue_override(args.venue.as_deref());
     let order_type = order_type_label(args.order_type).to_string();
 
     Ok(Phase2Input {
@@ -968,7 +958,7 @@ fn build_confirmation_phase1_input(
         isin: isin.to_string(),
         amount: sizing.amount_raw().map(ToString::to_string),
         shares: sizing.shares_raw().map(ToString::to_string),
-        venue: optional_trimmed_string(venue),
+        venue: normalize_venue_override(venue),
         order_type: order_type.to_string(),
         limit_price: prices.limit_price.clone(),
         stop_price: prices.stop_price.clone(),
@@ -988,11 +978,7 @@ fn build_trade_intent(input: TradeIntentBuildInput<'_>) -> Result<TradeIntent> {
         stop_price: input.stop_price_value,
         limit_price_str: input.limit_price.clone(),
         stop_price_str: input.stop_price.clone(),
-        venue_override: input
-            .venue
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_uppercase),
+        venue_override: normalize_venue_override(input.venue),
         locale: TRADE_WARNING_LOCALE.to_string(),
     })
 }
@@ -1171,8 +1157,12 @@ fn prepare_trade(
         }
     }
 
-    let quote_variables =
-        trade_security_tick_variables(&ids.account_id, &ids.portfolio_id, &intent.isin)?;
+    let quote_variables = trade_security_tick_variables(
+        &ids.account_id,
+        &ids.portfolio_id,
+        &intent.isin,
+        &tradability_gate.selected_venue,
+    )?;
     let quote_response = execute_with_refresh_retry(
         session_manager,
         env,
@@ -1724,10 +1714,6 @@ fn validate_order_price_flags(
     let limit_price = optional_trimmed_string(limit_price_raw);
     let stop_price = optional_trimmed_string(stop_price_raw);
 
-    if limit_price.is_some() && stop_price.is_some() {
-        bail!("Trade input invalid: --limit-price and --stop-price cannot be used together");
-    }
-
     match order_type {
         crate::cli::BrokerTradeOrderType::Market => {
             if limit_price.is_some() || stop_price.is_some() {
@@ -1750,6 +1736,14 @@ fn validate_order_price_flags(
             }
             if limit_price.is_some() {
                 bail!("Trade input invalid: --order-type stop does not allow --limit-price");
+            }
+        }
+        crate::cli::BrokerTradeOrderType::StopLimit => {
+            if limit_price.is_none() {
+                bail!("Trade input invalid: --limit-price is required for --order-type stop-limit");
+            }
+            if stop_price.is_none() {
+                bail!("Trade input invalid: --stop-price is required for --order-type stop-limit");
             }
         }
     }
@@ -1776,6 +1770,7 @@ fn order_type_label(order_type: crate::cli::BrokerTradeOrderType) -> &'static st
         crate::cli::BrokerTradeOrderType::Market => ORDER_TYPE_MARKET,
         crate::cli::BrokerTradeOrderType::Limit => ORDER_TYPE_LIMIT,
         crate::cli::BrokerTradeOrderType::Stop => ORDER_TYPE_STOP,
+        crate::cli::BrokerTradeOrderType::StopLimit => ORDER_TYPE_STOP_LIMIT,
     }
 }
 
@@ -2107,6 +2102,10 @@ mod tests {
     };
     use mockito::{Matcher, Server};
 
+    use crate::trade_venue::{
+        VENUE_LABEL_GETTEX, VENUE_LABEL_SEIX, VENUE_LABEL_XETRA, VENUE_MUNC, VENUE_SEIX,
+    };
+
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
@@ -2282,6 +2281,7 @@ mod tests {
             session: sample_session(),
             dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint()),
             mode: None,
+            refresh_recovery_pending: false,
         }
     }
 
@@ -2300,6 +2300,13 @@ mod tests {
         "DPoP test-token"
     }
 
+    fn graphql_variables_matcher(operation: &str, variables: Value) -> Matcher {
+        Matcher::AllOf(vec![
+            Matcher::Regex(operation.to_string()),
+            Matcher::PartialJson(json!({"variables": variables})),
+        ])
+    }
+
     fn ensure_runtime_dpop_key(config: &AppConfig) {
         crate::dpop::DpopKeyMaterial::load_or_create_for_options(
             &crate::channel::current_dpop_runtime_options(config),
@@ -2314,6 +2321,960 @@ mod tests {
         .expect("load runtime dpop key")
         .jwk_thumbprint()
         .expect("runtime dpop thumbprint")
+    }
+
+    fn trade_preparation_tradability_response(selected_venue: &str) -> String {
+        json!({
+            "data": {
+                "account": {
+                    "id": "person-1",
+                    "brokerPortfolio": {
+                        "id": "portfolio-1",
+                        "appropriatenessInfo": null,
+                        "suitabilityStatuses": [],
+                        "featureFlags": {"knockoutWarnings": false},
+                        "security": {
+                            "id": "DE0007100000",
+                            "requiredSuitability": null,
+                            "buyTradabilityForTrading": {
+                                "id": "buy-tradability",
+                                "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                "venues": [
+                                    {
+                                        "venue": "MUNC",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
+                                    },
+                                    {
+                                        "venue": "XETR",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
+                                    }
+                                ],
+                                "primaryVenue": {
+                                    "venue": selected_venue,
+                                    "status": "TRADABLE_WITHOUT_APPROPRIATENESS"
+                                }
+                            },
+                            "sellTradabilityForTrading": {
+                                "id": "sell-tradability",
+                                "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                "venues": [
+                                    {
+                                        "venue": "MUNC",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
+                                    },
+                                    {
+                                        "venue": "XETR",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
+                                    }
+                                ],
+                                "primaryVenue": {
+                                    "venue": selected_venue,
+                                    "status": "TRADABLE_WITHOUT_APPROPRIATENESS"
+                                }
+                            },
+                            "inventory": {
+                                "position": {
+                                    "sellableByVenue": [
+                                        {"venue": "MUNC", "sellable": 10.0},
+                                        {"venue": "XETR", "sellable": 10.0}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn trade_preparation_tick_response(mid_price: f64) -> String {
+        json!({
+            "data": {
+                "account": {
+                    "id": "person-1",
+                    "brokerPortfolio": {
+                        "id": "portfolio-1",
+                        "security": {
+                            "id": "DE0007100000",
+                            "isin": "DE0007100000",
+                            "quoteTick": {
+                                "askPrice": mid_price + 1.0,
+                                "bidPrice": mid_price - 1.0,
+                                "midPrice": mid_price,
+                                "currency": "EUR",
+                                "isOutdated": false,
+                                "timestampUtc": {"time": "2026-09-28T12:00:00Z"}
+                            },
+                            "issuerLinks": {"kidLinks": []}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn trade_preparation_ex_ante_response() -> String {
+        json!({
+            "data": {
+                "account": {
+                    "id": "person-1",
+                    "brokerPortfolio": {
+                        "id": "portfolio-1",
+                        "singleTradeExAnteCosts": {
+                            "id": "cost-id",
+                            "entryCosts": null,
+                            "ongoingCosts": {
+                                "serviceCosts": {"amount": 0.0, "percentage": 0.0},
+                                "productCosts": {"amount": 0.0, "percentage": 0.0},
+                                "total": {"amount": 0.0, "percentage": 0.0}
+                            },
+                            "exitCosts": {
+                                "serviceCosts": {"amount": 0.0, "percentage": 0.0},
+                                "productCosts": {"amount": 0.0, "percentage": 0.0},
+                                "total": {"amount": 0.0, "percentage": 0.0}
+                            },
+                            "effectOnReturn": {
+                                "initialYearCosts": null,
+                                "followingYearsCosts": null,
+                                "finalYearCosts": {"amount": 0.0, "percentage": 0.0}
+                            },
+                            "fiveYearsCosts": {"amount": 0.0, "percentage": 0.0},
+                            "incidentalCosts": {"amount": 0.0, "percentage": 0.0}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn trade_intent_for_preparation_test(
+        side: TradeSide,
+        venue_override: Option<&str>,
+    ) -> TradeIntent {
+        let (amount, amount_str, shares, shares_str) = match side {
+            TradeSide::Buy => (Some(500.0), Some("500".to_string()), None, None),
+            TradeSide::Sell => (
+                None,
+                None,
+                Some(NumberOfShares::Decimal(2.0)),
+                Some("2".to_string()),
+            ),
+        };
+
+        TradeIntent {
+            side,
+            isin: "DE0007100000".to_string(),
+            amount,
+            amount_str,
+            shares,
+            shares_str,
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+            limit_price_str: None,
+            stop_price_str: None,
+            venue_override: venue_override.map(ToString::to_string),
+            locale: TRADE_WARNING_LOCALE.to_string(),
+        }
+    }
+
+    fn assert_trade_preparation_uses_selected_venue_quote(
+        side: TradeSide,
+        venue_override: Option<&str>,
+        selected_venue: &str,
+        tick_mid_price: f64,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = crate::session::SessionManager::new(&config).expect("session");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let resolve_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "ResolveBrokerIds",
+                json!({"id": "person-1"}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "account": {
+                            "id": "person-1",
+                            "brokerPortfolios": [{"id": "portfolio-1"}]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let tradability_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getTradingTradability",
+                json!({
+                    "personId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "DE0007100000"
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_tradability_response(selected_venue))
+            .create();
+        let tick_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSecurityTick",
+                json!({
+                    "personId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "DE0007100000",
+                    "includeYearToDate": false,
+                    "source": selected_venue
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_tick_response(tick_mid_price))
+            .create();
+        let ex_ante_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSingleTradeExAnteCost",
+                json!({"venue": selected_venue}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_ex_ante_response())
+            .create();
+
+        let prepared = prepare_trade(
+            &trade_intent_for_preparation_test(side, venue_override),
+            &config,
+            &mut session_manager,
+        )
+        .expect("trade preparation succeeds");
+
+        assert_eq!(prepared.tradability_gate.selected_venue, selected_venue);
+        assert_eq!(prepared.quote_mid_price_value, tick_mid_price);
+        let expected_sizing_price = match side {
+            TradeSide::Buy => tick_mid_price + 1.0,
+            TradeSide::Sell => tick_mid_price - 1.0,
+        };
+        assert_eq!(
+            prepared.sizing_price,
+            canonical_decimal_from_f64(expected_sizing_price)
+        );
+
+        resolve_mock.assert();
+        tradability_mock.assert();
+        tick_mock.assert();
+        ex_ante_mock.assert();
+    }
+
+    #[test]
+    fn trade_preparation_buy_uses_default_selected_venue_for_quote() {
+        assert_trade_preparation_uses_selected_venue_quote(TradeSide::Buy, None, "MUNC", 50.0);
+    }
+
+    #[test]
+    fn trade_preparation_buy_uses_xetra_selected_venue_for_quote() {
+        assert_trade_preparation_uses_selected_venue_quote(
+            TradeSide::Buy,
+            Some("XETR"),
+            "XETR",
+            80.0,
+        );
+    }
+
+    #[test]
+    fn trade_preparation_sell_uses_default_selected_venue_for_quote() {
+        assert_trade_preparation_uses_selected_venue_quote(TradeSide::Sell, None, "MUNC", 50.0);
+    }
+
+    #[test]
+    fn trade_preparation_sell_uses_xetra_selected_venue_for_quote() {
+        assert_trade_preparation_uses_selected_venue_quote(
+            TradeSide::Sell,
+            Some("XETR"),
+            "XETR",
+            80.0,
+        );
+    }
+
+    #[test]
+    fn trade_phase2_reprepares_with_a_fresh_selected_venue_quote() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = crate::session::SessionManager::new(&config).expect("session");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let resolve_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "ResolveBrokerIds",
+                json!({"id": "person-1"}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "account": {
+                            "id": "person-1",
+                            "brokerPortfolios": [{"id": "portfolio-1"}]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create();
+        let tradability_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getTradingTradability",
+                json!({
+                    "personId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "DE0007100000"
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_tradability_response("XETR"))
+            .expect(2)
+            .create();
+
+        let phase1_tick_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSecurityTick",
+                json!({
+                    "personId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "DE0007100000",
+                    "includeYearToDate": false,
+                    "source": "XETR"
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_tick_response(50.0))
+            .create();
+        let phase1_ex_ante_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSingleTradeExAnteCost",
+                json!({"venue": "XETR"}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_ex_ante_response())
+            .create();
+
+        let phase1_args = crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE0007100000".to_string()),
+            amount: None,
+            shares: Some("3".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: Some("xetra".to_string()),
+            confirm: None,
+            acknowledge_appropriateness_warning: false,
+            json: true,
+        };
+        let phase1 = execute_broker_trade_buy(phase1_args, &config, &mut session_manager)
+            .expect("phase 1 preview");
+        let confirmation_id = phase1
+            .pointer("/confirmation/id")
+            .and_then(Value::as_str)
+            .expect("phase 1 confirmation id")
+            .to_string();
+        assert_eq!(
+            phase1.pointer("/result/market_quote/mid_price"),
+            Some(&json!("50"))
+        );
+        phase1_tick_mock.assert();
+        phase1_tick_mock.remove();
+        phase1_ex_ante_mock.assert();
+        phase1_ex_ante_mock.remove();
+
+        let phase2_tick_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSecurityTick",
+                json!({
+                    "personId": "person-1",
+                    "portfolioId": "portfolio-1",
+                    "isin": "DE0007100000",
+                    "includeYearToDate": false,
+                    "source": "XETR"
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_tick_response(75.0))
+            .create();
+        let phase2_ex_ante_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "getSingleTradeExAnteCost",
+                json!({"venue": "XETR"}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_ex_ante_response())
+            .create();
+        let place_order_mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(
+                "placeOrder",
+                json!({
+                    "portfolioId": "portfolio-1",
+                    "input": {"venue": "XETR"}
+                }),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "placeOrder": {
+                            "brokerPortfolio": {"id": "portfolio-1"},
+                            "orderData": {"orderId": "order-1", "isMarketable": true}
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let phase2 = execute_broker_trade_buy(
+            crate::cli::BrokerTradeBuyArgs {
+                isin: Some("DE0007100000".to_string()),
+                amount: None,
+                shares: Some("3".to_string()),
+                order_type: crate::cli::BrokerTradeOrderType::Market,
+                limit_price: None,
+                stop_price: None,
+                venue: Some("XETR".to_string()),
+                confirm: Some(confirmation_id),
+                acknowledge_appropriateness_warning: false,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .expect("phase 2 submission");
+
+        assert_eq!(
+            phase2.pointer("/result/tradability/selected_venue"),
+            Some(&json!("XETR"))
+        );
+        assert_eq!(
+            phase2.pointer("/result/market_quote/mid_price"),
+            Some(&json!("75"))
+        );
+        assert_eq!(
+            phase2.pointer("/result/order_submission/order_id"),
+            Some(&json!("order-1"))
+        );
+
+        resolve_mock.assert();
+        tradability_mock.assert();
+        phase2_tick_mock.assert();
+        phase2_ex_ante_mock.assert();
+        place_order_mock.assert();
+    }
+
+    fn execute_test_trade_command(
+        command: &str,
+        config: &AppConfig,
+        session_manager: &mut SessionManager,
+    ) -> Result<Value> {
+        use clap::Parser;
+        let cli =
+            crate::cli::Cli::try_parse_from(command.split_whitespace()).expect("parse replay");
+        let crate::cli::Commands::Broker(broker) = cli.command else {
+            panic!("broker command")
+        };
+        let crate::cli::BrokerCommand::Trade(trade) = broker.command else {
+            panic!("trade command")
+        };
+        match trade.command {
+            crate::cli::BrokerTradeCommand::Buy(args) => {
+                execute_broker_trade_buy(args, config, session_manager)
+            }
+            crate::cli::BrokerTradeCommand::Sell(args) => {
+                execute_broker_trade_sell(args, config, session_manager)
+            }
+            other => panic!("unsupported test command: {other:?}"),
+        }
+    }
+
+    fn mock_trade_read(
+        server: &mut Server,
+        operation: &str,
+        variables: Value,
+        response: String,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_body(graphql_variables_matcher(operation, variables))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(response)
+            .expect(1)
+            .create()
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StopLimitFlowOutcome {
+        Submit,
+        LimitMismatch,
+        StopMismatch,
+        TypeMismatch,
+        PriceFormatMismatch,
+        SizingFormatMismatch,
+        Expired,
+        Consumed,
+        SizingDrift,
+        CostsDrift,
+        ComplianceDrift,
+        MissingAcknowledgement,
+        PreviewNotionalBlocked,
+        ConfirmNotionalBlocked,
+        FreshQuoteNotionalBlocked,
+        StaleQuote,
+    }
+
+    fn assert_stop_limit_flow(
+        side: TradeSide,
+        amount_buy: bool,
+        require_ack: bool,
+        full_position: bool,
+        outcome: StopLimitFlowOutcome,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let mut config = sample_config();
+        // The exact estimate passes; this cap deliberately does not bound the limit-priced fill.
+        config.trade_controls = Some(crate::config::TradeControlsConfig {
+            max_order_notional: Some(if side.is_buy() { "945" } else { "237.5" }.to_string()),
+            ..Default::default()
+        });
+        if outcome == StopLimitFlowOutcome::PreviewNotionalBlocked {
+            config.trade_controls.as_mut().unwrap().max_order_notional =
+                Some("944.9999".to_string());
+        }
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .expect("save session");
+
+        let (sizing, stop, limit, shares, volume) = match side {
+            TradeSide::Buy => (
+                if amount_buy {
+                    "--amount 1000"
+                } else {
+                    "--shares 9"
+                },
+                105.0,
+                110.0,
+                json!(9),
+                945.0,
+            ),
+            TradeSide::Sell => ("--shares 2.5", 95.0, 90.0, json!(2.5), 237.5),
+        };
+        let command = format!(
+            "sc broker trade {} --isin DE0007100000 {sizing} --order-type stop-limit --stop-price {stop} --limit-price {limit} --venue xetra --json",
+            side_label(side)
+        );
+        // Catch any placement, including one with wrong variables or headers.
+        let unexpected_placement = server
+            .mock("POST", "/")
+            .match_body(Matcher::Regex("placeOrder".to_string()))
+            .with_status(500)
+            .expect(0)
+            .create();
+
+        let mut tradability: Value =
+            serde_json::from_str(&trade_preparation_tradability_response("XETR")).unwrap();
+        if full_position {
+            tradability["data"]["account"]["brokerPortfolio"]["security"]["inventory"]["position"]
+                ["sellableByVenue"][1]["sellable"] = json!(2.5);
+        }
+        if require_ack {
+            let portfolio = &mut tradability["data"]["account"]["brokerPortfolio"];
+            portfolio["suitabilityStatuses"] = json!([{"suitabilityType": "COMPLEX_INSTRUMENT", "result": "UNSUITABLE", "suitabilityId": "suit-ci-1"}]);
+            portfolio["security"]["requiredSuitability"] = json!({"suitabilityType": "COMPLEX_INSTRUMENT", "actionWhenUnsuitable": "PROCEED_TO_ORDER_FLOW"});
+        }
+        let warning_response = json!({"data": {"brokerAppropriatenessWarning": {
+            "version": "warning-1", "locale": "en-DE", "promptText": "Please review these risks.", "acknowledgementText": "I understand the risks."
+        }}}).to_string();
+        let mut tick: Value =
+            serde_json::from_str(&trade_preparation_tick_response(100.0)).unwrap();
+        if outcome == StopLimitFlowOutcome::StaleQuote {
+            tick["data"]["account"]["brokerPortfolio"]["security"]["quoteTick"]["isOutdated"] =
+                json!(true);
+        }
+        let ex_ante_variables = json!({
+            "personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000",
+            "side": side.as_graphql(), "venue": "XETR", "numberOfShares": shares,
+            "estimatedOrderVolume": volume, "isWholePositionSold": full_position,
+        });
+        let resolve_response = json!({"data": {"account": {"id": "person-1", "brokerPortfolios": [{"id": "portfolio-1"}]}}}).to_string();
+        let mut preview_mocks = vec![
+            mock_trade_read(
+                &mut server,
+                "ResolveBrokerIds",
+                json!({"id": "person-1"}),
+                resolve_response.clone(),
+            ),
+            mock_trade_read(
+                &mut server,
+                "getTradingTradability",
+                json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000"}),
+                tradability.to_string(),
+            ),
+            mock_trade_read(
+                &mut server,
+                "getSecurityTick",
+                json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000", "source": "XETR", "includeYearToDate": false}),
+                tick.to_string(),
+            ),
+        ];
+        if require_ack {
+            preview_mocks.push(mock_trade_read(
+                &mut server,
+                "getBrokerAppropriatenessWarning",
+                json!({"locale": "en-DE"}),
+                warning_response.clone(),
+            ));
+        }
+        let preview_costs = server
+            .mock("POST", "/")
+            .match_body(graphql_variables_matcher(
+                "getSingleTradeExAnteCost",
+                ex_ante_variables.clone(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trade_preparation_ex_ante_response())
+            .expect(if outcome == StopLimitFlowOutcome::StaleQuote {
+                0
+            } else {
+                1
+            })
+            .create();
+        let preview = execute_test_trade_command(&command, &config, &mut session_manager);
+        for mock in preview_mocks {
+            mock.assert();
+            mock.remove();
+        }
+        preview_costs.assert();
+        preview_costs.remove();
+        unexpected_placement.assert();
+        if matches!(
+            outcome,
+            StopLimitFlowOutcome::PreviewNotionalBlocked | StopLimitFlowOutcome::StaleQuote
+        ) {
+            let message = preview.expect_err("blocked preview").to_string();
+            assert!(
+                message.contains(if outcome == StopLimitFlowOutcome::StaleQuote {
+                    "outdated"
+                } else {
+                    "LOCAL_TRADE_CONTROL"
+                }),
+                "{message}"
+            );
+            return;
+        }
+        let preview = preview.expect("preview");
+        assert_eq!(preview["result"]["intent"]["order_type"], "stop-limit");
+        assert_eq!(
+            preview["result"]["intent"]["limit_price"],
+            limit.to_string()
+        );
+        assert_eq!(preview["result"]["intent"]["stop_price"], stop.to_string());
+        assert_eq!(
+            preview["result"]["calculation"]["estimated_order_volume"],
+            volume.to_string()
+        );
+        assert_eq!(
+            preview["result"]["calculation"]["estimate_price_basis"],
+            "stop_price"
+        );
+        assert_eq!(
+            preview["result"]["calculation"]["is_whole_position_sold"],
+            full_position
+        );
+        assert_eq!(preview["result"]["order_submission"]["submitted"], false);
+        assert_eq!(
+            preview["confirmation"]["requires_appropriateness_warning_acknowledgement"],
+            require_ack
+        );
+        let confirmation_id = preview["confirmation"]["id"].as_str().unwrap();
+        let mut stored = load_confirmation(confirmation_id)
+            .unwrap()
+            .expect("stored preview");
+        assert_eq!(stored.order_type, "stop-limit");
+        assert_eq!(
+            stored.phase1_input.limit_price.as_deref(),
+            Some(limit.to_string().as_str())
+        );
+        assert_eq!(
+            stored.phase1_input.stop_price.as_deref(),
+            Some(stop.to_string().as_str())
+        );
+        let mut replay = preview["confirmation"]["phase_2_command_template_json"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        match outcome {
+            StopLimitFlowOutcome::LimitMismatch => {
+                replay = replay.replace("--limit-price 110", "--limit-price 111")
+            }
+            StopLimitFlowOutcome::StopMismatch => {
+                replay = replay.replace("--stop-price 105", "--stop-price 106")
+            }
+            StopLimitFlowOutcome::TypeMismatch => {
+                replay = replay
+                    .replace("--order-type stop-limit", "--order-type stop")
+                    .replace(" --limit-price 110", "")
+            }
+            StopLimitFlowOutcome::PriceFormatMismatch => {
+                replay = replay.replace("--limit-price 110", "--limit-price 110.00")
+            }
+            StopLimitFlowOutcome::SizingFormatMismatch => {
+                replay = replay.replace("--amount 1000", "--amount 1000.00")
+            }
+            StopLimitFlowOutcome::Expired => {
+                stored.expires_at_epoch = current_epoch_seconds() - 1;
+                upsert_confirmation(stored.clone(), current_epoch_seconds()).unwrap();
+            }
+            StopLimitFlowOutcome::Consumed => {
+                mark_confirmation_consumed(confirmation_id, current_epoch_seconds()).unwrap()
+            }
+            StopLimitFlowOutcome::MissingAcknowledgement => {
+                replay = replay.replace(" --acknowledge-appropriateness-warning", "")
+            }
+            StopLimitFlowOutcome::ConfirmNotionalBlocked => {
+                config.trade_controls.as_mut().unwrap().max_order_notional =
+                    Some("944.9999".to_string())
+            }
+            _ => {}
+        }
+        let early_rejection = matches!(
+            outcome,
+            StopLimitFlowOutcome::LimitMismatch
+                | StopLimitFlowOutcome::StopMismatch
+                | StopLimitFlowOutcome::TypeMismatch
+                | StopLimitFlowOutcome::PriceFormatMismatch
+                | StopLimitFlowOutcome::SizingFormatMismatch
+                | StopLimitFlowOutcome::Expired
+                | StopLimitFlowOutcome::Consumed
+        );
+        let mut confirm_mocks = Vec::new();
+        if !early_rejection {
+            let mut fresh_tradability = tradability;
+            if outcome == StopLimitFlowOutcome::ComplianceDrift {
+                fresh_tradability["data"]["account"]["brokerPortfolio"]["suitabilityStatuses"][0]
+                    ["result"] = json!("SUITABLE");
+            }
+            let fresh_mid = match outcome {
+                StopLimitFlowOutcome::SizingDrift => 120.0,
+                StopLimitFlowOutcome::FreshQuoteNotionalBlocked => 106.0,
+                _ => 100.0,
+            };
+            let mut fresh_ex_ante = ex_ante_variables;
+            if outcome == StopLimitFlowOutcome::SizingDrift {
+                fresh_ex_ante["numberOfShares"] = json!(8);
+                fresh_ex_ante["estimatedOrderVolume"] = json!(880.0);
+            } else if outcome == StopLimitFlowOutcome::FreshQuoteNotionalBlocked {
+                fresh_ex_ante["estimatedOrderVolume"] = json!(963.0);
+            }
+            let mut costs: Value =
+                serde_json::from_str(&trade_preparation_ex_ante_response()).unwrap();
+            if outcome == StopLimitFlowOutcome::CostsDrift {
+                costs["data"]["account"]["brokerPortfolio"]["singleTradeExAnteCosts"]["ongoingCosts"]
+                    ["serviceCosts"]["amount"] = json!(0.1);
+            }
+            confirm_mocks.extend([
+                mock_trade_read(&mut server, "ResolveBrokerIds", json!({"id": "person-1"}), resolve_response),
+                mock_trade_read(&mut server, "getTradingTradability", json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000"}), fresh_tradability.to_string()),
+                mock_trade_read(&mut server, "getSecurityTick", json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000", "source": "XETR", "includeYearToDate": false}), trade_preparation_tick_response(fresh_mid)),
+                mock_trade_read(&mut server, "getSingleTradeExAnteCost", fresh_ex_ante, costs.to_string()),
+            ]);
+            if require_ack && outcome != StopLimitFlowOutcome::ComplianceDrift {
+                confirm_mocks.push(mock_trade_read(
+                    &mut server,
+                    "getBrokerAppropriatenessWarning",
+                    json!({"locale": "en-DE"}),
+                    warning_response,
+                ));
+            }
+        }
+        let mut input = json!({"isin": "DE0007100000", "side": side.as_graphql(), "numberOfShares": shares, "currency": "EUR", "venue": "XETR", "limitPrice": limit, "stopPrice": stop});
+        if require_ack {
+            input["appropriatenessId"] = json!("suit-ci-1");
+            input["acknowledgedAppropriatenessWarningVersion"] = json!("warning-1");
+        }
+        let placement = server.mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_header("x-sc-order-origin", "CLI")
+            .match_header("x-sc-idempotency-id", Matcher::Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$".to_string()))
+            .match_body(graphql_variables_matcher("placeOrder", json!({"portfolioId": "portfolio-1", "isBuy": side.is_buy(), "input": input})))
+            .with_status(200).with_header("content-type", "application/json")
+            .with_body(json!({"data": {"placeOrder": {"brokerPortfolio": {"id": "portfolio-1"}, "orderData": {"orderId": "order-stop-limit", "isMarketable": false}}}}).to_string())
+            .expect(if outcome == StopLimitFlowOutcome::Submit { 1 } else { 0 }).create();
+        let confirmed = execute_test_trade_command(&replay, &config, &mut session_manager);
+        if outcome == StopLimitFlowOutcome::Submit {
+            let confirmed = confirmed.expect("confirmed placement");
+            assert_eq!(
+                confirmed["result"]["order_submission"]["order_id"],
+                "order-stop-limit"
+            );
+            assert!(
+                load_confirmation(confirmation_id)
+                    .unwrap()
+                    .unwrap()
+                    .consumed_at_epoch
+                    .is_some()
+            );
+            let err = execute_test_trade_command(&replay, &config, &mut session_manager)
+                .expect_err("cannot reuse confirmation");
+            assert!(err.to_string().contains("CONFIRMATION_ALREADY_USED"));
+        } else {
+            let message = confirmed.expect_err("blocked confirmation").to_string();
+            let expected = match outcome {
+                StopLimitFlowOutcome::Expired => "CONFIRMATION_EXPIRED",
+                StopLimitFlowOutcome::Consumed => "CONFIRMATION_ALREADY_USED",
+                StopLimitFlowOutcome::MissingAcknowledgement => {
+                    "CONFIRMATION_APPROPRIATENESS_WARNING_ACK_REQUIRED"
+                }
+                StopLimitFlowOutcome::ConfirmNotionalBlocked
+                | StopLimitFlowOutcome::FreshQuoteNotionalBlocked => "LOCAL_TRADE_CONTROL",
+                _ => "CONFIRMATION_FIELDS_MISMATCH",
+            };
+            assert!(message.contains(expected), "{outcome:?}: {message}");
+        }
+        for mock in confirm_mocks {
+            mock.assert();
+        }
+        placement.assert();
+        unexpected_placement.assert();
+    }
+
+    #[test]
+    fn stop_limit_preview_and_confirm_cover_amount_shares_and_decimal_sells() {
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            true,
+            false,
+            false,
+            StopLimitFlowOutcome::Submit,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            false,
+            true,
+            false,
+            StopLimitFlowOutcome::Submit,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Sell,
+            false,
+            false,
+            false,
+            StopLimitFlowOutcome::Submit,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Sell,
+            false,
+            false,
+            true,
+            StopLimitFlowOutcome::Submit,
+        );
+    }
+
+    #[test]
+    fn stop_limit_confirmation_gates_prevent_placement() {
+        for outcome in [
+            StopLimitFlowOutcome::LimitMismatch,
+            StopLimitFlowOutcome::StopMismatch,
+            StopLimitFlowOutcome::TypeMismatch,
+            StopLimitFlowOutcome::PriceFormatMismatch,
+            StopLimitFlowOutcome::SizingFormatMismatch,
+            StopLimitFlowOutcome::Expired,
+            StopLimitFlowOutcome::Consumed,
+            StopLimitFlowOutcome::SizingDrift,
+            StopLimitFlowOutcome::CostsDrift,
+            StopLimitFlowOutcome::PreviewNotionalBlocked,
+            StopLimitFlowOutcome::ConfirmNotionalBlocked,
+            StopLimitFlowOutcome::StaleQuote,
+        ] {
+            assert_stop_limit_flow(TradeSide::Buy, true, false, false, outcome);
+        }
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            false,
+            false,
+            false,
+            StopLimitFlowOutcome::FreshQuoteNotionalBlocked,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            false,
+            true,
+            false,
+            StopLimitFlowOutcome::MissingAcknowledgement,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            false,
+            true,
+            false,
+            StopLimitFlowOutcome::ComplianceDrift,
+        );
     }
 
     fn sample_result_payload() -> Value {
@@ -2444,7 +3405,7 @@ mod tests {
             },
             "tradability": {
                 "status": "TRADABLE_WITHOUT_APPROPRIATENESS",
-                "selected_venue": "GETTEX",
+                "selected_venue": "MUNC",
                 "selected_venue_label": "Börse München (gettex)",
                 "selected_venue_status": "TRADABLE_WITHOUT_APPROPRIATENESS",
                 "selected_venue_unavailability_reason": Value::Null,
@@ -2777,7 +3738,7 @@ mod tests {
 
     #[test]
     fn venue_labels_cover_mapped_and_unmapped_values() {
-        assert_eq!(display_venue_label("GETTEX"), VENUE_LABEL_GETTEX);
+        assert_eq!(display_venue_label("MUNC"), VENUE_LABEL_GETTEX);
         assert_eq!(display_venue_label("XETR"), VENUE_LABEL_XETRA);
         assert_eq!(display_venue_label("SEIX"), VENUE_LABEL_SEIX);
         assert_eq!(display_venue_label("OTCX"), "OTCX");
@@ -2818,7 +3779,7 @@ mod tests {
 
     #[test]
     fn sell_regulatory_disclosures_include_execution_instruction_only() {
-        let disclosures = build_sell_regulatory_disclosures("GETTEX", VENUE_LABEL_GETTEX);
+        let disclosures = build_sell_regulatory_disclosures("MUNC", VENUE_LABEL_GETTEX);
 
         assert_eq!(disclosures.market_data_notice, None);
         assert_eq!(
@@ -3255,14 +4216,14 @@ mod tests {
                 stop_price: None,
                 limit_price_str: Some("48.50".to_string()),
                 stop_price_str: None,
-                venue_override: Some("GETTEX".to_string()),
+                venue_override: Some("MUNC".to_string()),
                 locale: "en_DE".to_string(),
             },
             tradability_gate: TradeTradabilityGate {
                 status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),
                 tradable: true,
                 requires_appropriateness: false,
-                selected_venue: "GETTEX".to_string(),
+                selected_venue: "MUNC".to_string(),
                 selected_venue_status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),
                 selected_venue_unavailability_reason: None,
                 selected_venue_sellable: None,
@@ -3327,7 +4288,7 @@ mod tests {
                 isin: "DE0007100000".to_string(),
                 amount: Some("500".to_string()),
                 currency: "EUR".to_string(),
-                venue: "GETTEX".to_string(),
+                venue: "MUNC".to_string(),
                 shares: "9".to_string(),
                 entry_total: "0.46".to_string(),
                 ongoing_total: "0.12".to_string(),
@@ -3344,7 +4305,7 @@ mod tests {
             status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),
             tradable: true,
             requires_appropriateness: false,
-            selected_venue: "GETTEX".to_string(),
+            selected_venue: "MUNC".to_string(),
             selected_venue_status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),
             selected_venue_unavailability_reason: None,
             selected_venue_sellable: matches!(side, TradeSide::Sell).then_some(5.0),
@@ -3733,7 +4694,7 @@ mod tests {
 
         assert_eq!(intent.isin, "DE0007100000");
         assert_eq!(intent.amount_str.as_deref(), Some("500"));
-        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
+        assert_eq!(intent.venue_override.as_deref(), Some("MUNC"));
         assert_eq!(intent.locale, TRADE_WARNING_LOCALE);
     }
 
@@ -3784,6 +4745,39 @@ mod tests {
     }
 
     #[test]
+    fn phase1_and_phase2_canonicalize_equivalent_venue_inputs() {
+        let buy_args = |venue: &str, confirm: Option<&str>| crate::cli::BrokerTradeBuyArgs {
+            isin: Some("DE0007100000".to_string()),
+            amount: Some("250.20".to_string()),
+            shares: None,
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: Some(venue.to_string()),
+            confirm: confirm.map(ToString::to_string),
+            acknowledge_appropriateness_warning: false,
+            json: true,
+        };
+
+        for (phase1_venue, phase2_venue) in [("eix", "SEIX"), ("SEIX", "eix")] {
+            let phase1_args = buy_args(phase1_venue, None);
+            let phase2_args = buy_args(phase2_venue, Some("scb1_test"));
+            let (phase1_input, phase1_intent) =
+                parse_phase1_buy(&phase1_args).expect("phase 1 input should parse");
+            let phase2 = parse_phase2_input_buy(&phase2_args).expect("phase 2 input should parse");
+
+            assert_eq!(phase1_input.venue.as_deref(), Some(VENUE_SEIX));
+            assert_eq!(phase1_intent.venue_override.as_deref(), Some(VENUE_SEIX));
+            assert_eq!(phase2.venue.as_deref(), Some(VENUE_SEIX));
+            assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1_input)
+                .expect("equivalent venue inputs should match");
+
+            let command = build_phase2_command_template("scb1_test", &phase1_input, false, true);
+            assert!(command.contains("--venue SEIX"));
+        }
+    }
+
+    #[test]
     fn build_phase2_intent_supports_buy_shares() {
         let phase2 = Phase2Input {
             confirmation_id: "scb1_test".to_string(),
@@ -3819,7 +4813,7 @@ mod tests {
         assert_eq!(intent.amount, None);
         assert_eq!(intent.shares, Some(NumberOfShares::Whole(3)));
         assert_eq!(intent.shares_str.as_deref(), Some("3"));
-        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
+        assert_eq!(intent.venue_override.as_deref(), Some("MUNC"));
     }
 
     #[test]
@@ -4041,8 +5035,30 @@ mod tests {
             parse_phase1_input_for_confirmation_buy(&args).expect("phase 1 confirmation input");
 
         assert_eq!(intent.isin, "DE000HSBC123");
-        assert_eq!(intent.venue_override.as_deref(), Some("GETTEX"));
+        assert_eq!(intent.venue_override.as_deref(), Some("MUNC"));
         assert_eq!(confirmation.isin, "DE000HSBC123");
+        assert_eq!(confirmation.venue.as_deref(), Some(VENUE_MUNC));
+    }
+
+    #[test]
+    fn parse_phase1_sell_canonicalizes_gettex_alias_for_intent_and_confirmation() {
+        let args = crate::cli::BrokerTradeSellArgs {
+            isin: Some("DE000HSBC123".to_string()),
+            shares: Some("3".to_string()),
+            order_type: crate::cli::BrokerTradeOrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            venue: Some("gettex".to_string()),
+            confirm: None,
+            json: true,
+        };
+
+        let intent = parse_phase1_intent_sell(&args).expect("phase 1 sell intent");
+        let confirmation =
+            parse_phase1_input_for_confirmation_sell(&args).expect("phase 1 sell confirmation");
+
+        assert_eq!(intent.venue_override.as_deref(), Some(VENUE_MUNC));
+        assert_eq!(confirmation.venue.as_deref(), Some(VENUE_MUNC));
     }
 
     #[test]
@@ -4231,6 +5247,171 @@ mod tests {
     }
 
     #[test]
+    fn stop_limit_replay_trims_prices_but_preserves_numeric_spelling() {
+        for amount_buy in [true, false] {
+            let args = |confirm| crate::cli::BrokerTradeBuyArgs {
+                isin: Some(" de0007100000 ".to_string()),
+                amount: amount_buy.then(|| " 1000.00 ".to_string()),
+                shares: (!amount_buy).then(|| " 09 ".to_string()),
+                order_type: crate::cli::BrokerTradeOrderType::StopLimit,
+                limit_price: Some(" 110.00 ".to_string()),
+                stop_price: Some(" 105.00 ".to_string()),
+                venue: Some(" xetra ".to_string()),
+                confirm,
+                acknowledge_appropriateness_warning: false,
+                json: true,
+            };
+            let (phase1, intent) = parse_phase1_buy(&args(None)).expect("phase 1");
+            let mut phase2_args = args(Some("scb1_test".to_string()));
+            phase2_args.venue = Some("XETR".to_string());
+            let phase2 = parse_phase2_input_buy(&phase2_args).expect("phase 2");
+            assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1)
+                .expect("trimmed replay");
+            assert_eq!(phase1.limit_price.as_deref(), Some("110.00"));
+            assert_eq!(phase1.stop_price.as_deref(), Some("105.00"));
+            assert_eq!(intent.order_type, "stop-limit");
+            if amount_buy {
+                phase2_args.amount = Some("1000".to_string());
+            } else {
+                phase2_args.shares = Some("9".to_string());
+            }
+            let phase2 = parse_phase2_input_buy(&phase2_args).expect("valid numeric spelling");
+            assert!(assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1).is_err());
+        }
+    }
+
+    #[test]
+    fn stop_limit_prices_and_type_bind_preview_and_submission_hashes() {
+        let hashes = |limit, stop, order_type| {
+            let checksum = checksum_for_payload(&intent_checksum_payload(IntentChecksumInput {
+                env: crate::channel::current_env(),
+                account_id: "account-1",
+                portfolio_id: "portfolio-1",
+                side: "buy",
+                order_type,
+                isin: "DE0007100000",
+                amount: Some("1000"),
+                shares: None,
+                limit_price: Some(limit),
+                stop_price: Some(stop),
+                venue_override: Some("XETR"),
+            }));
+            let submission = trade_intent_hash(TradeIntentHashInput {
+                env: crate::channel::current_env(),
+                account_id: "account-1",
+                portfolio_id: "portfolio-1",
+                side: "buy",
+                order_type,
+                isin: "DE0007100000",
+                amount: Some("1000"),
+                shares_input: None,
+                limit_price: Some(limit),
+                stop_price: Some(stop),
+                shares: "9",
+                estimated_order_volume: "945",
+                venue: "XETR",
+            });
+            (checksum, submission)
+        };
+        let original = hashes("110", "105", "stop-limit");
+        for changed in [
+            hashes("111", "105", "stop-limit"),
+            hashes("110", "106", "stop-limit"),
+            hashes("110.00", "105", "stop-limit"),
+            hashes("110", "105", "stop"),
+        ] {
+            assert_ne!(original.0, changed.0);
+            assert_ne!(original.1, changed.1);
+        }
+    }
+
+    #[test]
+    fn stop_limit_amount_sizing_uses_ask_and_controls_use_rounded_estimate() {
+        let mut intent = trade_intent_for_preparation_test(TradeSide::Buy, None);
+        intent.amount = Some(1000.0);
+        intent.amount_str = Some("1000".to_string());
+        intent.order_type = ORDER_TYPE_STOP_LIMIT.to_string();
+        intent.stop_price = Some(105.1234569);
+        intent.stop_price_str = Some("105.1234569".to_string());
+        intent.limit_price = Some(110.0);
+        intent.limit_price_str = Some("110".to_string());
+        let quote = SecurityTick {
+            ask_price: Some(101.0),
+            bid_price: Some(99.0),
+            mid_price: 100.0,
+            currency: "EUR".to_string(),
+            is_outdated: false,
+            timestamp_utc: None,
+        };
+        let calculation = calculate_trade_quantities(
+            &intent,
+            &quote,
+            &sample_tradability_gate_for_calculation(TradeSide::Buy),
+        )
+        .expect("calculate");
+        assert_eq!(calculation.number_of_shares, NumberOfShares::Whole(9));
+        assert_eq!(calculation.sizing_price_basis, "ask_price");
+        assert_eq!(calculation.estimate_price_basis, "stop_price");
+        assert_eq!(calculation.estimated_order_volume, 946.1111);
+        assert!(calculation.estimated_order_volume_raw > calculation.estimated_order_volume);
+        for (cap, passes) in [("946.1111", true), ("946.11109", false)] {
+            let policy = TradeControlsPolicy::from_config(&crate::config::TradeControlsConfig {
+                max_order_notional: Some(cap.to_string()),
+                ..Default::default()
+            });
+            assert_eq!(
+                policy
+                    .check_estimated_order_volume(calculation.estimated_order_volume)
+                    .is_ok(),
+                passes
+            );
+        }
+    }
+
+    #[test]
+    fn validate_stop_limit_requires_independent_positive_prices() {
+        use crate::cli::BrokerTradeOrderType;
+        for invalid in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("bad"),
+            Some("NaN"),
+            Some("inf"),
+            Some("-inf"),
+            Some("0"),
+            Some("-1"),
+            Some("1e309"),
+        ] {
+            assert!(
+                validate_order_price_flags(BrokerTradeOrderType::StopLimit, invalid, Some("105"))
+                    .is_err()
+            );
+            assert!(
+                validate_order_price_flags(BrokerTradeOrderType::StopLimit, Some("110"), invalid)
+                    .is_err()
+            );
+        }
+        for (limit, stop) in [("110", "105"), ("105", "105"), ("90", "105")] {
+            let prices = validate_order_price_flags(
+                BrokerTradeOrderType::StopLimit,
+                Some(limit),
+                Some(stop),
+            )
+            .expect("valid relationship");
+            assert_eq!(prices.limit_price.as_deref(), Some(limit));
+            assert_eq!(prices.stop_price.as_deref(), Some(stop));
+        }
+        for order_type in [
+            BrokerTradeOrderType::Market,
+            BrokerTradeOrderType::Limit,
+            BrokerTradeOrderType::Stop,
+        ] {
+            assert!(validate_order_price_flags(order_type, Some("110"), Some("105")).is_err());
+        }
+    }
+
+    #[test]
     fn validate_order_price_flags_rejects_market_with_prices() {
         let err = validate_order_price_flags(
             crate::cli::BrokerTradeOrderType::Market,
@@ -4242,14 +5423,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_order_price_flags_rejects_both_prices() {
+    fn validate_order_price_flags_rejects_stop_price_for_limit_order() {
         let err = validate_order_price_flags(
             crate::cli::BrokerTradeOrderType::Limit,
             Some("123.45"),
             Some("120"),
         )
         .expect_err("both prices should fail");
-        assert!(err.to_string().contains("cannot be used together"));
+        assert!(
+            err.to_string()
+                .contains("--order-type limit does not allow --stop-price")
+        );
     }
 
     #[test]

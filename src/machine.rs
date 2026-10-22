@@ -4,7 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
 
-use crate::auth::REFRESH_RELOGIN_REQUIRED_PREFIX;
+use crate::auth::{REFRESH_RELOGIN_REQUIRED_PREFIX, REFRESH_RETRYABLE_PREFIX};
+use crate::broker_projections::BROKER_CHART_DATA_UNAVAILABLE_PREFIX;
 use crate::broker_shared::{
     BROKER_PORTFOLIO_GROUP_ALREADY_EXISTS_ERROR_PREFIX,
     BROKER_PORTFOLIO_GROUP_CANNOT_BE_REMOVED_ERROR_PREFIX,
@@ -130,6 +131,7 @@ fn concise_error_message(message: &str) -> String {
 
 fn sanitize_error_message(message: &str) -> Cow<'_, str> {
     if !message.contains(REFRESH_RELOGIN_REQUIRED_PREFIX)
+        && !message.contains(REFRESH_RETRYABLE_PREFIX)
         && !message.contains(LOCAL_READ_ONLY_ERROR_PREFIX)
         && !message.contains(LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX)
         && !message.contains(LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX)
@@ -141,6 +143,7 @@ fn sanitize_error_message(message: &str) -> Cow<'_, str> {
     let mut sanitized = message.to_string();
     for prefix in [
         REFRESH_RELOGIN_REQUIRED_PREFIX,
+        REFRESH_RETRYABLE_PREFIX,
         LOCAL_READ_ONLY_ERROR_PREFIX,
         LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX,
         LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX,
@@ -197,6 +200,21 @@ fn classify_clap_error(err: &ClapError) -> ClassifiedError {
 }
 
 pub fn classify_error(err: &Error) -> ClassifiedError {
+    // Durable refresh recovery defines the safe next action, even when its
+    // final save failed with a typed storage error that normally advises login.
+    if err
+        .chain()
+        .any(|cause| cause.to_string().starts_with(REFRESH_RETRYABLE_PREFIX))
+    {
+        return ClassifiedError {
+            code: "refresh_retryable",
+            exit_code: 30,
+            hints: vec![
+                "Retry the command. The rotated refresh token was saved locally.".to_string(),
+            ],
+        };
+    }
+
     if let Some(storage_error) = session_storage_error_in_chain(err) {
         return match storage_error {
             SessionStorageError::SecretStoreUnavailable { .. } => ClassifiedError {
@@ -459,6 +477,16 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             code: "portfolio_group_cannot_be_removed",
             exit_code: 10,
             hints: vec!["Remove dependent items or pending activity, then retry.".to_string()],
+        };
+    }
+    if text.contains(BROKER_CHART_DATA_UNAVAILABLE_PREFIX) {
+        return ClassifiedError {
+            code: "broker_chart_data_unavailable",
+            exit_code: 10,
+            hints: vec![
+                "The instrument may not have market data for this timeframe; try another timeframe or security."
+                    .to_string(),
+            ],
         };
     }
     if lower.contains("broker response invalid:") {
@@ -1025,6 +1053,30 @@ mod tests {
     }
 
     #[test]
+    fn classify_broker_chart_data_unavailable_error() {
+        let message = "Chart data is unavailable for ISIN 'US0378331005' in the '1d' timeframe.";
+        let err = anyhow!(message);
+
+        let classified = classify_error(&err);
+        assert_eq!(classified.code, "broker_chart_data_unavailable");
+        assert_eq!(classified.exit_code, 10);
+        assert_eq!(
+            classified.hints,
+            vec![
+                "The instrument may not have market data for this timeframe; try another timeframe or security."
+            ]
+        );
+
+        let envelope =
+            classified_error_envelope("broker.chart", &user_error_message(&err), &classified);
+        let value = serde_json::to_value(envelope).expect("serialize machine envelope");
+        assert_eq!(value["error"]["code"], "broker_chart_data_unavailable");
+        assert_eq!(value["error"]["message"], message);
+        assert_eq!(human_error_message(&err), message);
+        assert!(message.starts_with(BROKER_CHART_DATA_UNAVAILABLE_PREFIX));
+    }
+
+    #[test]
     fn classify_broker_transaction_not_found_error() {
         let err = anyhow!("Broker transaction not found: field 'transaction_id' was not found");
         let c = classify_error(&err);
@@ -1093,6 +1145,44 @@ mod tests {
     }
 
     #[test]
+    fn classify_retryable_refresh_error() {
+        let err = anyhow!(
+            "{REFRESH_RETRYABLE_PREFIX} Token refresh succeeded, but token verification is temporarily unavailable."
+        );
+        let classified = classify_error(&err);
+
+        assert_eq!(classified.code, "refresh_retryable");
+        assert_eq!(classified.exit_code, 30);
+        assert_eq!(
+            concise_error_message(&err.to_string()),
+            "Token refresh succeeded, but token verification is temporarily unavailable."
+        );
+    }
+
+    #[test]
+    fn classify_retryable_refresh_overrides_underlying_typed_storage_error() {
+        let _lock = crate::lock_test_env();
+        let storage_error = anyhow::Error::new(SessionStorageError::secret_store_unavailable(
+            keyring_core::Error::NoDefaultStore,
+        ));
+        let error = crate::auth::refresh_retryable_with_error(
+            "The rotated refresh token was saved but final session persistence failed. Retry the command",
+            storage_error,
+        )
+        .into_error()
+        .context("Authenticated command failed");
+
+        assert!(session_storage_error_in_chain(&error).is_some());
+        let classified = classify_error(&error);
+        assert_eq!(classified.code, "refresh_retryable");
+        assert_eq!(classified.exit_code, 30);
+        assert_eq!(
+            classified.hints,
+            vec!["Retry the command. The rotated refresh token was saved locally."]
+        );
+    }
+
+    #[test]
     fn classify_local_read_only_error() {
         let err = anyhow!(
             "{LOCAL_READ_ONLY_ERROR_PREFIX} local read-only mode blocks write operation 'BrokerAddToWatchlist'. Re-login without --local-read-only to perform write operations."
@@ -1143,7 +1233,9 @@ mod tests {
                 "DBus error: org.freedesktop.secrets",
             ))),
         ))
-        .context("outer context");
+        .context(format!(
+            "Storage diagnostic mentions {REFRESH_RETRYABLE_PREFIX}"
+        ));
         let c = classify_error(&err);
         assert_eq!(c.code, "secret_storage_unavailable");
         assert_eq!(c.exit_code, 20);
