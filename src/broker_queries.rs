@@ -9,6 +9,8 @@ use crate::cli::{
     BrokerDerivativeType,
 };
 
+use crate::quote_source::QuoteSource;
+
 const VALID_BROKER_TRANSACTION_TYPE_FILTERS: &[&str] = &[
     "BUY",
     "SELL",
@@ -60,8 +62,6 @@ const CRYPTO_TRANSACTION_STATUSES: &[&str] = &[
     "REJECTED",
     "CONFIRMED",
 ];
-
-const CONSOLIDATED_MARKET_DATA_SOURCE: &str = "CONSOLIDATED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NormalizedBrokerTransactionsQueryInput {
@@ -192,6 +192,7 @@ query BrokerHoldings(
             currency
           }
           quoteTick(source: $quoteSource, includeYearToDate: $includeYearToDate) {
+            venue
             midPrice
             currency
             timestampUtc {
@@ -378,6 +379,19 @@ query BrokerTransactions(
 }
 "#;
 
+pub(crate) const BROKER_LATEST_STOP_PRICE_QUERY: &str = r#"
+query latestStopPrice($personId: ID!, $portfolioId: ID!, $transactionReference: String!) {
+  account(id: $personId) {
+    brokerPortfolio(id: $portfolioId) {
+      latestStopPrice(transactionReference: $transactionReference) {
+        stopPrice
+        latestStopPriceTimestamp { time epochSecond epochMillisecond }
+      }
+    }
+  }
+}
+"#;
+
 pub const BROKER_TRANSACTION_DETAILS_QUERY: &str = r#"
 query BrokerTransactionDetails($accountId: ID!, $portfolioId: ID!, $transactionId: ID!) {
   account(id: $accountId) {
@@ -553,6 +567,7 @@ query BrokerWatchlist(
           name
           type
           quoteTick(source: $quoteSource, includeYearToDate: $includeYearToDate) {
+            venue
             midPrice
             currency
             timestampUtc {
@@ -613,6 +628,7 @@ query BrokerSecuritySearch(
           name
           type
           quoteTick(source: $quoteSource, includeYearToDate: $includeYearToDate) {
+            venue
             midPrice
             currency
             timestampUtc {
@@ -740,6 +756,7 @@ query BrokerQuote(
         name
         type
         quoteTick(source: $quoteSource, includeYearToDate: $includeYearToDate) {
+          venue
           id
           isin
           midPrice
@@ -1111,6 +1128,7 @@ pub struct BrokerInput {
     account_id: String,
     portfolio_id: String,
     include_year_to_date: bool,
+    quote_source: QuoteSource,
 }
 
 impl BrokerInput {
@@ -1132,7 +1150,17 @@ impl BrokerInput {
             account_id: account_id.to_string(),
             portfolio_id: portfolio_id.to_string(),
             include_year_to_date,
+            quote_source: QuoteSource::default(),
         })
+    }
+
+    pub(crate) fn with_quote_source(mut self, source: QuoteSource) -> Self {
+        self.quote_source = source;
+        self
+    }
+
+    pub(crate) fn quote_source(&self) -> QuoteSource {
+        self.quote_source
     }
 
     pub(crate) fn account_id_value(&self) -> Value {
@@ -1210,7 +1238,7 @@ pub fn broker_holdings_variables(input: &BrokerInput) -> Result<Value> {
         "accountId": input.account_id,
         "portfolioId": input.portfolio_id,
         "includeYearToDate": input.include_year_to_date,
-        "quoteSource": CONSOLIDATED_MARKET_DATA_SOURCE,
+        "quoteSource": input.quote_source.as_graphql(),
     }))
 }
 

@@ -5,15 +5,25 @@ use crate::cli::WhoamiArgs;
 use crate::config::AppConfig;
 use crate::graphql::run_whoami_query;
 use crate::print_whoami_text;
-use crate::session::SessionManager;
+use crate::session::{SessionManager, SessionMode};
 use crate::session_refresh::{execute_with_refresh_retry, refresh_loaded_session_if_needed};
 use crate::transport_security::validate_env_transport_security;
 
-fn load_whoami_result(config: &AppConfig, session_manager: &mut SessionManager) -> Result<Value> {
+struct WhoamiResult {
+    identity: Value,
+    local_read_only: bool,
+}
+
+fn load_whoami_result(
+    config: &AppConfig,
+    session_manager: &mut SessionManager,
+) -> Result<WhoamiResult> {
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
     let dpop_options = &dpop_options;
     let stored = session_manager.load_required_active()?;
     crate::channel::require_current_channel(stored.env)?;
+    // Report the mode from the session snapshot used to start this command.
+    let local_read_only = stored.mode == Some(SessionMode::LocalReadOnly);
     let env = stored.env;
     let env_cfg = crate::channel::current_env_config();
     validate_env_transport_security(&env_cfg)?;
@@ -21,35 +31,27 @@ fn load_whoami_result(config: &AppConfig, session_manager: &mut SessionManager) 
         refresh_loaded_session_if_needed(session_manager, env, &env_cfg, stored, dpop_options)?;
 
     let person_id = session.person_id.clone();
-    execute_with_refresh_retry(
+    let identity = execute_with_refresh_retry(
         session_manager,
         env,
         &env_cfg,
         &mut session,
         dpop_options,
         |token| run_whoami_query(&env_cfg.graphql_url, token, &person_id, dpop_options),
-    )
+    )?;
+    Ok(WhoamiResult {
+        identity,
+        local_read_only,
+    })
 }
 
 pub(crate) fn run_human_whoami_command(
-    args: WhoamiArgs,
+    _args: WhoamiArgs,
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<()> {
     let result = load_whoami_result(config, session_manager)?;
-    if args.json {
-        let payload = json!({
-            "personOverview": result
-                .get("personOverview")
-                .cloned()
-                .unwrap_or(result.clone()),
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        print_whoami_text(&result)?;
-    }
-
-    Ok(())
+    print_whoami_text(&result.identity, result.local_read_only)
 }
 
 pub(crate) fn run_machine_whoami_command(
@@ -58,7 +60,10 @@ pub(crate) fn run_machine_whoami_command(
     session_manager: &mut SessionManager,
 ) -> Result<Value> {
     let result = load_whoami_result(config, session_manager)?;
-    Ok(json!({ "result": result }))
+    Ok(json!({
+        "result": result.identity,
+        "session": { "local_read_only": result.local_read_only },
+    }))
 }
 
 #[cfg(test)]
@@ -423,6 +428,88 @@ Avd7QBCxvqXU+7acaZ2xxaV4
 
     #[test]
     fn machine_whoami_persists_rotated_refresh_token() {
+        assert_machine_whoami_refresh_and_session_mode(None);
+    }
+
+    #[test]
+    fn machine_whoami_reports_local_read_only_after_refresh() {
+        assert_machine_whoami_refresh_and_session_mode(Some(
+            crate::session::SessionMode::LocalReadOnly,
+        ));
+    }
+
+    #[test]
+    fn machine_whoami_reports_loaded_session_mode_during_concurrent_login() {
+        for mode in [None, Some(SessionMode::LocalReadOnly)] {
+            assert_machine_whoami_uses_loaded_session_mode(mode);
+        }
+    }
+
+    fn assert_machine_whoami_uses_loaded_session_mode(mode: Option<SessionMode>) {
+        let mut server = Server::new();
+        let env_cfg = sample_env(&server);
+        let _channel_guard = TestChannelGuard::from_env(&env_cfg);
+        let config = sample_config();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = file_session_manager(&tmp);
+        let original = StoredSession {
+            env: crate::channel::current_env(),
+            session: sample_session(&env_cfg, 9_999_999_999),
+            dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
+            mode,
+            refresh_recovery_pending: false,
+        };
+        session_manager
+            .save_active(&original)
+            .expect("save original");
+        let mut replacement = original.clone();
+        replacement.mode = if mode.is_some() {
+            None
+        } else {
+            Some(SessionMode::LocalReadOnly)
+        };
+        replacement.session.person_id = "p-2".to_string();
+        replacement.session.access_token = make_verified_token(&env_cfg, json!({"jti": "login"}));
+        replacement.session.refresh_token = Some("replacement-refresh".to_string());
+        let query_replacement = replacement.clone();
+        let config_dir = tmp.path().to_path_buf();
+        let query = server
+            .mock("POST", "/")
+            .match_header(
+                "authorization",
+                format!("DPoP {}", original.session.access_token).as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_chunked_body(move |writer| {
+                let store = FileStore::new(config_dir.clone()).expect("file store");
+                let mut manager = SessionManager::with_store(StorageBackend::File(store));
+                manager
+                    .save_active(&query_replacement)
+                    .expect("save replacement");
+                writer.write_all(br#"{"data":{"personOverview":{"id":"p-1"}}}"#)
+            })
+            .expect(1)
+            .create();
+
+        let result =
+            run_machine_whoami_command(WhoamiArgs { json: false }, &config, &mut session_manager)
+                .expect("whoami reports the loaded session snapshot");
+        assert_eq!(result["result"]["personOverview"]["id"], "p-1");
+        assert_eq!(result["session"]["local_read_only"], mode.is_some());
+        assert_eq!(
+            session_manager
+                .load_required_active()
+                .expect("saved session"),
+            replacement,
+            "the concurrent login must remain untouched"
+        );
+        query.assert();
+    }
+
+    fn assert_machine_whoami_refresh_and_session_mode(mode: Option<crate::session::SessionMode>) {
         let mut server = Server::new();
         let env_cfg = sample_env(&server);
         let (_discovery, _jwks) = mock_oidc(&mut server, &env_cfg.auth.issuer, 2);
@@ -477,7 +564,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 env: crate::channel::current_env(),
                 session: sample_session(&env_cfg, 0),
                 dpop_jwk_thumbprint: Some(current_runtime_dpop_thumbprint(&config)),
-                mode: None,
+                mode,
                 refresh_recovery_pending: false,
             })
             .expect("save active session");
@@ -487,11 +574,16 @@ Avd7QBCxvqXU+7acaZ2xxaV4
                 .expect("whoami should succeed");
 
         assert_eq!(result["result"]["personOverview"]["id"], "p-1");
+        assert_eq!(
+            result["session"]["local_read_only"],
+            mode == Some(crate::session::SessionMode::LocalReadOnly)
+        );
         let stored = session_manager
             .load_active()
             .expect("load active")
             .expect("stored session");
         assert_eq!(stored.session.refresh_token.as_deref(), Some("refresh-2"));
+        assert_eq!(stored.mode, mode);
         let runtime_thumbprint = current_runtime_dpop_thumbprint(&config);
         assert_eq!(
             stored.dpop_jwk_thumbprint.as_deref(),

@@ -8,7 +8,9 @@ use crate::auth::{
 };
 use crate::config::{EnvConfig, TargetEnv};
 use crate::dpop::DpopRuntimeOptions;
-use crate::session::{SecretStore, Session, SessionManager, SessionRefreshLock, StoredSession};
+use crate::session::{
+    SecretStore, Session, SessionChanged, SessionManager, SessionRefreshLock, StoredSession,
+};
 use crate::user_error_message;
 
 pub(crate) fn refresh_loaded_session_if_needed<S: SecretStore>(
@@ -104,14 +106,11 @@ where
         {
             let authoritative = {
                 let _refresh_lock = SessionRefreshLock::acquire()?;
-                let (stored_session, dpop) = load_validated_active_session_with_dpop_context(
-                    session_manager,
-                    env,
-                    dpop_options,
-                )?;
+                let stored_session = load_validated_active_session(session_manager, env)?;
                 if stored_session.session.person_id != session.person_id {
-                    bail!("Active session changed to a different identity. Re-run the command.");
+                    return Err(SessionChanged.into());
                 }
+                let dpop = load_authenticated_session_dpop_context(&stored_session, dpop_options)?;
                 let pending = refresh_session_with_dpop(env_cfg, &stored_session.session, &dpop)
                     .map_err(|error| {
                         handle_refresh_failure(session_manager, &stored_session, error)
@@ -286,9 +285,7 @@ fn load_compatible_active_session_after_refresh_race<S: SecretStore>(
     if stored.session.person_id != base_session.session.person_id
         || stored.mode != base_session.mode
     {
-        bail!(
-            "Active session changed to a different identity or session mode. Re-run the command."
-        );
+        return Err(SessionChanged.into());
     }
     Ok((stored, dpop))
 }

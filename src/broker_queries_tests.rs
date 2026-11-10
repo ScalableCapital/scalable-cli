@@ -1188,3 +1188,30 @@ fn portfolio_chart_target_normalizes_and_rejects_invalid_input() {
         assert_eq!(classified.exit_code, 10);
     }
 }
+
+#[test]
+fn quote_source_overrides_reach_selectable_read_queries() {
+    use crate::quote_source::QuoteSource;
+    for source in [QuoteSource::Munc, QuoteSource::Seix, QuoteSource::Xves] {
+        let input = broker_input(false).with_quote_source(source);
+        for variables in [
+            broker_holdings_variables(&input).unwrap(),
+            broker_watchlist_variables(&input).unwrap(),
+            broker_quote_variables(&input, "US0378331005").unwrap(),
+        ] {
+            assert_eq!(variables["quoteSource"], source.as_graphql());
+        }
+    }
+}
+
+#[test]
+fn quote_bearing_read_queries_request_actual_venue() {
+    for query in [
+        BROKER_HOLDINGS_QUERY,
+        BROKER_WATCHLIST_QUERY,
+        BROKER_SEARCH_QUERY,
+        BROKER_QUOTE_QUERY,
+    ] {
+        assert!(query.contains("{\n            venue") || query.contains("{\n          venue"));
+    }
+}

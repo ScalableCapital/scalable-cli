@@ -3,8 +3,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::header::HeaderMap;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json, value::RawValue};
 
 use crate::dpop::{DPOP_SESSION_KEY_RELOGIN_MESSAGE, DpopKeyMaterial, DpopRuntimeOptions};
 use crate::session::SessionMode;
@@ -38,7 +38,7 @@ struct GraphqlRequest<'a, T: Serialize> {
 
 #[derive(Debug, Deserialize)]
 struct GraphqlResponse {
-    data: Option<Value>,
+    data: Option<Box<RawValue>>,
     errors: Option<Value>,
 }
 
@@ -97,6 +97,29 @@ pub fn execute_graphql<T: Serialize>(
         access_context,
         &[],
         dpop_options,
+    )
+}
+
+pub(crate) fn execute_graphql_typed<R: DeserializeOwned, T: Serialize>(
+    endpoint: &str,
+    token: &str,
+    query: &str,
+    variables: &T,
+    operation_name: Option<&str>,
+    access_context: GraphqlAccessContext,
+    dpop_options: &DpopRuntimeOptions,
+) -> Result<R> {
+    let dpop = GraphqlDpopContext::from_runtime_options(dpop_options)?;
+    execute_graphql_with_headers_with_retry_policy(
+        endpoint,
+        token,
+        query,
+        variables,
+        operation_name,
+        access_context,
+        &[],
+        &dpop,
+        true,
     )
 }
 
@@ -177,7 +200,7 @@ fn execute_graphql_with_headers_with_context<T: Serialize>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_graphql_with_headers_with_retry_policy<T: Serialize>(
+fn execute_graphql_with_headers_with_retry_policy<T: Serialize, R: DeserializeOwned>(
     endpoint: &str,
     token: &str,
     query: &str,
@@ -187,7 +210,7 @@ fn execute_graphql_with_headers_with_retry_policy<T: Serialize>(
     headers: &[(&str, &str)],
     dpop: &GraphqlDpopContext,
     retry_dpop_nonce: bool,
-) -> Result<Value> {
+) -> Result<R> {
     enforce_graphql_access_policy(query, operation_name, access_context)?;
     let validated_endpoint = validate_https_url(endpoint, "graphql_url")
         .with_context(|| format!("Invalid GraphQL endpoint URL: {endpoint}"))?
@@ -255,17 +278,24 @@ fn execute_graphql_with_headers_with_retry_policy<T: Serialize>(
             .json::<GraphqlResponse>()
             .context("Failed to parse GraphQL JSON response")?;
 
-        if let Some(errors) = parsed.errors {
-            bail!(
-                "{}",
-                graphql_application_error_message(operation_name, &errors)
-            );
-        }
-
-        return parsed.data.context("GraphQL response missing data");
+        return decode_graphql_data(parsed, operation_name);
     }
 
     unreachable!("GraphQL retry loop should always return");
+}
+
+fn decode_graphql_data<R: DeserializeOwned>(
+    response: GraphqlResponse,
+    operation_name: Option<&str>,
+) -> Result<R> {
+    if let Some(errors) = response.errors {
+        bail!(
+            "{}",
+            graphql_application_error_message(operation_name, &errors)
+        );
+    }
+    let data = response.data.context("GraphQL response missing data")?;
+    serde_json::from_str(data.get()).context("Failed to parse GraphQL JSON response data")
 }
 
 pub(crate) fn enforce_graphql_access_policy(
@@ -736,6 +766,80 @@ mod tests {
     fn ensure_runtime_dpop_key() {
         DpopKeyMaterial::load_or_create_for_options(&test_dpop_options())
             .expect("create runtime dpop key");
+    }
+
+    #[test]
+    fn execute_graphql_typed_preserves_raw_numeric_tokens() {
+        let _lock = crate::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        ensure_runtime_dpop_key();
+        let mut server = Server::new();
+        let raw_data = r#"{"price":123.123456789012345678901,"small":1.2e-19}"#;
+        let mock = server
+            .mock("POST", "/graphql")
+            .match_header("authorization", "DPoP token-1")
+            .match_header("dpop", Matcher::Regex(".+".to_string()))
+            .with_status(200)
+            .with_body(format!(r#"{{"data":{raw_data}}}"#))
+            .create();
+
+        let result: Box<RawValue> = execute_graphql_typed(
+            &format!("{}/graphql", server.url()),
+            "token-1",
+            "query Prices { price small }",
+            &json!({}),
+            Some("Prices"),
+            GraphqlAccessContext::default(),
+            &test_dpop_options(),
+        )
+        .expect("typed graphql call should succeed");
+
+        assert_eq!(result.get(), raw_data);
+        mock.assert();
+    }
+
+    #[test]
+    fn decode_graphql_data_preserves_default_value_number_and_checksum_behavior() {
+        let response =
+            serde_json::from_str(r#"{"data":{"day_of_month":1,"amount":1.2e-1,"quantity":1.0}}"#)
+                .expect("graphql envelope");
+        let result: Value = decode_graphql_data(response, None).expect("graphql data");
+        let expected = json!({"day_of_month": 1, "amount": 0.12, "quantity": 1.0});
+
+        assert_eq!(result["day_of_month"].to_string(), "1");
+        assert_eq!(result["amount"].to_string(), "0.12");
+        assert_eq!(result, expected);
+        assert_eq!(
+            crate::payload_fingerprint::checksum_for_payload(&result),
+            crate::payload_fingerprint::checksum_for_payload(&expected)
+        );
+    }
+
+    #[test]
+    fn decode_graphql_data_reports_errors_before_deserializing_partial_data() {
+        let response = serde_json::from_str(
+            r#"{"data":{"unexpected":"shape"},"errors":[{"extensions":{"code":"UNAUTHENTICATED"}}]}"#,
+        )
+        .expect("graphql envelope");
+        let err = decode_graphql_data::<u64>(response, Some("Prices"))
+            .expect_err("graphql errors take precedence over invalid typed data");
+
+        assert_eq!(
+            err.to_string(),
+            "GraphQL returned errors for Prices (code: UNAUTHENTICATED)"
+        );
+    }
+
+    #[test]
+    fn decode_graphql_data_rejects_null_or_missing_data() {
+        for body in [r#"{"data":null}"#, "{}"] {
+            let response = serde_json::from_str(body).expect("graphql envelope");
+            let err = decode_graphql_data::<Value>(response, None)
+                .expect_err("graphql data must be present");
+
+            assert_eq!(err.to_string(), "GraphQL response missing data");
+        }
     }
 
     #[test]

@@ -390,6 +390,7 @@ pub(crate) fn run_broker_command_human(
                 command,
                 portfolio_id,
                 include_year_to_date,
+                quote_source,
                 json,
             } = watchlist_args;
             match command {
@@ -410,6 +411,7 @@ pub(crate) fn run_broker_command_human(
                             command: None,
                             portfolio_id,
                             include_year_to_date,
+                            quote_source,
                             json,
                         },
                         config,
@@ -446,6 +448,10 @@ pub(crate) fn run_broker_command_human(
             let compact = quote_args.json;
             let payload = execute_broker_quote(quote_args, config, session_manager)?;
             Ok(HumanBrokerOutput::Json(payload, compact))
+        }
+        BrokerCommand::Candlesticks(args) => {
+            let payload = crate::broker_candlesticks::execute(args, config, session_manager)?;
+            Ok(HumanBrokerOutput::Json(payload, false))
         }
         BrokerCommand::SecurityNews(news_args) => {
             let compact = news_args.json;
@@ -662,6 +668,7 @@ pub(crate) fn run_broker_command_machine(
                 command,
                 portfolio_id,
                 include_year_to_date,
+                quote_source,
                 json,
             } = args;
             match command {
@@ -676,6 +683,7 @@ pub(crate) fn run_broker_command_machine(
                         command: None,
                         portfolio_id,
                         include_year_to_date,
+                        quote_source,
                         json,
                     },
                     config,
@@ -690,6 +698,9 @@ pub(crate) fn run_broker_command_machine(
             }
         },
         BrokerCommand::Chart(args) => execute_broker_chart(args, config, session_manager),
+        BrokerCommand::Candlesticks(args) => {
+            crate::broker_candlesticks::execute(args, config, session_manager)
+        }
         BrokerCommand::Quote(args) => execute_broker_quote(args, config, session_manager),
         BrokerCommand::SecurityNews(args) => {
             execute_broker_security_news(args, config, session_manager)
@@ -1083,6 +1094,25 @@ fn render_security_trade_text(lines: &mut Vec<String>, result: &Value, currency:
         "stop_price: {}",
         display_money(security_trade.get("stop_price"), currency)
     ));
+    if let Some(trailing) = security_trade
+        .get("trailing_stop_info")
+        .filter(|v| !v.is_null())
+    {
+        for field in [
+            "trail_type",
+            "trail_offset",
+            "stop_price",
+            "stop_price_source",
+            "latest_stop_price_timestamp",
+            "refresh_status",
+        ] {
+            lines.push(format!(
+                "trailing_{}: {}",
+                field,
+                display_value(trailing.get(field))
+            ));
+        }
+    }
     lines.push(format!(
         "valid_until: {}",
         display_value(security_trade.get("valid_until"))

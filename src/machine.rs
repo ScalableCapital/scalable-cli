@@ -16,7 +16,7 @@ use crate::broker_shared::{
 };
 use crate::dpop::{DPOP_SESSION_KEY_RELOGIN_MESSAGE, SecureEnclaveKeyLocked};
 use crate::graphql::{BROKER_TRANSACTION_NOT_FOUND_ERROR_PREFIX, LOCAL_READ_ONLY_ERROR_PREFIX};
-use crate::session::SessionStorageError;
+use crate::session::{SESSION_CHANGED_RECOVERY, SessionChanged, SessionStorageError};
 use crate::trade_controls::{
     LOCAL_TRADE_CONTROL_ISIN_DENIED_PREFIX, LOCAL_TRADE_CONTROL_ISIN_NOT_ALLOWED_PREFIX,
     LOCAL_TRADE_CONTROL_ORDER_NOTIONAL_EXCEEDED_PREFIX,
@@ -232,6 +232,14 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             code: DEVICE_LOCKED_ERROR_CODE,
             exit_code: 20,
             hints: vec![DEVICE_LOCKED_ERROR_HINT.to_string()],
+        };
+    }
+
+    if err.chain().any(|cause| cause.is::<SessionChanged>()) {
+        return ClassifiedError {
+            code: "session_changed",
+            exit_code: 20,
+            hints: vec![SESSION_CHANGED_RECOVERY.to_string()],
         };
     }
 
@@ -696,6 +704,14 @@ pub fn classify_error(err: &Error) -> ClassifiedError {
             code: "appropriateness_warning_ack_required",
             exit_code: 10,
             hints: vec!["Provide the exact acknowledgement text when prompted.".to_string()],
+        };
+    }
+
+    if text.contains("ORDER_SIZE_BELOW_ONE_SHARE:") {
+        return ClassifiedError {
+            code: "order_size_below_one_share",
+            exit_code: 10,
+            hints: vec![crate::trade::ORDER_SIZE_BELOW_ONE_SHARE_RECOVERY.to_string()],
         };
     }
 
@@ -1252,6 +1268,31 @@ mod tests {
             c.hints,
             vec!["Run 'sc login' again to create a fresh session."]
         );
+    }
+
+    #[test]
+    fn classify_session_changed_through_context_and_serialize_recovery() {
+        for error in [
+            Error::new(SessionChanged),
+            Error::new(SessionChanged).context("Whoami could not finish"),
+        ] {
+            let classified = classify_error(&error);
+            assert_eq!(classified.code, "session_changed");
+            assert_eq!(classified.exit_code, 20);
+            let envelope =
+                classified_error_envelope("whoami", &user_error_message(&error), &classified);
+            let json = serde_json::to_value(envelope).expect("error envelope");
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error"]["code"], "session_changed");
+            assert_eq!(
+                json["hints"][0],
+                "Verify the active identity with 'sc whoami' and check the intended portfolio before rerunning the command."
+            );
+            let human_message = human_error_message(&error);
+            assert!(human_message.contains("Active session changed"));
+            assert!(human_message.contains("Verify the active identity with 'sc whoami'"));
+            assert!(human_message.contains("check the intended portfolio before rerunning"));
+        }
     }
 
     #[test]

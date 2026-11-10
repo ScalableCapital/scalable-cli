@@ -264,7 +264,7 @@ fn project_broker_holdings_maps_crypto_coin_and_all_etp_positions() {
                         "type": "STOCK",
                         "inventory": {"position": {"filled": 1, "pending": 0, "blocked": 0}},
                         "portfolioIsinPerformance": {"valuation": 200, "currency": "EUR"},
-                        "quoteTick": {"midPrice": 200, "currency": "EUR"}
+                        "quoteTick": {"venue": "MUNC", "midPrice": 200, "currency": "EUR"}
                     }]
                 },
                 "crypto": {
@@ -553,6 +553,7 @@ fn project_broker_quote_response_maps_quote_fields() {
                     "name": "Apple",
                     "type": "STOCK",
                     "quoteTick": {
+                        "venue": "MUNC",
                         "id": "tick-1",
                         "midPrice": 201.1,
                         "bidPrice": 201.0,
@@ -1989,4 +1990,41 @@ fn project_broker_remove_price_alert_response_accepts_nonmatching_backend_id() {
     assert_eq!(projected["alert_id"], "alert-1");
     assert_eq!(projected["isin"], "US0378331005");
     assert_eq!(projected["removed"], true);
+}
+
+#[test]
+fn quote_projections_reject_unsupported_venues_atomically_and_keep_null_quotes() {
+    let input = broker_input(false).with_quote_source(crate::quote_source::QuoteSource::Seix);
+    for venue in [json!("XXXX"), Value::Null, json!("XETR"), json!("unknown")] {
+        let tick = json!({"midPrice": 12345.6789, "venue": venue});
+        let response = json!({"account": {"brokerPortfolio": {
+            "inventory": {"items": [{"isin": "A", "quoteTick": {"midPrice": 10, "venue": "SEIX"}}, {"isin": "B", "quoteTick": tick}]},
+            "watchlist": {"items": [{"isin": "B", "quoteTick": tick}]},
+            "simpleSecuritySearch": {"items": [{"isin": "B", "quoteTick": tick}]},
+            "security": {"isin": "US0378331005", "quoteTick": tick}
+        }}});
+        for result in [
+            project_broker_holdings_response(&input, &response),
+            project_broker_watchlist_response(&input, &response),
+            project_broker_search_response(&input, "apple", &response),
+            project_broker_quote_response(&input, "US0378331005", &response),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("quote venue is missing or unsupported"),
+                "{error}"
+            );
+            assert!(!error.contains("12345"));
+        }
+    }
+    for tick in [
+        Value::Null,
+        json!({}),
+        json!({"midPrice": 100, "venue": "MUNC"}),
+    ] {
+        let response = json!({"account": {"brokerPortfolio": {"security": {"isin": "US0378331005", "quoteTick": tick}}}});
+        let projected = project_broker_quote_response(&input, "US0378331005", &response).unwrap();
+        assert_eq!(projected["requested_quote_source"], "SEIX");
+        assert_eq!(projected["quote_venue"], tick["venue"]);
+    }
 }

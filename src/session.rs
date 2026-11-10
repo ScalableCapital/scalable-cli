@@ -64,6 +64,22 @@ impl std::error::Error for SessionStorageError {
     }
 }
 
+pub(crate) const SESSION_CHANGED_RECOVERY: &str = "Verify the active identity with 'sc whoami' and check the intended portfolio before rerunning the command.";
+
+#[derive(Debug)]
+pub(crate) struct SessionChanged;
+
+impl Display for SessionChanged {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Active session changed to a different identity or session mode. {SESSION_CHANGED_RECOVERY}"
+        )
+    }
+}
+
+impl std::error::Error for SessionChanged {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginSource {

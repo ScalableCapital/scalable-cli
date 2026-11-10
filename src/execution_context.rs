@@ -429,6 +429,7 @@ mod tests {
                 )),
                 portfolio_id: None,
                 include_year_to_date: false,
+                quote_source: None,
                 json: false,
             }),
         });

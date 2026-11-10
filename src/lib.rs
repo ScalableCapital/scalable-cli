@@ -2,6 +2,7 @@
 
 mod active_session;
 mod auth;
+mod broker_candlesticks;
 mod broker_commands;
 mod broker_context;
 mod broker_portfolio_groups;
@@ -32,6 +33,7 @@ mod overnight_queries;
 mod overnight_query_execution;
 mod overnight_shared;
 mod payload_fingerprint;
+mod quote_source;
 mod savings_plan_confirmation;
 mod savings_plan_presentation;
 pub mod session;
@@ -220,12 +222,13 @@ fn normalize_watchlist_args(
         command,
         portfolio_id,
         include_year_to_date,
+        quote_source,
         json,
     } = args;
 
     match command {
         Some(BrokerWatchlistCommand::Add(mut add_args)) => {
-            reject_watchlist_list_only_flags(include_year_to_date)?;
+            reject_watchlist_list_only_flags(include_year_to_date, quote_source)?;
             if add_args.portfolio_id.is_none() {
                 add_args.portfolio_id = portfolio_id;
             }
@@ -234,11 +237,12 @@ fn normalize_watchlist_args(
                 command: Some(BrokerWatchlistCommand::Add(add_args)),
                 portfolio_id: None,
                 include_year_to_date: false,
+                quote_source: None,
                 json: false,
             })
         }
         Some(BrokerWatchlistCommand::Remove(mut remove_args)) => {
-            reject_watchlist_list_only_flags(include_year_to_date)?;
+            reject_watchlist_list_only_flags(include_year_to_date, quote_source)?;
             if remove_args.portfolio_id.is_none() {
                 remove_args.portfolio_id = portfolio_id;
             }
@@ -247,6 +251,7 @@ fn normalize_watchlist_args(
                 command: Some(BrokerWatchlistCommand::Remove(remove_args)),
                 portfolio_id: None,
                 include_year_to_date: false,
+                quote_source: None,
                 json: false,
             })
         }
@@ -254,15 +259,24 @@ fn normalize_watchlist_args(
             command: None,
             portfolio_id,
             include_year_to_date,
+            quote_source,
             json,
         }),
     }
 }
 
-fn reject_watchlist_list_only_flags(include_year_to_date: bool) -> Result<()> {
+fn reject_watchlist_list_only_flags(
+    include_year_to_date: bool,
+    quote_source: Option<crate::quote_source::QuoteSource>,
+) -> Result<()> {
     if include_year_to_date {
         bail!(
             "Broker input invalid: `--include-year-to-date` is only supported for `sc broker watchlist` without `add` or `remove`"
+        );
+    }
+    if quote_source.is_some() {
+        bail!(
+            "Broker input invalid: `--quote-source` is only supported for `sc broker watchlist` without `add` or `remove`"
         );
     }
     Ok(())
@@ -543,6 +557,7 @@ fn broker_command_requests_json(command: &BrokerCommand) -> bool {
             BrokerDerivativesCommand::Search(search_args) => search_args.json,
         },
         BrokerCommand::Chart(args) => args.json,
+        BrokerCommand::Candlesticks(args) => args.json,
         BrokerCommand::Quote(args) => args.json,
         BrokerCommand::SecurityNews(args) => args.json,
         BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -844,6 +859,7 @@ fn machine_capabilities(config: &AppConfig) -> Value {
             "broker.search",
             "broker.derivatives.search",
             "broker.chart",
+            "broker.candlesticks",
             "broker.quote",
             "broker.security-news",
             "broker.price-alerts",
@@ -899,8 +915,8 @@ fn machine_capabilities(config: &AppConfig) -> Value {
                 "phase_1": "Run trade sell args without --confirm to preview and receive confirmation id.",
                 "phase_2": "Repeat the same trade sell args with --confirm <id> to submit.",
                 "preferred_output": "json",
-                "phase_1_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --json",
-                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> --json",
+                "phase_1_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit|trailing-stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--trail-amount <EUR> | --trail-percent <PERCENT>] [--venue <VENUE>] --json",
+                "phase_2_command_template_json": "sc broker trade sell --isin <ISIN> --shares <SHARES> --order-type <market|limit|stop|stop-limit|trailing-stop> [--limit-price <LIMIT_PRICE>] [--stop-price <STOP_PRICE>] [--trail-amount <EUR> | --trail-percent <PERCENT>] [--venue <VENUE>] --confirm <CONFIRMATION_ID> --json",
                 "raw_json_not_recommended_for_humans": true,
                 "phase_1_presentation_requirement": {
                     "rule_id": "pre_trade_full_disclosure_v1",
@@ -1002,6 +1018,7 @@ fn broker_machine_command_name(command: &BrokerCommand) -> &'static str {
             BrokerDerivativesCommand::Search(_) => "broker.derivatives.search",
         },
         BrokerCommand::Chart(_) => "broker.chart",
+        BrokerCommand::Candlesticks(_) => "broker.candlesticks",
         BrokerCommand::Quote(_) => "broker.quote",
         BrokerCommand::SecurityNews(_) => "broker.security-news",
         BrokerCommand::PriceAlerts(args) => match &args.command {
@@ -1027,15 +1044,15 @@ fn broker_trade_machine_command_name(command: &BrokerTradeCommand) -> &'static s
     }
 }
 
-pub(crate) fn print_whoami_text(result: &Value) -> Result<()> {
-    let lines = build_whoami_lines(result)?;
+pub(crate) fn print_whoami_text(result: &Value, local_read_only: bool) -> Result<()> {
+    let lines = build_whoami_lines(result, local_read_only)?;
     for line in lines {
         println!("{line}");
     }
     Ok(())
 }
 
-fn build_whoami_lines(result: &Value) -> Result<Vec<String>> {
+fn build_whoami_lines(result: &Value, local_read_only: bool) -> Result<Vec<String>> {
     let obj = result
         .get("personOverview")
         .and_then(Value::as_object)
@@ -1070,6 +1087,7 @@ fn build_whoami_lines(result: &Value) -> Result<Vec<String>> {
         format!("name: {display_name}"),
         format!("id: {id}"),
         format!("locale: {locale}"),
+        format!("session.local_read_only: {local_read_only}"),
     ];
 
     Ok(lines)
@@ -1275,8 +1293,12 @@ mod tests {
                 }
             }
         });
-        let lines = build_whoami_lines(&result).expect("whoami lines should render");
-        assert!(lines.contains(&"name: Ada Lovelace".to_string()));
+        for local_read_only in [false, true] {
+            let lines =
+                build_whoami_lines(&result, local_read_only).expect("whoami lines should render");
+            assert!(lines.contains(&"name: Ada Lovelace".to_string()));
+            assert!(lines.contains(&format!("session.local_read_only: {local_read_only}")));
+        }
     }
 
     #[test]

@@ -1828,6 +1828,52 @@ fn refresh_loaded_session_if_needed_uses_authoritative_newer_saved_session_on_su
 }
 
 #[test]
+fn execute_with_refresh_retry_rejects_a_changed_identity_before_refreshing() {
+    let _lock = crate::lock_test_env();
+    let mut server = Server::new();
+    let env_cfg = sample_env(&server);
+    let fixture = RefreshTestEnvironment::new(&env_cfg);
+    let mut session_manager = fixture.session_manager();
+    let mut replacement = stored_session(
+        make_verified_token(&env_cfg, json!({})),
+        Some("replacement-refresh"),
+        fixture.dpop_thumbprint.clone(),
+        false,
+    );
+    let mut in_memory_session = replacement.session.clone();
+    replacement.session.person_id = "person-2".to_string();
+    session_manager
+        .save_active(&replacement)
+        .expect("save replacement login");
+    let refresh = server.mock("POST", "/oauth/token").expect(0).create();
+    let mut attempts = 0;
+
+    let result: Result<()> = execute_with_refresh_retry(
+        &mut session_manager,
+        crate::channel::current_env(),
+        &env_cfg,
+        &mut in_memory_session,
+        &fixture.dpop_options,
+        |_| {
+            attempts += 1;
+            Err(anyhow::anyhow!("GraphQL HTTP error 401: unauthorized"))
+        },
+    );
+
+    let error = result.expect_err("changed identity must stop the retry");
+    assert!(error.is::<SessionChanged>());
+    assert_eq!(attempts, 1);
+    assert_eq!(in_memory_session.person_id, "person-1");
+    assert_eq!(
+        session_manager
+            .load_required_active()
+            .expect("saved session"),
+        replacement
+    );
+    refresh.assert();
+}
+
+#[test]
 fn execute_with_refresh_retry_uses_stored_session_snapshot_and_preserves_mode() {
     let _lock = crate::lock_test_env();
     let mut server = Server::new();

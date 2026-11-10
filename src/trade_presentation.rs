@@ -8,7 +8,7 @@ use crate::trade_confirmation::ConfirmationPhase1Input;
 use crate::trade_execution::{
     ORDER_SIDE_BUY, ORDER_SIDE_SELL, PreparedTrade, canonical_decimal_from_f64,
 };
-use crate::trade_venue::{VENUE_XETR, display_venue_label as display_venue_label_from_table};
+use crate::trade_venue::display_venue_label as display_venue_label_from_table;
 
 #[derive(Clone, Copy)]
 struct PresentationSectionSpec {
@@ -41,8 +41,7 @@ struct ExAnteGroupSpec {
 pub(crate) const PRESENTATION_MAPPING_INCOMPLETE: &str = "PRESENTATION_MAPPING_INCOMPLETE";
 pub(crate) const PHASE1_PRESENTATION_FORMAT: &str = "markdown_sections";
 pub(crate) const PHASE1_COMPLIANCE_RULE_ID: &str = "pre_trade_full_disclosure_v1";
-pub(crate) const BUY_XETRA_MARKET_DATA_NOTICE: &str =
-    "Market data: Börse München (gettex). Xetra's price can be found at www.boerse-frankfurt.de";
+pub(crate) const MARKET_DATA_NOTICE: &str = "Market data: EIX, Börse München (gettex)";
 pub(crate) const BUY_EXECUTION_INSTRUCTION_TEMPLATE: &str = "I instruct Scalable Capital to place this order for execution on {exchange_name} valid for up to 360 days.";
 pub(crate) const BUY_EX_ANTE_COSTS_NOTICE: &str = "The information is based on the current buy price or the selected limit or stop price. The actual execution price may differ. Financial transaction taxes (https://de.scalable.capital/en/clean-page/financial-transaction-tax) may apply. Payments may be received which depend on factors that may only be quantifiable subsequently. The actual payments received are disclosed retrospectively.";
 pub(crate) const SELL_EXECUTION_INSTRUCTION_TEMPLATE: &str = "I instruct Scalable Capital to place this order for execution on {exchange_name} valid for up to 360 days.";
@@ -149,7 +148,7 @@ const PHASE1_PRESENTATION_SECTION_REGULATORY_DISCLOSURES: PresentationSectionSpe
         title: "Regulatory disclosures",
     };
 
-const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 28] = [
+const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 32] = [
     PresentationFieldSpec {
         section_key: "trade_intent",
         path: "/result/intent/isin",
@@ -172,6 +171,30 @@ const PHASE1_PRESENTATION_FIELDS_PREFIX: [PresentationFieldSpec; 28] = [
         section_key: "trade_intent",
         path: "/result/intent/stop_price",
         label: "Stop price",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/trailing_stop/trail_type",
+        label: "Trail type",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/trailing_stop/trail_offset",
+        label: "Trail distance",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/trailing_stop/unit",
+        label: "Trail unit",
+        nullable: true,
+    },
+    PresentationFieldSpec {
+        section_key: "trade_intent",
+        path: "/result/intent/trailing_stop/execution",
+        label: "Trailing stop execution",
         nullable: true,
     },
     PresentationFieldSpec {
@@ -618,7 +641,7 @@ const PHASE1_PRESENTATION_FIELDS_REGULATORY_DISCLOSURES_BUY: [PresentationFieldS
         section_key: "regulatory_disclosures",
         path: "/result/regulatory_disclosures/market_data_notice",
         label: "Market data notice",
-        nullable: true,
+        nullable: false,
     },
     PresentationFieldSpec {
         section_key: "regulatory_disclosures",
@@ -634,13 +657,20 @@ const PHASE1_PRESENTATION_FIELDS_REGULATORY_DISCLOSURES_BUY: [PresentationFieldS
     },
 ];
 
-const PHASE1_PRESENTATION_FIELDS_REGULATORY_DISCLOSURES_SELL: [PresentationFieldSpec; 1] =
-    [PresentationFieldSpec {
+const PHASE1_PRESENTATION_FIELDS_REGULATORY_DISCLOSURES_SELL: [PresentationFieldSpec; 2] = [
+    PresentationFieldSpec {
+        section_key: "regulatory_disclosures",
+        path: "/result/regulatory_disclosures/market_data_notice",
+        label: "Market data notice",
+        nullable: false,
+    },
+    PresentationFieldSpec {
         section_key: "regulatory_disclosures",
         path: "/result/regulatory_disclosures/execution_instruction",
         label: "Execution instruction",
         nullable: false,
-    }];
+    },
+];
 
 const PHASE1_PRESENTATION_FIELDS_DOCUMENT_LINKS: [PresentationFieldSpec; 3] = [
     PresentationFieldSpec {
@@ -664,7 +694,7 @@ const PHASE1_PRESENTATION_FIELDS_DOCUMENT_LINKS: [PresentationFieldSpec; 3] = [
 ];
 
 pub(crate) struct RegulatoryDisclosures {
-    pub(crate) market_data_notice: Option<&'static str>,
+    pub(crate) market_data_notice: &'static str,
     pub(crate) execution_instruction: String,
     pub(crate) ex_ante_costs_notice: Option<&'static str>,
 }
@@ -674,14 +704,10 @@ pub(crate) fn display_venue_label(selected_venue: &str) -> String {
 }
 
 pub(crate) fn build_buy_regulatory_disclosures(
-    selected_venue: &str,
     selected_venue_label: &str,
 ) -> RegulatoryDisclosures {
-    let market_data_notice = matches!(selected_venue.trim().to_uppercase().as_str(), VENUE_XETR)
-        .then_some(BUY_XETRA_MARKET_DATA_NOTICE);
-
     RegulatoryDisclosures {
-        market_data_notice,
+        market_data_notice: MARKET_DATA_NOTICE,
         execution_instruction: BUY_EXECUTION_INSTRUCTION_TEMPLATE
             .replace("{exchange_name}", selected_venue_label),
         ex_ante_costs_notice: Some(BUY_EX_ANTE_COSTS_NOTICE),
@@ -689,11 +715,10 @@ pub(crate) fn build_buy_regulatory_disclosures(
 }
 
 pub(crate) fn build_sell_regulatory_disclosures(
-    _selected_venue: &str,
     selected_venue_label: &str,
 ) -> RegulatoryDisclosures {
     RegulatoryDisclosures {
-        market_data_notice: None,
+        market_data_notice: MARKET_DATA_NOTICE,
         execution_instruction: SELL_EXECUTION_INSTRUCTION_TEMPLATE
             .replace("{exchange_name}", selected_venue_label),
         ex_ante_costs_notice: None,
@@ -880,6 +905,9 @@ pub(crate) fn build_phase1_command_template(
     if let Some(stop_price) = phase1_input.stop_price.as_deref() {
         cmd.push_str(&format!(" --stop-price {stop_price}"));
     }
+    if let Some(trailing) = &phase1_input.trailing_stop {
+        cmd.push_str(&format!(" {} {}", trailing.flag(), trailing.offset_str()));
+    }
     if json_mode {
         cmd.push_str(" --json");
     }
@@ -905,21 +933,16 @@ pub(crate) fn build_result_payload(
 ) -> Value {
     let regulatory_disclosures =
         if order_submission.is_none() && matches!(prepared.intent.side, TradeSide::Buy) {
-            let disclosures = build_buy_regulatory_disclosures(
-                &prepared.tradability_gate.selected_venue,
-                &prepared.selected_venue_label,
-            );
+            let disclosures = build_buy_regulatory_disclosures(&prepared.selected_venue_label);
             Some(json!({
                 "market_data_notice": disclosures.market_data_notice,
                 "execution_instruction": disclosures.execution_instruction,
                 "ex_ante_costs_notice": disclosures.ex_ante_costs_notice,
             }))
         } else if order_submission.is_none() && matches!(prepared.intent.side, TradeSide::Sell) {
-            let disclosures = build_sell_regulatory_disclosures(
-                &prepared.tradability_gate.selected_venue,
-                &prepared.selected_venue_label,
-            );
+            let disclosures = build_sell_regulatory_disclosures(&prepared.selected_venue_label);
             Some(json!({
+                "market_data_notice": disclosures.market_data_notice,
                 "execution_instruction": disclosures.execution_instruction,
             }))
         } else {
@@ -948,6 +971,15 @@ pub(crate) fn build_result_payload(
             "order_type": &prepared.intent.order_type,
             "limit_price": &prepared.intent.limit_price_str,
             "stop_price": &prepared.intent.stop_price_str,
+            "trailing_stop": {
+                "trail_type": prepared.intent.trailing_stop.as_ref().map(|t| match t {
+                    crate::trade::TrailingStop::Amount(_) => "AMOUNT",
+                    crate::trade::TrailingStop::Percentage(_) => "PERCENTAGE",
+                }),
+                "trail_offset": prepared.intent.trailing_stop.as_ref().map(|t| t.offset_str()),
+                "unit": prepared.intent.trailing_stop.as_ref().map(|t| t.unit()),
+                "execution": prepared.intent.trailing_stop.as_ref().map(|_| "Triggers a market sell. The execution price may be below the stop price."),
+            },
             "venue_override": &prepared.intent.venue_override,
             "locale": &prepared.intent.locale,
         },
@@ -1355,7 +1387,7 @@ fn render_price_warnings_block(payload: &Value) -> Vec<String> {
     lines
 }
 
-fn render_buy_regulatory_disclosures_lines(payload: &Value) -> Vec<String> {
+fn render_regulatory_disclosures_lines(payload: &Value) -> Vec<String> {
     let mut lines = Vec::new();
 
     if let Some(market_data_notice) = payload
@@ -1364,19 +1396,6 @@ fn render_buy_regulatory_disclosures_lines(payload: &Value) -> Vec<String> {
     {
         lines.push(format!("market_data_notice: {market_data_notice}"));
     }
-    if let Some(execution_instruction) = payload
-        .pointer("/result/regulatory_disclosures/execution_instruction")
-        .and_then(Value::as_str)
-    {
-        lines.push(format!("execution_instruction: {execution_instruction}"));
-    }
-
-    lines
-}
-
-fn render_sell_regulatory_disclosures_lines(payload: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
-
     if let Some(execution_instruction) = payload
         .pointer("/result/regulatory_disclosures/execution_instruction")
         .and_then(Value::as_str)
@@ -1648,6 +1667,23 @@ fn render_trade_prefix_lines(payload: &Value, buy: bool) -> Vec<String> {
             lines.push(format!("{field}: {price} {currency}"));
         }
     }
+    if let Some(trailing) = payload.pointer("/result/intent/trailing_stop")
+        && let Some(offset) = trailing.get("trail_offset").and_then(Value::as_str)
+    {
+        lines.push(format!(
+            "trail_type: {}",
+            trailing["trail_type"].as_str().unwrap_or_default()
+        ));
+        lines.push(format!(
+            "trail_distance: {} {}",
+            offset,
+            trailing["unit"].as_str().unwrap_or_default()
+        ));
+        lines.push(format!(
+            "trailing_stop_execution: {}",
+            trailing["execution"].as_str().unwrap_or_default()
+        ));
+    }
     if buy {
         if let Some(amount) = amount {
             lines.push(format!("amount: {amount}"));
@@ -1697,18 +1733,10 @@ fn render_trade_prefix_lines(payload: &Value, buy: bool) -> Vec<String> {
         lines.extend(render_ex_ante_costs_block(payload));
         push_section_blank_line(&mut lines);
         lines.extend(render_suitability_block(payload));
-        if buy {
-            let buy_regulatory_disclosures = render_buy_regulatory_disclosures_lines(payload);
-            if !buy_regulatory_disclosures.is_empty() {
-                push_section_blank_line(&mut lines);
-                lines.extend(buy_regulatory_disclosures);
-            }
-        } else {
-            let sell_regulatory_disclosures = render_sell_regulatory_disclosures_lines(payload);
-            if !sell_regulatory_disclosures.is_empty() {
-                push_section_blank_line(&mut lines);
-                lines.extend(sell_regulatory_disclosures);
-            }
+        let regulatory_disclosures = render_regulatory_disclosures_lines(payload);
+        if !regulatory_disclosures.is_empty() {
+            push_section_blank_line(&mut lines);
+            lines.extend(regulatory_disclosures);
         }
         let document_links = render_document_links_block(payload);
         if !document_links.is_empty() {
@@ -1759,6 +1787,8 @@ mod tests {
             order_type: "stop-limit".to_string(),
             limit_price: Some("48.50".to_string()),
             stop_price: Some("47.00".to_string()),
+            trailing_stop: None,
+            initial_stop_price: None,
         }
     }
 
@@ -1772,6 +1802,8 @@ mod tests {
             order_type: "stop-limit".to_string(),
             limit_price: Some("48.50".to_string()),
             stop_price: Some("47.00".to_string()),
+            trailing_stop: None,
+            initial_stop_price: None,
         }
     }
 
@@ -1831,6 +1863,7 @@ mod tests {
                 stop_price_str: None,
                 venue_override: Some("SEIX".to_string()),
                 locale: "en_DE".to_string(),
+                trailing_stop: None,
             },
             tradability_gate: TradeTradabilityGate {
                 status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),

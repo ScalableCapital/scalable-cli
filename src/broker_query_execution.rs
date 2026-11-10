@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use crate::active_session::load_active_session;
 use crate::broker_projections::project_broker_portfolio_chart_response;
 use crate::broker_queries::{
-    BROKER_PORTFOLIO_CHART_QUERY, BrokerChartTarget, broker_portfolio_chart_variables,
-    normalize_broker_chart_target,
+    BROKER_LATEST_STOP_PRICE_QUERY, BROKER_PORTFOLIO_CHART_QUERY, BrokerChartTarget,
+    broker_portfolio_chart_variables, normalize_broker_chart_target,
 };
 use crate::broker_shared::{
     broker_result_envelope, fingerprint_payload_for_transactions_input,
@@ -241,8 +241,80 @@ pub(crate) fn execute_broker_transaction_details(
             )
         },
     )?;
-    let projected = project_broker_transaction_details_response(&input, &response)?;
+    let mut projected = project_broker_transaction_details_response(&input, &response)?;
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    if trailing_stop_needs_refresh(&projected, now_millis) {
+        let variables = json!({
+            "personId": ids.account_id,
+            "portfolioId": ids.portfolio_id,
+            "transactionReference": projected["transaction_reference"],
+        });
+        let latest = execute_with_refresh_retry(
+            session_manager,
+            env,
+            &env_cfg,
+            &mut session,
+            dpop_options,
+            |token| {
+                execute_graphql(
+                    &env_cfg.graphql_url,
+                    token,
+                    BROKER_LATEST_STOP_PRICE_QUERY,
+                    &variables,
+                    Some("latestStopPrice"),
+                    access_context,
+                    dpop_options,
+                )
+            },
+        );
+        apply_latest_stop_price(&mut projected, latest.as_ref().ok());
+    }
     Ok(broker_result_envelope(&ids, projected))
+}
+
+fn trailing_stop_needs_refresh(projected: &Value, now_millis: u128) -> bool {
+    projected["is_pending"] == true
+        && projected["transaction_reference"]
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty())
+        && projected
+            .pointer("/security_trade/trailing_stop_info/latest_stop_price_epoch_millisecond")
+            .and_then(Value::as_u64)
+            .is_some_and(|epoch| now_millis.saturating_sub(u128::from(epoch)) > 30_000)
+}
+
+fn apply_latest_stop_price(projected: &mut Value, response: Option<&Value>) {
+    let trailing = &mut projected["security_trade"]["trailing_stop_info"];
+    trailing["refresh_status"] = json!("unavailable");
+    let Some(latest) = response.and_then(|v| v.pointer("/account/brokerPortfolio/latestStopPrice"))
+    else {
+        return;
+    };
+    let valid_price = latest["stopPrice"]
+        .as_f64()
+        .or_else(|| latest["stopPrice"].as_str()?.parse().ok())
+        .is_some_and(|v: f64| v.is_finite() && v > 0.0);
+    let timestamp = &latest["latestStopPriceTimestamp"];
+    if !valid_price
+        || timestamp["epochMillisecond"].as_u64().is_none()
+        || timestamp["time"].as_str().is_none()
+    {
+        return;
+    }
+    if timestamp["epochMillisecond"].as_u64()
+        < trailing["latest_stop_price_epoch_millisecond"].as_u64()
+    {
+        return;
+    }
+    trailing["stop_price"] = latest["stopPrice"].clone();
+    trailing["stop_price_source"] = json!("latest_available");
+    trailing["refresh_status"] = json!("refreshed");
+    trailing["latest_stop_price_timestamp"] = timestamp["time"].clone();
+    trailing["latest_stop_price_epoch_second"] = timestamp["epochSecond"].clone();
+    trailing["latest_stop_price_epoch_millisecond"] = timestamp["epochMillisecond"].clone();
 }
 
 pub(crate) fn execute_broker_holdings(
@@ -265,7 +337,8 @@ pub(crate) fn execute_broker_holdings(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, args.include_year_to_date)?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?
+        .with_quote_source(args.quote_source.unwrap_or_default());
     let variables = broker_holdings_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -352,7 +425,8 @@ pub(crate) fn execute_broker_watchlist(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, args.include_year_to_date)?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?
+        .with_quote_source(args.quote_source.unwrap_or_default());
     let variables = broker_watchlist_variables(&input)?;
     let response = execute_with_refresh_retry(
         session_manager,
@@ -487,7 +561,8 @@ pub(crate) fn execute_broker_quote(
         dpop_options,
         args.portfolio_id.as_deref(),
     )?;
-    let input = validated_broker_input(&ids, args.include_year_to_date)?;
+    let input = validated_broker_input(&ids, args.include_year_to_date)?
+        .with_quote_source(args.quote_source.unwrap_or_default());
     let requested_isin = args.isin.trim().to_string();
     let variables = broker_quote_variables(&input, &requested_isin)?;
     let response = execute_with_refresh_retry(
@@ -957,6 +1032,7 @@ mod tests {
             portfolio_id: Some("portfolio-1".to_string()),
             isin: "US0378331005".to_string(),
             include_year_to_date: true,
+            quote_source: None,
             json: true,
         }
     }
@@ -1747,6 +1823,7 @@ mod tests {
                                             "name": "Tesla",
                                             "type": "EQ",
                                             "quoteTick": {
+                                                "venue": "MUNC",
                                                 "midPrice": 200.11,
                                                 "currency": "USD",
                                                 "timestampUtc": "2026-03-11T08:00:00Z",
@@ -1758,6 +1835,7 @@ mod tests {
                                             "name": "Mercedes-Benz Group",
                                             "type": "EQ",
                                             "quoteTick": {
+                                                "venue": "MUNC",
                                                 "midPrice": 58.3,
                                                 "currency": "EUR",
                                                 "timestampUtc": "2026-03-11T08:01:00Z",
@@ -2055,6 +2133,7 @@ mod tests {
                                     "name": "Apple Turbo Long",
                                     "type": "WARRANT",
                                     "quoteTick": {
+                                        "venue": "MUNC",
                                         "id": "tick-1",
                                         "midPrice": 12.34,
                                         "bidPrice": 12.30,
@@ -2082,6 +2161,7 @@ mod tests {
                 portfolio_id: Some("portfolio-1".to_string()),
                 isin: "DE000HSBC121".to_string(),
                 include_year_to_date: false,
+                quote_source: None,
                 json: true,
             },
             &config,
@@ -2164,6 +2244,7 @@ mod tests {
                                     "name": "Apple",
                                     "type": "EQ",
                                     "quoteTick": {
+                                        "venue": "MUNC",
                                         "id": "tick-1",
                                         "isin": "US0378331005",
                                         "midPrice": 201.1,
@@ -2495,6 +2576,74 @@ mod tests {
     }
 
     #[test]
+    fn execute_broker_candlesticks_uses_existing_auth_and_direct_backend_data() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut server = Server::new();
+        let _channel_guard = TestChannelGuard::for_server(&server);
+        let _cfg_guard = EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+        let config = sample_config();
+        ensure_runtime_dpop_key(&config);
+        let mut session_manager = SessionManager::new(&config).expect("session manager");
+        session_manager
+            .save_active(&sample_stored_session(crate::channel::current_env()))
+            .unwrap();
+        let mock = server
+            .mock("POST", "/")
+            .match_header("authorization", expected_authorization_header())
+            .match_header("dpop", Matcher::Regex(".+".to_string()))
+            .match_body(Matcher::PartialJson(
+                json!({"operation_name":"BrokerCandlesticks",
+                "variables":{"isin":"US0378331005", "timeFrames":["ONE_MONTH"], "source":"SEIX"}}),
+            ))
+            .match_body(Matcher::Regex("source: \\$source".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            // Use raw numeric JSON to test precision through the HTTP decoder,
+            // not just through an already parsed mapper fixture.
+            .with_body(
+                r#"{"data":{"candlesticksTimeSeries":{
+                "isin":"US0378331005", "currency":"EUR", "source":"SEIX", "candlesticks":[{
+                    "timeFrame":"ONE_MONTH", "dataPoints":[{
+                        "open":9007199254740993.1234567890123456789,
+                        "high":"9007199254740994.1234567890123456789", "low":0.000000000000000123, "close":1e-10,
+                        "startTimestamp":{"time":"2026-09-09T05:30:00Z"},
+                        "endTimestamp":{"time":"2026-09-09T21:00:00Z"}
+                    }]
+                }]
+            }}}"#,
+            )
+            .create();
+        let payload = crate::broker_candlesticks::execute(
+            crate::cli::BrokerCandlesticksArgs {
+                isin: " us0378331005 ".to_string(),
+                timeframe: crate::cli::BrokerCandlesticksTimeframe::OneMonth,
+                quote_source: crate::quote_source::QuoteSource::Seix,
+                json: true,
+            },
+            &config,
+            &mut session_manager,
+        )
+        .unwrap();
+        assert_eq!(payload["isin"], "US0378331005");
+        assert_eq!(payload["source"], "seix");
+        assert_eq!(
+            payload["candlesticks"][0]["open"],
+            "9007199254740993.1234567890123456789"
+        );
+        assert_eq!(
+            payload["candlesticks"][0]["high"],
+            "9007199254740994.1234567890123456789"
+        );
+        assert_eq!(payload["candlesticks"][0]["low"], "0.000000000000000123");
+        assert_eq!(payload["candlesticks"][0]["close"], "0.0000000001");
+        assert_eq!(
+            payload["candlesticks"][0]["end_time_utc"],
+            "2026-09-09T21:00:00.000Z"
+        );
+        mock.assert();
+    }
+
+    #[test]
     fn execute_broker_chart_accepts_lowercase_isin() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut server = Server::new();
@@ -2632,6 +2781,64 @@ mod tests {
     }
 
     #[test]
+    fn execute_broker_candlesticks_rejects_http_graphql_and_invalid_data() {
+        for (status, body, expected) in [
+            (401, json!({}), "GraphQL HTTP error 401"),
+            (403, json!({}), "GraphQL HTTP error 403"),
+            (
+                200,
+                json!({"data":{"candlesticksTimeSeries":{
+                "isin":"US0378331005", "currency":"EUR",
+                "candlesticks":[{"timeFrame":"ONE_MONTH", "dataPoints":[]}]
+            }}, "errors":[{"message":"Unavailable", "extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}),
+                "GraphQL returned errors",
+            ),
+            (
+                200,
+                json!({"data":{"candlesticksTimeSeries":{"isin":[]}}}),
+                "Broker response invalid: candlesticks response could not be mapped",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut session_manager = SessionManager::new(&config).unwrap();
+            session_manager
+                .save_active(&sample_stored_session(crate::channel::current_env()))
+                .unwrap();
+            let mock = server
+                .mock("POST", "/")
+                .match_header("authorization", expected_authorization_header())
+                .match_body(Matcher::Regex("BrokerCandlesticks".to_string()))
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body.to_string())
+                .expect(1)
+                .create();
+            let error = crate::broker_candlesticks::execute(
+                crate::cli::BrokerCandlesticksArgs {
+                    isin: "US0378331005".to_string(),
+                    timeframe: crate::cli::BrokerCandlesticksTimeframe::OneMonth,
+                    quote_source: crate::quote_source::QuoteSource::Consolidated,
+                    json: true,
+                },
+                &config,
+                &mut session_manager,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            if expected.starts_with("Broker response invalid") {
+                assert_eq!(classify_error(&error).code, "broker_response_invalid");
+            }
+            mock.assert();
+        }
+    }
+
+    #[test]
     fn execute_broker_chart_maps_ytd_alias_to_year_to_date() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut server = Server::new();
@@ -2753,6 +2960,7 @@ mod tests {
                 portfolio_id: Some("portfolio-1".to_string()),
                 isin: "LU2903252406".to_string(),
                 include_year_to_date: false,
+                quote_source: None,
                 json: true,
             },
             &config,
@@ -2869,4 +3077,5 @@ mod tests {
         assert_eq!(classify_error(&err).code, "broker_transaction_not_found");
         transaction_mock.assert();
     }
+    include!("broker_query_execution_trailing_tests.rs");
 }

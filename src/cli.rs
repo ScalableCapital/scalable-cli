@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::helpers::{broker_transactions_status_help, broker_transactions_type_filter_help};
 use crate::overnight_queries::overnight_transactions_type_filter_help;
+use crate::quote_source::QuoteSource;
 
 fn non_empty_trimmed_value(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
@@ -47,7 +48,8 @@ pub enum Commands {
 pub struct LoginArgs {
     #[arg(
         long,
-        help = "Store the session in locally enforced read-only mode for GraphQL mutations"
+        help = "Allow reads and previews while blocking broker changes through the CLI",
+        long_help = "Keep this CLI session read-only: allow account reads and trade or savings-plan previews, but block order submission and other broker changes. Local files may still be updated. Backend token permissions are unchanged."
     )]
     pub local_read_only: bool,
 }
@@ -184,13 +186,15 @@ pub enum BrokerCommand {
     Derivatives(BrokerDerivativesArgs),
     #[command(about = "Get historical chart data for a portfolio or security")]
     Chart(BrokerChartArgs),
+    #[command(about = "Get OHLC candlestick data for a security ISIN")]
+    Candlesticks(BrokerCandlesticksArgs),
     #[command(about = "Get the current quote for a security ISIN")]
     Quote(BrokerQuoteArgs),
     #[command(about = "Get news summary for a security ISIN")]
     SecurityNews(BrokerSecurityNewsArgs),
     #[command(about = "List, add, or remove broker price alerts")]
     PriceAlerts(BrokerPriceAlertsArgs),
-    #[command(about = "List or add broker savings plans")]
+    #[command(about = "List broker savings plans, inspect options, or add/remove plans")]
     SavingsPlans(BrokerSavingsPlansArgs),
     #[command(about = "Trade commands")]
     Trade(BrokerTradeArgs),
@@ -348,6 +352,14 @@ pub struct BrokerHoldingsArgs {
     #[arg(long, help = "Include year-to-date performance points for quote ticks")]
     pub include_year_to_date: bool,
 
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        help = "Quote source (default: consolidated; aliases: gettex, eix, vestima)"
+    )]
+    pub quote_source: Option<QuoteSource>,
+
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
@@ -477,6 +489,14 @@ pub struct BrokerWatchlistArgs {
 
     #[arg(long, help = "Include year-to-date performance points for quote ticks")]
     pub include_year_to_date: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        help = "Quote source (default: consolidated; aliases: gettex, eix, vestima)"
+    )]
+    pub quote_source: Option<QuoteSource>,
 
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
@@ -765,6 +785,14 @@ pub struct BrokerQuoteArgs {
     #[arg(long, help = "Include year-to-date performance points for quote ticks")]
     pub include_year_to_date: bool,
 
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        help = "Quote source (default: consolidated; aliases: gettex, eix, vestima)"
+    )]
+    pub quote_source: Option<QuoteSource>,
+
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
@@ -832,6 +860,58 @@ pub struct BrokerChartArgs {
     #[arg(long, value_enum, help = "Chart timeframe")]
     pub timeframe: BrokerChartTimeframe,
 
+    #[arg(long, help = "Print compact JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum BrokerCandlesticksTimeframe {
+    Intraday,
+    TwoDays,
+    OneWeek,
+    OneMonth,
+    ThreeMonths,
+    SixMonths,
+    YearToDate,
+    OneYear,
+    Max,
+}
+
+impl BrokerCandlesticksTimeframe {
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Intraday => "intraday",
+            Self::TwoDays => "two_days",
+            Self::OneWeek => "one_week",
+            Self::OneMonth => "one_month",
+            Self::ThreeMonths => "three_months",
+            Self::SixMonths => "six_months",
+            Self::YearToDate => "year_to_date",
+            Self::OneYear => "one_year",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn as_graphql(self) -> String {
+        self.as_cli_value().to_ascii_uppercase()
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerCandlesticksArgs {
+    #[arg(long, help = "Security ISIN")]
+    pub isin: String,
+    #[arg(long, value_enum, help = "Candlestick timeframe")]
+    pub timeframe: BrokerCandlesticksTimeframe,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "consolidated",
+        ignore_case = true,
+        help = "Quote source (aliases: gettex, eix, vestima)"
+    )]
+    pub quote_source: QuoteSource,
     #[arg(long, help = "Print compact JSON")]
     pub json: bool,
 }
@@ -1066,6 +1146,8 @@ pub enum BrokerTradeOrderType {
     Limit,
     Stop,
     StopLimit,
+    /// Sell with a stop that follows favourable price movements.
+    TrailingStop,
 }
 
 #[derive(Debug, Args)]
@@ -1146,6 +1228,20 @@ pub struct BrokerTradeSellArgs {
         help = "Activation trigger price (required for --order-type stop or stop-limit)"
     )]
     pub stop_price: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "trail_percent",
+        help = "Trailing-stop distance in EUR; use exactly one of --trail-amount or --trail-percent"
+    )]
+    pub trail_amount: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "trail_amount",
+        help = "Trailing-stop distance in percent (5 means 5%); minimum 0.5%"
+    )]
+    pub trail_percent: Option<String>,
 
     #[arg(long, help = crate::trade_venue::VENUE_OVERRIDE_HELP)]
     pub venue: Option<String>,

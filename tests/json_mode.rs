@@ -57,9 +57,23 @@ fn capabilities_returns_machine_json_envelope() {
         ),
     ] {
         let workflow = &data["workflows"][format!("broker.trade.{side}")];
+        assert!(
+            workflow["phase_1_presentation_requirement"]["required_leaf_paths"]
+                .as_array()
+                .expect("required leaf paths")
+                .contains(&json!("/result/regulatory_disclosures/market_data_notice"))
+        );
         for key in keys {
             let template = workflow[key].as_str().expect("trade template");
-            assert!(template.contains("<market|limit|stop|stop-limit>"));
+            let order_types = if side == "sell" {
+                "<market|limit|stop|stop-limit|trailing-stop>"
+            } else {
+                "<market|limit|stop|stop-limit>"
+            };
+            assert!(template.contains(order_types));
+            if side == "sell" {
+                assert!(template.contains("--trail-amount <EUR> | --trail-percent <PERCENT>"));
+            }
             assert!(template.contains("--limit-price <LIMIT_PRICE>"));
             assert!(template.contains("--stop-price <STOP_PRICE>"));
         }
@@ -81,6 +95,7 @@ fn capabilities_returns_machine_json_envelope() {
     assert!(commands.contains(&json!("broker.portfolio-groups.assign")));
     assert!(commands.contains(&json!("broker.portfolio-groups.unassign")));
     assert!(commands.contains(&json!("broker.chart")));
+    assert!(commands.contains(&json!("broker.candlesticks")));
     assert!(commands.contains(&json!("broker.quote")));
     assert!(commands.contains(&json!("broker.price-alerts.remove")));
     assert!(commands.contains(&json!("broker.savings-plans.config")));

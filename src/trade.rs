@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::map::Entry;
 use serde_json::{Value, json};
+
+pub(crate) const ORDER_SIZE_BELOW_ONE_SHARE_RECOVERY: &str = "Request a new preview without --confirm or --acknowledge-appropriateness-warning (alias --accept-unsuitable). Increase --amount to cover at least one whole share at the current ask price, or replace --amount with --shares and a positive whole number. Review the preview before confirming with its new ID and any required acknowledgement.";
 
 pub const TRADE_TRADABILITY_QUERY: &str = r#"
 query getTradingTradability($personId: ID!, $isin: ID!, $portfolioId: ID!) {
@@ -112,6 +115,7 @@ query getSecurityTick(
         id
         isin
         quoteTick(source: $source, includeYearToDate: $includeYearToDate) {
+          venue
           askPrice
           bidPrice
           midPrice
@@ -1157,12 +1161,18 @@ pub fn trade_security_tick_variables(
     isin: &str,
     source: &str,
 ) -> Result<Value> {
+    let source = required_non_empty(source, "source")?;
+    if !matches!(source.as_str(), "MUNC" | "SEIX" | "XETR" | "XVES") {
+        return Err(anyhow!(
+            "Trade input invalid: unsupported venue for quote requests"
+        ));
+    }
     Ok(json!({
         "personId": required_non_empty(person_id, "person_id")?,
         "portfolioId": required_non_empty(portfolio_id, "portfolio_id")?,
         "isin": required_non_empty(isin, "isin")?,
         "includeYearToDate": false,
-        "source": required_non_empty(source, "source")?,
+        "source": source,
     }))
 }
 
@@ -1174,6 +1184,8 @@ pub fn parse_security_tick(response: &Value) -> Result<SecurityTick> {
         .and_then(|v| v.get("quoteTick"))
         .ok_or_else(|| anyhow!("Trade response invalid: missing security quote tick"))?;
 
+    crate::quote_source::validate_quote_tick(tick)
+        .map_err(|message| anyhow!("Trade response invalid: {message}"))?;
     let ask_price = parse_optional_quote_leg(tick, "askPrice")?;
     let bid_price = parse_optional_quote_leg(tick, "bidPrice")?;
     let mid_price = tick
@@ -1563,6 +1575,118 @@ pub fn trade_fill_forecast_variables(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "trail_type", content = "trail_offset")]
+pub enum TrailingStop {
+    #[serde(rename = "AMOUNT")]
+    Amount(String),
+    #[serde(rename = "PERCENTAGE")]
+    Percentage(String),
+}
+
+impl TrailingStop {
+    pub(crate) fn parse(amount: Option<&str>, percent: Option<&str>) -> Result<Option<Self>> {
+        let (raw, percentage) = match (amount, percent) {
+            (None, None) => return Ok(None),
+            (Some(raw), None) => (raw, false),
+            (None, Some(raw)) => (raw, true),
+            _ => bail!("Trade input invalid: use exactly one of --trail-amount or --trail-percent"),
+        };
+        let raw = raw.trim();
+        let parts: Vec<_> = raw.split('.').collect();
+        if raw.is_empty()
+            || parts.len() > 2
+            || !parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+            || parts
+                .get(1)
+                .is_some_and(|p| p.trim_end_matches('0').len() > 10)
+        {
+            bail!(
+                "Trade input invalid: trailing distance must be a positive decimal with at most 10 fractional digits"
+            );
+        }
+        let value = raw
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .ok_or_else(|| {
+                anyhow!("Trade input invalid: trailing distance must be a positive decimal")
+            })?;
+        let canonical = value.to_string();
+        Ok(Some(if percentage {
+            Self::Percentage(canonical)
+        } else {
+            Self::Amount(canonical)
+        }))
+    }
+
+    pub(crate) fn offset(&self) -> Result<f64> {
+        self.offset_str()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .ok_or_else(|| anyhow!("Trade input invalid: invalid trailing distance"))
+    }
+
+    pub(crate) fn offset_str(&self) -> &str {
+        match self {
+            Self::Amount(v) | Self::Percentage(v) => v,
+        }
+    }
+
+    pub(crate) fn unit(&self) -> &'static str {
+        match self {
+            Self::Amount(_) => "EUR",
+            Self::Percentage(_) => "%",
+        }
+    }
+
+    pub(crate) fn flag(&self) -> &'static str {
+        match self {
+            Self::Amount(_) => "--trail-amount",
+            Self::Percentage(_) => "--trail-percent",
+        }
+    }
+
+    pub(crate) fn initial_stop(&self, bid: f64) -> Result<f64> {
+        let offset = self.offset()?;
+        let fraction = match self {
+            Self::Amount(_) => offset / bid,
+            Self::Percentage(_) => offset / 100.0,
+        };
+        let fraction_rounding_tolerance = 2.0 * f64::EPSILON * 0.005;
+        if !bid.is_finite()
+            || bid <= 0.0
+            || !(0.005 - fraction_rounding_tolerance..=1.0).contains(&fraction)
+        {
+            bail!(
+                "Trade input invalid: trailing distance must be between 0.5% and 100% of the positive bid price"
+            );
+        }
+        let distance = match self {
+            Self::Amount(_) => offset,
+            Self::Percentage(_) => (offset / 100.0) * bid,
+        };
+        let stop = bid - distance;
+        if !stop.is_finite() || stop <= 0.0 || stop >= bid {
+            bail!(
+                "Trade input invalid: trailing distance must produce a positive stop below the bid price"
+            );
+        }
+        Ok(stop)
+    }
+
+    pub(crate) fn wire(&self) -> Result<Value> {
+        Ok(json!({
+            "trailType": match self {
+                Self::Amount(_) => "AMOUNT",
+                Self::Percentage(_) => "PERCENTAGE",
+            },
+            "trailOffset": self.offset()?,
+        }))
+    }
+}
+
 pub struct PlaceOrderFields<'a> {
     pub side: TradeSide,
     pub portfolio_id: &'a str,
@@ -1572,6 +1696,7 @@ pub struct PlaceOrderFields<'a> {
     pub venue: &'a str,
     pub limit_price: Option<f64>,
     pub stop_price: Option<f64>,
+    pub trailing_stop: Option<&'a TrailingStop>,
     pub appropriateness_id: Option<&'a str>,
     pub acknowledged_warning_version: Option<&'a str>,
     pub fill_forecast_id: Option<&'a str>,
@@ -1595,6 +1720,15 @@ pub fn trade_place_order_variables(fields: PlaceOrderFields<'_>) -> Result<Value
     if let Some(stop_price) = fields.stop_price {
         input["stopPrice"] =
             serde_json::to_value(required_positive_decimal(stop_price, "stop_price")?)?;
+    }
+
+    if let Some(trailing) = fields.trailing_stop {
+        if fields.side.is_buy() || fields.limit_price.is_some() || fields.stop_price.is_none() {
+            bail!(
+                "Trade input invalid: trailing orders require SELL with a stop and no limit price"
+            );
+        }
+        input["trailingStopData"] = trailing.wire()?;
     }
 
     if let Some(appropriateness_id) = fields.appropriateness_id {
@@ -1701,7 +1835,7 @@ pub fn trade_estimated_order_price(
                 _ => side_quote,
             })
         }
-        "stop" => {
+        "stop" | "trailing-stop" => {
             let stop_price = stop_price.ok_or_else(|| {
                 anyhow!("Trade input invalid: stop order requires stop_price for estimate")
             })?;
@@ -2081,6 +2215,7 @@ mod tests {
             acknowledged_warning_version: Some("v1"),
             fill_forecast_id: Some("ff-1"),
             displayed_fill_probability: Some(0.92),
+            trailing_stop: None,
         })
         .expect("place order vars");
 
@@ -2118,6 +2253,7 @@ mod tests {
             acknowledged_warning_version: None,
             fill_forecast_id: None,
             displayed_fill_probability: None,
+            trailing_stop: None,
         })
         .expect("place order vars");
 
@@ -2143,6 +2279,7 @@ mod tests {
             acknowledged_warning_version: None,
             fill_forecast_id: None,
             displayed_fill_probability: None,
+            trailing_stop: None,
         })
         .expect("place order vars");
 
@@ -2166,6 +2303,7 @@ mod tests {
             acknowledged_warning_version: None,
             fill_forecast_id: None,
             displayed_fill_probability: None,
+            trailing_stop: None,
         })
         .expect("place order vars");
 
@@ -2868,12 +3006,32 @@ mod tests {
     }
 
     #[test]
+    fn trade_quote_routes_and_actual_provenance_are_checked_separately() {
+        for source in ["MUNC", "SEIX", "XVES", "XETR"] {
+            assert_eq!(
+                trade_security_tick_variables("p", "f", "US0378331005", source).unwrap()["source"],
+                source
+            );
+        }
+        for source in ["XXXX", "UNKNOWN", "CONSOLIDATED"] {
+            assert!(trade_security_tick_variables("p", "f", "US0378331005", source).is_err());
+        }
+        for venue in [json!("XXXX"), Value::Null, json!("XETR")] {
+            let response = json!({"account": {"brokerPortfolio": {"security": {"quoteTick": {"midPrice": 12345.6789, "venue": venue}}}}});
+            let error = parse_security_tick(&response).unwrap_err().to_string();
+            assert!(error.contains("quote venue is missing or unsupported"));
+            assert!(!error.contains("12345"));
+        }
+    }
+
+    #[test]
     fn parse_security_tick_extracts_quote_info() {
         let response = json!({
             "account": {
                 "brokerPortfolio": {
                     "security": {
                         "quoteTick": {
+                            "venue": "MUNC",
                             "askPrice": 123.46,
                             "bidPrice": 123.44,
                             "midPrice": 123.45,
@@ -2901,6 +3059,7 @@ mod tests {
                 "brokerPortfolio": {
                     "security": {
                         "quoteTick": {
+                            "venue": "MUNC",
                             "askPrice": 0,
                             "bidPrice": 0.0,
                             "midPrice": 123.45,
@@ -2926,6 +3085,7 @@ mod tests {
                 "brokerPortfolio": {
                     "security": {
                         "quoteTick": {
+                            "venue": "MUNC",
                             "askPrice": -1.0,
                             "bidPrice": 123.44,
                             "midPrice": 123.45,
@@ -3396,5 +3556,66 @@ mod tests {
         });
         let err = parse_cancel_order_result(&response).expect_err("non-object payload should fail");
         assert!(err.to_string().contains("cancelOrder must be an object"));
+    }
+}
+
+#[cfg(test)]
+mod trailing_stop_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_stop_accepts_exact_minimum_and_rejects_smaller_distances() {
+        for trail in [
+            TrailingStop::Amount("0.145".into()),
+            TrailingStop::Percentage("0.5".into()),
+        ] {
+            assert_eq!(trail.initial_stop(29.0).unwrap(), 28.855);
+        }
+        for trail in [
+            TrailingStop::Amount("0.1449999999".into()),
+            TrailingStop::Percentage("0.4999999999".into()),
+        ] {
+            assert!(trail.initial_stop(29.0).is_err());
+        }
+    }
+
+    #[test]
+    fn trailing_stop_distance_bounds_precision_and_wire_units() {
+        for (amount, percent) in [
+            (Some("0"), None),
+            (Some("-1"), None),
+            (None, Some("NaN")),
+            (None, Some("1e2")),
+            (None, Some("0.12345678901")),
+            (Some("5"), Some("5")),
+        ] {
+            assert!(TrailingStop::parse(amount, percent).is_err());
+        }
+        for trail in [
+            TrailingStop::Amount("0.49".into()),
+            TrailingStop::Percentage("0.49".into()),
+            TrailingStop::Percentage("100".into()),
+            TrailingStop::Amount("100".into()),
+        ] {
+            assert!(trail.initial_stop(100.0).is_err());
+        }
+        for trail in [
+            TrailingStop::Amount("0.5".into()),
+            TrailingStop::Percentage("0.5".into()),
+        ] {
+            assert_eq!(trail.initial_stop(100.0).unwrap(), 99.5);
+            assert!(trail.initial_stop(f64::NAN).is_err());
+        }
+        let trail = TrailingStop::parse(None, Some("5.1234567891"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            trail.wire().unwrap(),
+            json!({"trailType": "PERCENTAGE", "trailOffset": 5.1234567891})
+        );
+        assert_eq!(
+            trail.initial_stop(100.0).unwrap(),
+            100.0 - (5.1234567891 / 100.0) * 100.0
+        );
     }
 }

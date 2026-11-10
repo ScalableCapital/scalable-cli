@@ -701,6 +701,93 @@ fn broker_chart_json_without_session_returns_no_session_code() {
 }
 
 #[test]
+fn broker_candlesticks_json_without_session_returns_no_session_code() {
+    assert_json_no_session(
+        &[
+            "broker",
+            "candlesticks",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "one_month",
+            "--json",
+        ],
+        "broker.candlesticks",
+    );
+}
+
+#[test]
+fn broker_candlesticks_invalid_isin_returns_input_error_without_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_test_config(tmp.path());
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", tmp.path())
+        .args([
+            "broker",
+            "candlesticks",
+            "--isin",
+            "US0378331006",
+            "--timeframe",
+            "one_month",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+    let envelope: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(envelope["command"], "broker.candlesticks");
+    assert_eq!(envelope["error"]["code"], "broker_input_invalid");
+}
+
+#[test]
+fn broker_candlesticks_invalid_timeframe_uses_machine_error_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_test_config(tmp.path());
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", tmp.path())
+        .args([
+            "broker",
+            "candlesticks",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "invalid",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+    let envelope: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(envelope["command"], "broker.candlesticks");
+    assert_eq!(envelope["ok"], false);
+}
+
+#[test]
+fn broker_candlesticks_invalid_source_uses_machine_error_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_test_config(tmp.path());
+    let assert = sc_command()
+        .env("SC_CONFIG_DIR", tmp.path())
+        .args([
+            "broker",
+            "candlesticks",
+            "--isin",
+            "US0378331005",
+            "--timeframe",
+            "one_month",
+            "--quote-source",
+            "invalid",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(10);
+    let envelope: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(envelope["command"], "broker.candlesticks");
+    assert_eq!(envelope["ok"], false);
+}
+
+#[test]
 fn broker_quote_json_invalid_isin_returns_broker_input_invalid_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_dir = tmp.path().to_string_lossy().to_string();

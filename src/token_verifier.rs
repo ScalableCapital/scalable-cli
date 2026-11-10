@@ -604,7 +604,7 @@ Avd7QBCxvqXU+7acaZ2xxaV4
     }
 
     #[test]
-    fn rejects_invalid_signature() {
+    fn rejects_unsupported_algorithm() {
         let mut server = Server::new();
         let env_cfg = sample_env(server.url());
         let (_discovery, _jwks) =
@@ -615,6 +615,31 @@ Avd7QBCxvqXU+7acaZ2xxaV4
         let token = signed_hs256_token(claims);
         let err = verify_access_token_strict(&token, &env_cfg).unwrap_err();
         assert!(err.to_string().contains("Unsupported JWT algorithm"));
+    }
+
+    #[test]
+    fn rejects_invalid_rs256_signature() {
+        let mut server = Server::new();
+        let env_cfg = sample_env(server.url());
+        let (_discovery, _jwks) =
+            mock_discovery_and_jwks(&mut server, &env_cfg.auth.issuer, standard_jwks());
+
+        let token = signed_rs256_token(baseline_claims(&env_cfg.auth.issuer), Some(TEST_KID));
+        let (signing_input, signature) = token.rsplit_once('.').unwrap();
+        let mut signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .unwrap();
+        signature[0] ^= 1;
+        let token = format!(
+            "{signing_input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+        );
+
+        let err = verify_access_token_strict(&token, &env_cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("JWT signature verification failed")
+        );
     }
 
     #[test]

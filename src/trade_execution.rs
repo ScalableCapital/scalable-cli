@@ -16,8 +16,8 @@ use crate::trade::{
     NumberOfShares, PlaceOrderFields, SecurityTick, SingleExAnteFields,
     TRADE_APPROPRIATENESS_WARNING_QUERY, TRADE_CANCEL_ORDER_MUTATION, TRADE_PLACE_ORDER_MUTATION,
     TRADE_SECURITY_TICK_QUERY, TRADE_SINGLE_EX_ANTE_COSTS_QUERY, TRADE_TRADABILITY_QUERY,
-    TradeComplianceDecision, TradeSide, TradeTradabilityGate, evaluate_trade_compliance,
-    extract_single_trade_ex_ante_costs, market_buy_shares_from_amount,
+    TradeComplianceDecision, TradeSide, TradeTradabilityGate, TrailingStop,
+    evaluate_trade_compliance, extract_single_trade_ex_ante_costs, market_buy_shares_from_amount,
     parse_appropriateness_warning, parse_cancel_order_result, parse_place_order_result,
     parse_security_issuer_document_links, parse_security_tick, parse_tradability_gate,
     required_non_empty, round_estimated_order_volume_for_ex_ante,
@@ -54,6 +54,7 @@ const ORDER_TYPE_MARKET: &str = "market";
 const ORDER_TYPE_LIMIT: &str = "limit";
 const ORDER_TYPE_STOP: &str = "stop";
 const ORDER_TYPE_STOP_LIMIT: &str = "stop-limit";
+const ORDER_TYPE_TRAILING_STOP: &str = "trailing-stop";
 pub(crate) const ORDER_SIDE_BUY: &str = "buy";
 pub(crate) const ORDER_SIDE_SELL: &str = "sell";
 const TRADE_WARNING_LOCALE: &str = "en_DE";
@@ -71,6 +72,7 @@ pub(crate) struct TradeIntent {
     pub(crate) stop_price: Option<f64>,
     pub(crate) limit_price_str: Option<String>,
     pub(crate) stop_price_str: Option<String>,
+    pub(crate) trailing_stop: Option<TrailingStop>,
     pub(crate) venue_override: Option<String>,
     pub(crate) locale: String,
 }
@@ -193,6 +195,7 @@ impl TradeSizingInput {
 
 #[derive(Debug, Clone)]
 struct Phase2Input {
+    trailing_stop: Option<TrailingStop>,
     confirmation_id: String,
     acknowledge_appropriateness_warning: bool,
     isin: String,
@@ -371,7 +374,7 @@ fn execute_trade_sell_phase2(
 
 fn execute_trade_phase1(
     side: TradeSide,
-    phase1_input: ConfirmationPhase1Input,
+    mut phase1_input: ConfirmationPhase1Input,
     intent: TradeIntent,
     json_mode: bool,
     config: &AppConfig,
@@ -393,6 +396,9 @@ fn execute_trade_phase1(
         },
     )?;
 
+    if prepared.intent.trailing_stop.is_some() {
+        phase1_input.initial_stop_price = prepared.intent.stop_price_str.clone();
+    }
     let now = current_epoch_seconds();
     let nonce = format!("{:032x}", rand::random::<u128>());
     let confirmation_id =
@@ -522,6 +528,11 @@ fn execute_trade_phase2(
         );
     }
 
+    if confirmation_id_from_nonce_and_checksum(&stored.nonce, &stored.intent_checksum)
+        != stored.confirmation_id
+    {
+        bail!("CONFIRMATION_FIELDS_MISMATCH: stored confirmation checksum does not match its id");
+    }
     let active_env = resolve_active_env(session_manager)?;
     if stored.env != active_env.as_str() {
         bail!(
@@ -726,9 +737,9 @@ fn collect_canonical_ex_ante_amounts(
 fn build_phase2_intent(
     side: TradeSide,
     phase2: &Phase2Input,
-    _phase1: &ConfirmationPhase1Input,
+    phase1: &ConfirmationPhase1Input,
 ) -> Result<TradeIntent> {
-    build_trade_intent(TradeIntentBuildInput {
+    let mut intent = build_trade_intent(TradeIntentBuildInput {
         side,
         isin: &phase2.isin,
         sizing: &phase2.sizing,
@@ -738,7 +749,16 @@ fn build_phase2_intent(
         stop_price: &phase2.stop_price,
         stop_price_value: phase2.stop_price_value,
         venue: phase2.venue.as_deref(),
-    })
+    })?;
+    intent.trailing_stop = phase2.trailing_stop.clone();
+    if intent.trailing_stop.is_some() {
+        let stop = phase1.initial_stop_price.as_deref().ok_or_else(|| {
+            anyhow!("CONFIRMATION_FIELDS_MISMATCH: missing confirmed initial stop")
+        })?;
+        intent.stop_price = Some(parse_positive_decimal_from_str(stop, "initial_stop_price")?.0);
+        intent.stop_price_str = Some(stop.to_string());
+    }
+    Ok(intent)
 }
 
 #[cfg(test)]
@@ -771,6 +791,7 @@ fn parse_phase1_intent_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Tr
         stop_price_str: prices.stop_price,
         venue_override,
         locale: TRADE_WARNING_LOCALE.to_string(),
+        trailing_stop: parse_sell_trailing(args)?,
     })
 }
 
@@ -784,6 +805,9 @@ fn parse_phase1_input_for_confirmation_buy(
 fn parse_phase1_buy(
     args: &crate::cli::BrokerTradeBuyArgs,
 ) -> Result<(ConfirmationPhase1Input, TradeIntent)> {
+    if args.order_type == crate::cli::BrokerTradeOrderType::TrailingStop {
+        bail!("Trade input invalid: trailing-stop orders support SELL only");
+    }
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
     let sizing = parse_buy_sizing_input(args.amount.as_deref(), args.shares.as_deref())?;
     let prices = validate_order_price_flags(
@@ -826,18 +850,23 @@ fn parse_phase1_input_for_confirmation_sell(
         args.stop_price.as_deref(),
     )?;
 
-    Ok(build_confirmation_phase1_input(
+    let mut input = build_confirmation_phase1_input(
         ORDER_SIDE_SELL,
         &isin,
         &sizing,
         order_type_label(args.order_type),
         &prices,
         args.venue.as_deref(),
-    ))
+    );
+    input.trailing_stop = parse_sell_trailing(args)?;
+    Ok(input)
 }
 
 fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase2Input> {
     let confirmation_id = required_flag_value(args.confirm.as_deref(), "--confirm")?.to_string();
+    if args.order_type == crate::cli::BrokerTradeOrderType::TrailingStop {
+        bail!("Trade input invalid: trailing-stop orders support SELL only");
+    }
     let isin = required_input_value(args.isin.as_deref(), "isin")?.to_string();
     let sizing = parse_buy_sizing_input(args.amount.as_deref(), args.shares.as_deref())?;
     let prices = validate_order_price_flags(
@@ -859,6 +888,7 @@ fn parse_phase2_input_buy(args: &crate::cli::BrokerTradeBuyArgs) -> Result<Phase
         stop_price: prices.stop_price,
         limit_price_value: prices.limit_price_value,
         stop_price_value: prices.stop_price_value,
+        trailing_stop: None,
     })
 }
 
@@ -885,7 +915,19 @@ fn parse_phase2_input_sell(args: &crate::cli::BrokerTradeSellArgs) -> Result<Pha
         stop_price: prices.stop_price,
         limit_price_value: prices.limit_price_value,
         stop_price_value: prices.stop_price_value,
+        trailing_stop: parse_sell_trailing(args)?,
     })
+}
+
+fn parse_sell_trailing(args: &crate::cli::BrokerTradeSellArgs) -> Result<Option<TrailingStop>> {
+    let trailing =
+        TrailingStop::parse(args.trail_amount.as_deref(), args.trail_percent.as_deref())?;
+    if (args.order_type == crate::cli::BrokerTradeOrderType::TrailingStop) != trailing.is_some() {
+        bail!(
+            "Trade input invalid: --order-type trailing-stop requires exactly one of --trail-amount or --trail-percent; other order types do not allow trailing distance"
+        );
+    }
+    Ok(trailing)
 }
 
 fn parse_buy_sizing_input(
@@ -962,6 +1004,8 @@ fn build_confirmation_phase1_input(
         order_type: order_type.to_string(),
         limit_price: prices.limit_price.clone(),
         stop_price: prices.stop_price.clone(),
+        trailing_stop: None,
+        initial_stop_price: None,
     }
 }
 
@@ -980,6 +1024,7 @@ fn build_trade_intent(input: TradeIntentBuildInput<'_>) -> Result<TradeIntent> {
         stop_price_str: input.stop_price.clone(),
         venue_override: normalize_venue_override(input.venue),
         locale: TRADE_WARNING_LOCALE.to_string(),
+        trailing_stop: None,
     })
 }
 
@@ -1023,6 +1068,9 @@ fn assert_phase2_matches_phase1_input(
     if phase2.limit_price != phase1.limit_price {
         bail!("CONFIRMATION_FIELDS_MISMATCH: --limit-price does not match phase 1 input");
     }
+    if phase2.trailing_stop != phase1.trailing_stop {
+        bail!("CONFIRMATION_FIELDS_MISMATCH: trailing distance does not match phase 1 input");
+    }
     if phase2.stop_price != phase1.stop_price {
         bail!("CONFIRMATION_FIELDS_MISMATCH: --stop-price does not match phase 1 input");
     }
@@ -1034,6 +1082,7 @@ fn prepare_trade(
     config: &AppConfig,
     session_manager: &mut SessionManager,
 ) -> Result<PreparedTrade> {
+    let mut intent = intent.clone();
     let dpop_options = crate::channel::current_dpop_runtime_options(config);
     let dpop_options = &dpop_options;
     let env = resolve_active_env(session_manager)?;
@@ -1086,6 +1135,15 @@ fn prepare_trade(
             tradability_gate.selected_venue,
             tradability_gate.selected_venue_status,
             reason
+        );
+    }
+
+    if intent.trailing_stop.is_some()
+        && (intent.side.is_buy()
+            || !matches!(tradability_gate.selected_venue.as_str(), "SEIX" | "MUNC"))
+    {
+        bail!(
+            "Trade input invalid: trailing-stop SELL orders require EIX or gettex; select --venue EIX or --venue gettex"
         );
     }
 
@@ -1187,9 +1245,26 @@ fn prepare_trade(
             "EX_ANTE_COST_UNAVAILABLE: security quote is outdated, cannot continue with ex-ante disclosure"
         );
     }
+    if let Some(trailing) = &intent.trailing_stop {
+        if matches!(trailing, TrailingStop::Amount(_)) && quote.currency != "EUR" {
+            bail!("Trade input invalid: --trail-amount requires an EUR quote");
+        }
+        let bid = quote.bid_price.ok_or_else(|| {
+            anyhow!("Trade input invalid: trailing-stop requires a positive bid price")
+        })?;
+        let calculated = trailing.initial_stop(bid)?;
+        let stop = intent.stop_price.unwrap_or(calculated);
+        if !stop.is_finite() || stop <= 0.0 || stop >= bid {
+            bail!(
+                "CONFIRMATION_FIELDS_MISMATCH: approved initial stop is no longer below the bid price; rerun phase 1"
+            );
+        }
+        intent.stop_price = Some(stop);
+        intent.stop_price_str = Some(stop.to_string());
+    }
     let issuer_document_links =
         parse_security_issuer_document_links(&quote_response, &intent.locale)?;
-    let calculation = calculate_trade_quantities(intent, &quote, &tradability_gate)?;
+    let calculation = calculate_trade_quantities(&intent, &quote, &tradability_gate)?;
 
     let ex_ante_variables = trade_single_ex_ante_variables(SingleExAnteFields {
         person_id: &ids.account_id,
@@ -1253,6 +1328,7 @@ fn prepare_trade(
             "order_type": &intent.order_type,
             "limit_price": &intent.limit_price_str,
             "stop_price": &intent.stop_price_str,
+            "trailing_stop": &intent.trailing_stop,
             "venue_override": &intent.venue_override,
             "locale": &intent.locale,
         },
@@ -1304,6 +1380,7 @@ fn prepare_trade(
         limit_price: intent.limit_price_str.as_deref(),
         stop_price: intent.stop_price_str.as_deref(),
         venue_override: intent.venue_override.as_deref(),
+        trailing_stop: intent.trailing_stop.as_ref(),
     }));
 
     Ok(PreparedTrade {
@@ -1366,11 +1443,12 @@ fn calculate_trade_quantities(
                 let shares_u64 = market_buy_shares_from_amount(amount, sizing_price.price, false);
                 if shares_u64 == 0 {
                     bail!(
-                        "EX_ANTE_COST_UNAVAILABLE: amount {} {} is below one share at current {} {}",
+                        "ORDER_SIZE_BELOW_ONE_SHARE: amount {} {} is below one share at current {} {}\n{}",
                         amount_str,
                         quote.currency,
                         pricing_basis_display_name(sizing_price.basis),
-                        canonical_decimal_from_f64(sizing_price.price)
+                        canonical_decimal_from_f64(sizing_price.price),
+                        crate::trade::ORDER_SIZE_BELOW_ONE_SHARE_RECOVERY
                     );
                 }
                 (
@@ -1484,6 +1562,7 @@ fn submit_order(
         shares: &prepared.number_of_shares_str,
         estimated_order_volume: &canonical_decimal_from_f64(prepared.estimated_order_volume),
         venue: &prepared.confirmation_fields.venue,
+        trailing_stop: prepared.intent.trailing_stop.as_ref(),
     });
 
     let now_epoch = current_epoch_seconds();
@@ -1521,6 +1600,7 @@ fn submit_order(
         acknowledged_warning_version: prepared.warning_version_for_order.as_deref(),
         fill_forecast_id: None,
         displayed_fill_probability: None,
+        trailing_stop: prepared.intent.trailing_stop.as_ref(),
     })?;
 
     let submit_response = execute_with_refresh_retry(
@@ -1715,10 +1795,12 @@ fn validate_order_price_flags(
     let stop_price = optional_trimmed_string(stop_price_raw);
 
     match order_type {
-        crate::cli::BrokerTradeOrderType::Market => {
+        crate::cli::BrokerTradeOrderType::Market
+        | crate::cli::BrokerTradeOrderType::TrailingStop => {
             if limit_price.is_some() || stop_price.is_some() {
                 bail!(
-                    "Trade input invalid: --order-type market does not allow --limit-price or --stop-price"
+                    "Trade input invalid: --order-type {} does not allow --limit-price or --stop-price",
+                    order_type_label(order_type)
                 );
             }
         }
@@ -1771,6 +1853,7 @@ fn order_type_label(order_type: crate::cli::BrokerTradeOrderType) -> &'static st
         crate::cli::BrokerTradeOrderType::Limit => ORDER_TYPE_LIMIT,
         crate::cli::BrokerTradeOrderType::Stop => ORDER_TYPE_STOP,
         crate::cli::BrokerTradeOrderType::StopLimit => ORDER_TYPE_STOP_LIMIT,
+        crate::cli::BrokerTradeOrderType::TrailingStop => ORDER_TYPE_TRAILING_STOP,
     }
 }
 
@@ -1825,7 +1908,7 @@ fn parse_positive_decimal_from_str(raw: &str, field: &str) -> Result<(f64, Strin
     Ok((parsed, normalized))
 }
 
-fn normalize_decimal_str(raw: &str) -> String {
+pub(crate) fn normalize_decimal_str(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "0".to_string();
@@ -1905,6 +1988,7 @@ fn canonical_cost_from_json(value: Option<&Value>) -> String {
 }
 
 struct IntentChecksumInput<'a> {
+    trailing_stop: Option<&'a TrailingStop>,
     env: TargetEnv,
     account_id: &'a str,
     portfolio_id: &'a str,
@@ -1931,6 +2015,7 @@ fn intent_checksum_payload(input: IntentChecksumInput<'_>) -> Value {
         "shares": input.shares,
         "limit_price": input.limit_price,
         "stop_price": input.stop_price,
+        "trailing_stop": input.trailing_stop,
         "venue_override": input.venue_override,
     })
 }
@@ -2043,6 +2128,7 @@ fn confirmation_id_from_nonce_and_checksum(nonce: &str, checksum: &str) -> Strin
 }
 
 struct TradeIntentHashInput<'a> {
+    trailing_stop: Option<&'a TrailingStop>,
     env: TargetEnv,
     account_id: &'a str,
     portfolio_id: &'a str,
@@ -2070,6 +2156,7 @@ fn trade_intent_hash(input: TradeIntentHashInput<'_>) -> String {
         "shares_input": input.shares_input,
         "limit_price": input.limit_price,
         "stop_price": input.stop_price,
+        "trailing_stop": input.trailing_stop,
         "shares": input.shares,
         "estimated_order_volume": input.estimated_order_volume,
         "venue": input.venue,
@@ -2096,7 +2183,7 @@ mod tests {
     use super::*;
     use crate::session::{LoginSource, Session, StoredSession};
     use crate::trade_presentation::{
-        BUY_EX_ANTE_COSTS_NOTICE, BUY_XETRA_MARKET_DATA_NOTICE, CLIENT_DOCUMENTS_URL,
+        BUY_EX_ANTE_COSTS_NOTICE, CLIENT_DOCUMENTS_URL, MARKET_DATA_NOTICE,
         PRESENTATION_MAPPING_INCOMPLETE, build_buy_regulatory_disclosures,
         build_sell_regulatory_disclosures, phase1_presentation_sections,
     };
@@ -2349,6 +2436,11 @@ mod tests {
                                         "venue": "XETR",
                                         "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
                                         "unavailabilityReason": null
+                                    },
+                                    {
+                                        "venue": "SEIX",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
                                     }
                                 ],
                                 "primaryVenue": {
@@ -2369,6 +2461,11 @@ mod tests {
                                         "venue": "XETR",
                                         "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
                                         "unavailabilityReason": null
+                                    },
+                                    {
+                                        "venue": "SEIX",
+                                        "tradabilityStatus": "TRADABLE_WITHOUT_APPROPRIATENESS",
+                                        "unavailabilityReason": null
                                     }
                                 ],
                                 "primaryVenue": {
@@ -2380,7 +2477,8 @@ mod tests {
                                 "position": {
                                     "sellableByVenue": [
                                         {"venue": "MUNC", "sellable": 10.0},
-                                        {"venue": "XETR", "sellable": 10.0}
+                                        {"venue": "XETR", "sellable": 10.0},
+                                        {"venue": "SEIX", "sellable": 10.0}
                                     ]
                                 }
                             }
@@ -2403,6 +2501,7 @@ mod tests {
                             "id": "DE0007100000",
                             "isin": "DE0007100000",
                             "quoteTick": {
+                                "venue": "MUNC",
                                 "askPrice": mid_price + 1.0,
                                 "bidPrice": mid_price - 1.0,
                                 "midPrice": mid_price,
@@ -2482,6 +2581,7 @@ mod tests {
             stop_price_str: None,
             venue_override: venue_override.map(ToString::to_string),
             locale: TRADE_WARNING_LOCALE.to_string(),
+            trailing_stop: None,
         }
     }
 
@@ -2585,6 +2685,44 @@ mod tests {
             canonical_decimal_from_f64(expected_sizing_price)
         );
 
+        let result = build_result_payload(&prepared, None);
+        assert_eq!(
+            result
+                .pointer("/intent/venue_override")
+                .and_then(Value::as_str),
+            venue_override
+        );
+        assert_eq!(
+            result
+                .pointer("/regulatory_disclosures/market_data_notice")
+                .and_then(Value::as_str),
+            Some("Market data: EIX, Börse München (gettex)")
+        );
+        let confirmation = sample_confirmation_payload();
+        let presentation = build_phase1_presentation(&result, &confirmation)
+            .expect("preview presentation should build");
+        let notice_path = "/result/regulatory_disclosures/market_data_notice";
+        assert_eq!(
+            find_field(&presentation, notice_path)
+                .and_then(|field| field.get("value"))
+                .and_then(Value::as_str),
+            Some("Market data: EIX, Börse München (gettex)")
+        );
+        assert!(
+            presentation["required_leaf_paths"]
+                .as_array()
+                .expect("required leaf paths")
+                .contains(&json!(notice_path))
+        );
+        let payload = json!({"result": result, "confirmation": confirmation});
+        let lines = match side {
+            TradeSide::Buy => render_trade_buy_text(&payload),
+            TradeSide::Sell => render_trade_sell_text(&payload),
+        };
+        assert!(lines.iter().any(|line| {
+            line == "market_data_notice: Market data: EIX, Börse München (gettex)"
+        }));
+
         resolve_mock.assert();
         tradability_mock.assert();
         tick_mock.assert();
@@ -2592,37 +2730,101 @@ mod tests {
     }
 
     #[test]
-    fn trade_preparation_buy_uses_default_selected_venue_for_quote() {
-        assert_trade_preparation_uses_selected_venue_quote(TradeSide::Buy, None, "MUNC", 50.0);
+    fn trade_preparation_rejects_unsupported_quote_request_venues() {
+        for venue in ["XXXX", "UNKNOWN"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut server = Server::new();
+            let _channel_guard = TestChannelGuard::for_server(&server);
+            let _cfg_guard =
+                EnvGuard::set("SC_CONFIG_DIR", tmp.path().to_string_lossy().to_string());
+            let config = sample_config();
+            ensure_runtime_dpop_key(&config);
+            let mut session_manager = SessionManager::new(&config).unwrap();
+            session_manager
+                .save_active(&sample_stored_session(crate::channel::current_env()))
+                .unwrap();
+            let resolve = mock_trade_read(&mut server, "ResolveBrokerIds", json!({"id": "person-1"}),
+                json!({"data": {"account": {"id": "person-1", "brokerPortfolios": [{"id": "portfolio-1"}]}}}).to_string());
+            let tradability = mock_trade_read(
+                &mut server,
+                "getTradingTradability",
+                json!({"isin": "DE0007100000"}),
+                trade_preparation_tradability_response(venue),
+            );
+            let forbidden = server
+                .mock("POST", "/")
+                .match_body(Matcher::Regex("getSecurityTick|placeOrder".to_string()))
+                .expect(0)
+                .with_status(500)
+                .create();
+            let error = prepare_trade(
+                &trade_intent_for_preparation_test(TradeSide::Buy, None),
+                &config,
+                &mut session_manager,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("unsupported venue for quote requests"),
+                "{error}"
+            );
+            resolve.assert();
+            tradability.assert();
+            forbidden.assert();
+        }
     }
 
     #[test]
-    fn trade_preparation_buy_uses_xetra_selected_venue_for_quote() {
-        assert_trade_preparation_uses_selected_venue_quote(
-            TradeSide::Buy,
-            Some("XETR"),
-            "XETR",
-            80.0,
-        );
+    fn trade_preparation_buy_uses_default_selected_venue_for_quote() {
+        for venue in ["MUNC", "XETR", "SEIX"] {
+            assert_trade_preparation_uses_selected_venue_quote(TradeSide::Buy, None, venue, 50.0);
+        }
+    }
+
+    #[test]
+    fn trade_preparation_buy_uses_explicit_selected_venue_for_quote() {
+        for venue in ["MUNC", "XETR", "SEIX"] {
+            assert_trade_preparation_uses_selected_venue_quote(
+                TradeSide::Buy,
+                Some(venue),
+                venue,
+                80.0,
+            );
+        }
     }
 
     #[test]
     fn trade_preparation_sell_uses_default_selected_venue_for_quote() {
-        assert_trade_preparation_uses_selected_venue_quote(TradeSide::Sell, None, "MUNC", 50.0);
+        for venue in ["MUNC", "XETR", "SEIX"] {
+            assert_trade_preparation_uses_selected_venue_quote(TradeSide::Sell, None, venue, 50.0);
+        }
     }
 
     #[test]
-    fn trade_preparation_sell_uses_xetra_selected_venue_for_quote() {
-        assert_trade_preparation_uses_selected_venue_quote(
-            TradeSide::Sell,
-            Some("XETR"),
-            "XETR",
-            80.0,
-        );
+    fn trade_preparation_sell_uses_explicit_selected_venue_for_quote() {
+        for venue in ["MUNC", "XETR", "SEIX"] {
+            assert_trade_preparation_uses_selected_venue_quote(
+                TradeSide::Sell,
+                Some(venue),
+                venue,
+                80.0,
+            );
+        }
     }
 
     #[test]
     fn trade_phase2_reprepares_with_a_fresh_selected_venue_quote() {
+        assert_phase2_quote_provenance(None);
+    }
+
+    #[test]
+    fn trade_phase2_rejects_unsupported_or_missing_quote_venues_before_submission() {
+        for venue in [json!("XXXX"), Value::Null] {
+            assert_phase2_quote_provenance(Some(venue));
+        }
+    }
+
+    fn assert_phase2_quote_provenance(rejected_venue: Option<Value>) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut server = Server::new();
         let _channel_guard = TestChannelGuard::for_server(&server);
@@ -2730,6 +2932,12 @@ mod tests {
         phase1_ex_ante_mock.assert();
         phase1_ex_ante_mock.remove();
 
+        let mut phase2_tick: Value =
+            serde_json::from_str(&trade_preparation_tick_response(75.0)).unwrap();
+        if let Some(venue) = &rejected_venue {
+            phase2_tick["data"]["account"]["brokerPortfolio"]["security"]["quoteTick"]["venue"] =
+                venue.clone();
+        }
         let phase2_tick_mock = server
             .mock("POST", "/")
             .match_header("authorization", expected_authorization_header())
@@ -2745,7 +2953,7 @@ mod tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(trade_preparation_tick_response(75.0))
+            .with_body(phase2_tick.to_string())
             .create();
         let phase2_ex_ante_mock = server
             .mock("POST", "/")
@@ -2757,6 +2965,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trade_preparation_ex_ante_response())
+            .expect(if rejected_venue.is_some() { 0 } else { 1 })
             .create();
         let place_order_mock = server
             .mock("POST", "/")
@@ -2781,6 +2990,7 @@ mod tests {
                 })
                 .to_string(),
             )
+            .expect(if rejected_venue.is_some() { 0 } else { 1 })
             .create();
 
         let phase2 = execute_broker_trade_buy(
@@ -2798,8 +3008,20 @@ mod tests {
             },
             &config,
             &mut session_manager,
-        )
-        .expect("phase 2 submission");
+        );
+        if rejected_venue.is_some() {
+            let error = phase2.unwrap_err().to_string();
+            assert!(
+                error.contains("quote venue is missing or unsupported"),
+                "{error}"
+            );
+            assert!(!error.contains("75"));
+            phase2_tick_mock.assert();
+            phase2_ex_ante_mock.assert();
+            place_order_mock.assert();
+            return;
+        }
+        let phase2 = phase2.expect("phase 2 submission");
 
         assert_eq!(
             phase2.pointer("/result/tradability/selected_venue"),
@@ -2874,6 +3096,7 @@ mod tests {
         Expired,
         Consumed,
         SizingDrift,
+        BelowOneShare,
         CostsDrift,
         ComplianceDrift,
         MissingAcknowledgement,
@@ -3122,6 +3345,7 @@ mod tests {
             }
             let fresh_mid = match outcome {
                 StopLimitFlowOutcome::SizingDrift => 120.0,
+                StopLimitFlowOutcome::BelowOneShare => 2000.0,
                 StopLimitFlowOutcome::FreshQuoteNotionalBlocked => 106.0,
                 _ => 100.0,
             };
@@ -3142,8 +3366,15 @@ mod tests {
                 mock_trade_read(&mut server, "ResolveBrokerIds", json!({"id": "person-1"}), resolve_response),
                 mock_trade_read(&mut server, "getTradingTradability", json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000"}), fresh_tradability.to_string()),
                 mock_trade_read(&mut server, "getSecurityTick", json!({"personId": "person-1", "portfolioId": "portfolio-1", "isin": "DE0007100000", "source": "XETR", "includeYearToDate": false}), trade_preparation_tick_response(fresh_mid)),
-                mock_trade_read(&mut server, "getSingleTradeExAnteCost", fresh_ex_ante, costs.to_string()),
             ]);
+            if outcome != StopLimitFlowOutcome::BelowOneShare {
+                confirm_mocks.push(mock_trade_read(
+                    &mut server,
+                    "getSingleTradeExAnteCost",
+                    fresh_ex_ante,
+                    costs.to_string(),
+                ));
+            }
             if require_ack && outcome != StopLimitFlowOutcome::ComplianceDrift {
                 confirm_mocks.push(mock_trade_read(
                     &mut server,
@@ -3184,7 +3415,8 @@ mod tests {
                 .expect_err("cannot reuse confirmation");
             assert!(err.to_string().contains("CONFIRMATION_ALREADY_USED"));
         } else {
-            let message = confirmed.expect_err("blocked confirmation").to_string();
+            let error = confirmed.expect_err("blocked confirmation");
+            let message = error.to_string();
             let expected = match outcome {
                 StopLimitFlowOutcome::Expired => "CONFIRMATION_EXPIRED",
                 StopLimitFlowOutcome::Consumed => "CONFIRMATION_ALREADY_USED",
@@ -3193,15 +3425,45 @@ mod tests {
                 }
                 StopLimitFlowOutcome::ConfirmNotionalBlocked
                 | StopLimitFlowOutcome::FreshQuoteNotionalBlocked => "LOCAL_TRADE_CONTROL",
+                StopLimitFlowOutcome::BelowOneShare => "ORDER_SIZE_BELOW_ONE_SHARE",
                 _ => "CONFIRMATION_FIELDS_MISMATCH",
             };
             assert!(message.contains(expected), "{outcome:?}: {message}");
+            if outcome == StopLimitFlowOutcome::BelowOneShare {
+                assert_below_one_share_recovery(&error);
+                assert_recovery_preview_inputs(&replay, confirmation_id);
+                assert!(
+                    load_confirmation(confirmation_id)
+                        .unwrap()
+                        .unwrap()
+                        .consumed_at_epoch
+                        .is_none()
+                );
+            }
         }
         for mock in confirm_mocks {
             mock.assert();
         }
         placement.assert();
         unexpected_placement.assert();
+    }
+
+    #[test]
+    fn confirmation_price_rise_below_one_share_requires_a_new_preview() {
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            true,
+            false,
+            false,
+            StopLimitFlowOutcome::BelowOneShare,
+        );
+        assert_stop_limit_flow(
+            TradeSide::Buy,
+            true,
+            true,
+            false,
+            StopLimitFlowOutcome::BelowOneShare,
+        );
     }
 
     #[test]
@@ -3353,7 +3615,7 @@ mod tests {
                 "fiveYearsCosts": {"amount": 2.50, "percentage": 0.00550}
             },
             "regulatory_disclosures": {
-                "market_data_notice": Value::Null,
+                "market_data_notice": MARKET_DATA_NOTICE,
                 "execution_instruction": "I instruct Scalable Capital to place this order for execution on European Investor Exchange (EIX) valid for up to 360 days.",
                 "ex_ante_costs_notice": BUY_EX_ANTE_COSTS_NOTICE
             },
@@ -3453,6 +3715,7 @@ mod tests {
                 "fiveYearsCosts": {"amount": 2.50, "percentage": 0.00550}
             },
             "regulatory_disclosures": {
+                "market_data_notice": MARKET_DATA_NOTICE,
                 "execution_instruction": "I instruct Scalable Capital to place this order for execution on Börse München (gettex) valid for up to 360 days."
             },
             "document_links": {
@@ -3745,12 +4008,12 @@ mod tests {
     }
 
     #[test]
-    fn buy_regulatory_disclosures_include_xetra_market_data_notice() {
-        let disclosures = build_buy_regulatory_disclosures("XETR", VENUE_LABEL_XETRA);
+    fn buy_regulatory_disclosures_include_market_data_notice_for_xetra() {
+        let disclosures = build_buy_regulatory_disclosures(VENUE_LABEL_XETRA);
 
         assert_eq!(
             disclosures.market_data_notice,
-            Some(BUY_XETRA_MARKET_DATA_NOTICE)
+            "Market data: EIX, Börse München (gettex)"
         );
         assert_eq!(
             disclosures.execution_instruction,
@@ -3763,10 +4026,13 @@ mod tests {
     }
 
     #[test]
-    fn buy_regulatory_disclosures_omit_market_data_notice_for_non_xetra() {
-        let disclosures = build_buy_regulatory_disclosures("SEIX", VENUE_LABEL_SEIX);
+    fn buy_regulatory_disclosures_include_market_data_notice_for_eix() {
+        let disclosures = build_buy_regulatory_disclosures(VENUE_LABEL_SEIX);
 
-        assert_eq!(disclosures.market_data_notice, None);
+        assert_eq!(
+            disclosures.market_data_notice,
+            "Market data: EIX, Börse München (gettex)"
+        );
         assert_eq!(
             disclosures.execution_instruction,
             "I instruct Scalable Capital to place this order for execution on European Investor Exchange (EIX) valid for up to 360 days."
@@ -3778,10 +4044,13 @@ mod tests {
     }
 
     #[test]
-    fn sell_regulatory_disclosures_include_execution_instruction_only() {
-        let disclosures = build_sell_regulatory_disclosures("MUNC", VENUE_LABEL_GETTEX);
+    fn sell_regulatory_disclosures_include_market_data_notice_and_execution_instruction() {
+        let disclosures = build_sell_regulatory_disclosures(VENUE_LABEL_GETTEX);
 
-        assert_eq!(disclosures.market_data_notice, None);
+        assert_eq!(
+            disclosures.market_data_notice,
+            "Market data: EIX, Börse München (gettex)"
+        );
         assert_eq!(
             disclosures.execution_instruction,
             "I instruct Scalable Capital to place this order for execution on Börse München (gettex) valid for up to 360 days."
@@ -4010,11 +4279,9 @@ mod tests {
                 .iter()
                 .any(|line| line == "phase_2_acknowledgement_flag: null")
         );
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.starts_with("market_data_notice:"))
-        );
+        assert!(lines.iter().any(|line| {
+            line == "market_data_notice: Market data: EIX, Börse München (gettex)"
+        }));
     }
 
     #[test]
@@ -4184,11 +4451,9 @@ mod tests {
         assert!(lines.iter().any(|line| {
             line == "  Five years costs percentage (raw fraction, 1 = 100%): 0.00550"
         }));
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.starts_with("market_data_notice:"))
-        );
+        assert!(lines.iter().any(|line| {
+            line == "market_data_notice: Market data: EIX, Börse München (gettex)"
+        }));
         assert!(
             !lines
                 .iter()
@@ -4218,6 +4483,7 @@ mod tests {
                 stop_price_str: None,
                 venue_override: Some("MUNC".to_string()),
                 locale: "en_DE".to_string(),
+                trailing_stop: None,
             },
             tradability_gate: TradeTradabilityGate {
                 status: "TRADABLE_WITHOUT_APPROPRIATENESS".to_string(),
@@ -4313,6 +4579,101 @@ mod tests {
     }
 
     #[test]
+    fn buy_amount_below_one_share_has_a_specific_validation_error() {
+        let mut intent = TradeIntent {
+            side: TradeSide::Buy,
+            isin: "DE0007100000".to_string(),
+            amount: Some(50.49),
+            amount_str: Some("50.49".to_string()),
+            shares: None,
+            shares_str: None,
+            order_type: ORDER_TYPE_MARKET.to_string(),
+            limit_price: None,
+            stop_price: None,
+            limit_price_str: None,
+            stop_price_str: None,
+            venue_override: None,
+            locale: "en_DE".to_string(),
+            trailing_stop: None,
+        };
+        let quote = SecurityTick {
+            ask_price: Some(50.5),
+            bid_price: Some(50.3),
+            mid_price: 50.4,
+            currency: "EUR".to_string(),
+            is_outdated: false,
+            timestamp_utc: None,
+        };
+        let gate = sample_tradability_gate_for_calculation(TradeSide::Buy);
+        let error = calculate_trade_quantities(&intent, &quote, &gate)
+            .expect_err("amount below the ask price must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("amount 50.49 EUR is below one share")
+        );
+        assert_below_one_share_recovery(&error);
+
+        intent.amount = Some(50.5);
+        intent.amount_str = Some("50.50".to_string());
+        let calculation = calculate_trade_quantities(&intent, &quote, &gate)
+            .expect("amount equal to the ask price buys one share");
+        assert_eq!(calculation.number_of_shares, NumberOfShares::Whole(1));
+    }
+
+    fn assert_below_one_share_recovery(error: &anyhow::Error) {
+        let classified = crate::machine::classify_error(error);
+        assert_eq!(classified.code, "order_size_below_one_share");
+        assert_eq!(classified.exit_code, 10);
+        let human_message = crate::machine::human_error_message(error);
+        let machine_hint = classified.hints.join(" ");
+        for guidance in [&human_message, &machine_hint] {
+            assert!(
+                guidance.contains("new preview without --confirm"),
+                "{guidance}"
+            );
+            assert!(guidance.contains("--amount"), "{guidance}");
+            assert!(
+                guidance.contains("replace --amount with --shares"),
+                "{guidance}"
+            );
+            assert!(
+                guidance.contains("--acknowledge-appropriateness-warning"),
+                "{guidance}"
+            );
+            assert!(guidance.contains("new ID"), "{guidance}");
+        }
+    }
+
+    fn assert_recovery_preview_inputs(replay: &str, confirmation_id: &str) {
+        use clap::Parser;
+
+        let preview = replay
+            .replace(&format!(" --confirm {confirmation_id}"), "")
+            .replace(" --acknowledge-appropriateness-warning", "");
+        for sizing in ["--amount 3000", "--shares 1"] {
+            let command = preview.replace("--amount 1000", sizing);
+            let cli = crate::cli::Cli::try_parse_from(command.split_whitespace())
+                .expect("recovery command must parse without confirmation-only flags");
+            let crate::cli::Commands::Broker(broker) = cli.command else {
+                panic!("broker command")
+            };
+            let crate::cli::BrokerCommand::Trade(trade) = broker.command else {
+                panic!("trade command")
+            };
+            let crate::cli::BrokerTradeCommand::Buy(args) = trade.command else {
+                panic!("buy command")
+            };
+            let intent = parse_phase1_intent_buy(&args)
+                .expect("recovery must use exactly one valid sizing input");
+            assert_eq!(intent.amount.is_some(), sizing.starts_with("--amount"));
+            assert_eq!(intent.shares.is_some(), sizing.starts_with("--shares"));
+            assert!(args.confirm.is_none());
+            assert!(!args.acknowledge_appropriateness_warning);
+        }
+    }
+
+    #[test]
     fn calculate_trade_quantities_sizes_buy_amount_from_ask_and_estimates_limit_from_limit_price() {
         let intent = TradeIntent {
             side: TradeSide::Buy,
@@ -4328,6 +4689,7 @@ mod tests {
             stop_price_str: None,
             venue_override: None,
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: Some(50.5),
@@ -4371,6 +4733,7 @@ mod tests {
             stop_price_str: None,
             venue_override: None,
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: Some(50.5),
@@ -4413,6 +4776,7 @@ mod tests {
             stop_price_str: Some("48.00".to_string()),
             venue_override: None,
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: Some(50.5),
@@ -4454,6 +4818,7 @@ mod tests {
             stop_price_str: None,
             venue_override: None,
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: Some(50.5),
@@ -4502,6 +4867,8 @@ mod tests {
                 order_type: prepared.intent.order_type.clone(),
                 limit_price: prepared.intent.limit_price_str.clone(),
                 stop_price: prepared.intent.stop_price_str.clone(),
+                trailing_stop: None,
+                initial_stop_price: None,
             },
             fields: prepared.confirmation_fields.clone(),
             snapshot_payload: prepared.snapshot_payload.clone(),
@@ -4644,6 +5011,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
 
         let err = ensure_phase2_submission_requirements(&prepared, &phase2, &stored)
@@ -4677,6 +5045,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -4687,6 +5056,8 @@ mod tests {
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
             stop_price: None,
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let intent =
@@ -4794,6 +5165,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -4804,6 +5176,8 @@ mod tests {
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
             stop_price: None,
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let intent =
@@ -4833,6 +5207,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -4843,6 +5218,8 @@ mod tests {
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
             stop_price: None,
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let intent =
@@ -4913,6 +5290,7 @@ mod tests {
             stop_price: None,
             limit_price_value: Some(123.45),
             stop_price_value: None,
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -4923,6 +5301,8 @@ mod tests {
             order_type: ORDER_TYPE_LIMIT.to_string(),
             limit_price: Some("120".to_string()),
             stop_price: None,
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let err = assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1)
@@ -4947,6 +5327,7 @@ mod tests {
             stop_price: Some("88.10".to_string()),
             limit_price_value: None,
             stop_price_value: Some(88.10),
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -4957,6 +5338,8 @@ mod tests {
             order_type: ORDER_TYPE_STOP.to_string(),
             limit_price: None,
             stop_price: Some("87.50".to_string()),
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let err = assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1)
@@ -4984,6 +5367,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
 
         let err = ensure_appropriateness_warning_acknowledgement(&phase2, &stored)
@@ -5051,6 +5435,8 @@ mod tests {
             venue: Some("gettex".to_string()),
             confirm: None,
             json: true,
+            trail_amount: None,
+            trail_percent: None,
         };
 
         let intent = parse_phase1_intent_sell(&args).expect("phase 1 sell intent");
@@ -5229,6 +5615,7 @@ mod tests {
             stop_price: None,
             limit_price_value: None,
             stop_price_value: None,
+            trailing_stop: None,
         };
         let phase1 = ConfirmationPhase1Input {
             side: ORDER_SIDE_BUY.to_string(),
@@ -5239,6 +5626,8 @@ mod tests {
             order_type: ORDER_TYPE_MARKET.to_string(),
             limit_price: None,
             stop_price: None,
+            trailing_stop: None,
+            initial_stop_price: None,
         };
 
         let err = assert_phase2_matches_phase1_input(TradeSide::Buy, &phase2, &phase1)
@@ -5295,6 +5684,7 @@ mod tests {
                 limit_price: Some(limit),
                 stop_price: Some(stop),
                 venue_override: Some("XETR"),
+                trailing_stop: None,
             }));
             let submission = trade_intent_hash(TradeIntentHashInput {
                 env: crate::channel::current_env(),
@@ -5310,6 +5700,7 @@ mod tests {
                 shares: "9",
                 estimated_order_volume: "945",
                 venue: "XETR",
+                trailing_stop: None,
             });
             (checksum, submission)
         };
@@ -5459,6 +5850,7 @@ mod tests {
             stop_price_str: None,
             venue_override: Some("SEIX".to_string()),
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: None,
@@ -5493,6 +5885,7 @@ mod tests {
             stop_price_str: None,
             venue_override: Some("SEIX".to_string()),
             locale: "en_DE".to_string(),
+            trailing_stop: None,
         };
         let quote = SecurityTick {
             ask_price: Some(48.8),
@@ -5621,4 +6014,5 @@ mod tests {
             "Trade input invalid: field 'order_id' must be a non-empty string"
         );
     }
+    include!("trade_execution_trailing_tests.rs");
 }

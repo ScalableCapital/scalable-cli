@@ -30,6 +30,10 @@ pub struct ConfirmationPhase1Input {
     pub order_type: String,
     pub limit_price: Option<String>,
     pub stop_price: Option<String>,
+    #[serde(default)]
+    pub trailing_stop: Option<crate::trade::TrailingStop>,
+    #[serde(default)]
+    pub initial_stop_price: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +240,8 @@ mod tests {
                 order_type: "market".to_string(),
                 limit_price: None,
                 stop_price: None,
+                trailing_stop: None,
+                initial_stop_price: None,
             },
             fields: ConfirmationFields {
                 isin: "US0378331005".to_string(),

@@ -136,7 +136,8 @@ whose token fails local signature or claim validation still requires `sc login`.
 | List transactions | `sc broker transactions --json` |
 | View a transaction | `sc broker transaction details --transaction-id <TRANSACTION_ID> --json` |
 | Find a security | `sc broker search "apple" --json` |
-| Get a quote | `sc broker quote --isin US0378331005 --json` |
+| Get a quote | `sc broker quote --isin US0378331005 --quote-source eix --json` |
+| Get OHLC candles | `sc broker candlesticks --isin US0378331005 --timeframe one_month --quote-source eix --json` |
 | Discover execution venues | `sc broker order-venues` |
 | View portfolio groups | `sc broker portfolio-groups` |
 | List savings plans | `sc broker savings-plans` |
@@ -189,6 +190,7 @@ in the Scalable app before retrying. Do not submit another order while the
 outcome is unresolved. Follow the [trade recovery procedure](public-docs/commands.md#recovering-from-a-failed-submission).
 
 Savings-plan changes have their own [inspection and recovery procedure](public-docs/commands.md#watchlist-alerts-and-savings-plans).
+Savings-plan confirmation is bound to the disclosed cost snapshot.
 See [Trading](public-docs/commands.md#trading) for sell orders, sizing, venues,
 order types, and cancellation.
 

@@ -24,6 +24,9 @@ sc whoami
 sc logout
 ```
 
+`sc whoami` also reports `session.local_read_only`; JSON output includes the
+boolean at `data.session.local_read_only`.
+
 For session limits, refresh, and revocation, see the
 [automation guide](automation.md#session-lifetimes-and-refresh).
 
@@ -58,6 +61,8 @@ sc broker portfolio-groups --group-id <GROUP_ID>
 sc broker chart --timeframe 1y
 sc broker chart --portfolio-id <PORTFOLIO_ID> --timeframe ytd --json
 sc broker chart --isin US0378331005 --timeframe 1m
+sc broker candlesticks --isin US0378331005 --timeframe one_month
+sc broker candlesticks --isin US0378331005 --timeframe one_month --quote-source eix --json
 sc broker quote --isin US0378331005
 sc broker watchlist
 sc broker search "apple"
@@ -95,9 +100,21 @@ report `broker_response_invalid`.
 
 For cash and buying power, see [Cash and buying power](#cash-and-buying-power).
 
-For `sc broker holdings`, `sc broker quote`, `sc broker watchlist`, and
-`sc broker search`, market-data selection is automatic and uses the standard
-consolidated quote.
+`sc broker candlesticks` returns open, high, low, and close decimal strings and
+UTC interval bounds. It preserves backend values and order without generating
+or correcting candles. Supported timeframes are `intraday`, `two_days`,
+`one_week`, `one_month`, `three_months`, `six_months`, `year_to_date`, `one_year`,
+and `max`.
+
+`--quote-source` accepts `consolidated` (the default), `gettex`/`MUNC`,
+`eix`/`SEIX`, and `vestima`/`XVES`, case-insensitively. Availability varies by
+source, security, and timeframe; the command never substitutes another source.
+Empty history in a present series returns `candlesticks: []`; missing or
+malformed series report `broker_response_invalid`.
+
+`sc broker holdings`, `sc broker quote`, and `sc broker watchlist` (listing)
+support the same `--quote-source` options and default. `sc broker search`
+always uses consolidated quotes.
 
 `sc broker order-venues` lists the supported venues currently enabled for the
 resolved portfolio. Its `venue` values (`gettex`, `xetra`, or `eix`) are valid
@@ -218,6 +235,9 @@ the full ex-ante cost disclosure calculated for `SEIX`, together with a
 short-lived confirmation ID. Present every value in that disclosure to the
 client, obtain an explicit affirmative response in a separate interaction,
 then repeat the exact arguments with `--confirm <CONFIRMATION_ID>`.
+Savings-plan confirmation is bound to the disclosed cost snapshot. Changes to
+that snapshot require a new preview and confirmation, including numeric-format
+changes that alter its checksum.
 
 When `--day-of-month` is supplied without `--year-month`, the CLI selects the
 earliest available execution month for that specific day. Supplying
@@ -258,6 +278,9 @@ the warning and confirming that you understand the risks and want to proceed.
 Buy orders require exactly one sizing input: `--amount` or `--shares`. Buy-side
 share input currently accepts whole shares only.
 
+Buy amounts below one share at the current ask price return
+`order_size_below_one_share` in JSON output with exit code `10`.
+
 To request a specific execution venue for a trade, use `--venue`. The following
 names and MICs are accepted: `gettex` or `MUNC`, `xetra` or `XETR`, and `eix`
 or `SEIX`. The selected execution venue is also used for the trade preview.
@@ -275,6 +298,7 @@ Supported order types:
 - `limit`
 - `stop`
 - `stop-limit` (requires both `--stop-price` and `--limit-price`)
+- `trailing-stop` (sell only, with either `--trail-amount` or `--trail-percent`)
 
 For stop-limit orders, the stop triggers activation and the limit constrains the
 execution price. Execution depends on market prices and available liquidity.
@@ -296,6 +320,32 @@ sc broker trade buy --isin US0378331005 --shares 2 --order-type stop-limit \
 sc broker trade sell --isin US0378331005 --shares 1 --order-type stop-limit \
   --stop-price 170.00 --limit-price 169.00 --confirm <CONFIRMATION_ID>
 ```
+
+For a trailing stop loss sell on EIX or gettex, set either a distance in EUR or a
+percentage distance. `--trail-percent 5` means 5%, not 0.05%. The minimum distance
+is 0.5% of the bid price. The distance must produce a positive initial stop below
+the bid price, so 100% is invalid. Inputs support up to 10 fractional digits.
+Do not combine a trailing distance with `--stop-price` or `--limit-price`.
+
+```bash
+sc broker trade sell --isin US0378331005 --shares 1 --order-type trailing-stop \
+  --trail-amount 5 --venue eix
+sc broker trade sell --isin US0378331005 --shares 1 --order-type trailing-stop \
+  --trail-percent 5 --venue gettex
+```
+
+The preview shows the distance, initial stop, venue and costs. Review the preview,
+then repeat its inputs with `--confirm <CONFIRMATION_ID>` after a separate
+confirmation. The confirmed initial stop stays fixed during submission. If it
+becomes invalid, request a new preview. Once placed, the Broker moves the stop
+when the price rises. The stop triggers a market sell, whose execution price may
+be below the stop price.
+
+`sc broker transaction details --transaction-id <ORDER_ID>` shows the trail and
+latest available stop with its timestamp. When a refresh is unavailable, the
+output retains the initial or last-known stop and identifies its source. This
+value is not a guaranteed live quote. Use the existing cancellation command to
+cancel a pending trailing order.
 
 Trade cancellation is a separate single-step command for pending orders. Use
 the `order_id` returned by `sc broker trade buy` or `sc broker trade sell`; it

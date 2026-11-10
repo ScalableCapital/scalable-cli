@@ -73,6 +73,11 @@ pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -
             anyhow!("Broker response invalid: missing account.brokerPortfolio.inventory.items")
         })?;
 
+    for item in items {
+        crate::quote_source::validate_quote_tick(&item["quoteTick"])
+            .map_err(|message| anyhow!("Broker response invalid: {message}"))?;
+    }
+
     let mut projected = items
         .iter()
         .map(|item| {
@@ -98,6 +103,7 @@ pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -
                 "fifo_price": position.get("fifoPrice").cloned().unwrap_or(Value::Null),
                 "valuation": performance.get("valuation").cloned().unwrap_or(Value::Null),
                 "valuation_currency": performance.get("currency").cloned().unwrap_or(Value::Null),
+                "quote_venue": quote.get("venue").cloned().unwrap_or(Value::Null),
                 "quote_mid_price": quote.get("midPrice").cloned().unwrap_or(Value::Null),
                 "quote_currency": quote.get("currency").cloned().unwrap_or(Value::Null),
                 "quote_timestamp_utc": timestamp_value_or_null(quote.get("timestampUtc")),
@@ -192,6 +198,7 @@ pub fn project_broker_holdings_response(input: &BrokerInput, response: &Value) -
     });
 
     Ok(json!({
+        "requested_quote_source": input.quote_source().as_graphql(),
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
         "count": projected.len(),
@@ -390,6 +397,11 @@ pub fn project_broker_watchlist_response(input: &BrokerInput, response: &Value) 
             anyhow!("Broker response invalid: missing account.brokerPortfolio.watchlist.items")
         })?;
 
+    for item in items {
+        crate::quote_source::validate_quote_tick(&item["quoteTick"])
+            .map_err(|message| anyhow!("Broker response invalid: {message}"))?;
+    }
+
     let mut projected = items
         .iter()
         .map(|item| {
@@ -398,6 +410,7 @@ pub fn project_broker_watchlist_response(input: &BrokerInput, response: &Value) 
                 "isin": item.get("isin").cloned().unwrap_or(Value::Null),
                 "name": item.get("name").cloned().unwrap_or(Value::Null),
                 "security_type": item.get("type").cloned().unwrap_or(Value::Null),
+                "quote_venue": quote.get("venue").cloned().unwrap_or(Value::Null),
                 "quote_mid_price": quote.get("midPrice").cloned().unwrap_or(Value::Null),
                 "quote_currency": quote.get("currency").cloned().unwrap_or(Value::Null),
                 "quote_timestamp_utc": timestamp_value_or_null(quote.get("timestampUtc")),
@@ -413,6 +426,7 @@ pub fn project_broker_watchlist_response(input: &BrokerInput, response: &Value) 
     });
 
     Ok(json!({
+        "requested_quote_source": input.quote_source().as_graphql(),
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
         "count": projected.len(),
@@ -475,6 +489,11 @@ pub fn project_broker_search_response(
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("Broker response invalid: missing account.brokerPortfolio.simpleSecuritySearch.items"))?;
 
+    for item in items {
+        crate::quote_source::validate_quote_tick(&item["quoteTick"])
+            .map_err(|message| anyhow!("Broker response invalid: {message}"))?;
+    }
+
     let mut projected = items
         .iter()
         .map(|item| {
@@ -483,6 +502,7 @@ pub fn project_broker_search_response(
                 "isin": item.get("isin").cloned().unwrap_or(Value::Null),
                 "name": item.get("name").cloned().unwrap_or(Value::Null),
                 "security_type": item.get("type").cloned().unwrap_or(Value::Null),
+                "quote_venue": quote.get("venue").cloned().unwrap_or(Value::Null),
                 "quote_mid_price": quote.get("midPrice").cloned().unwrap_or(Value::Null),
                 "quote_currency": quote.get("currency").cloned().unwrap_or(Value::Null),
                 "quote_timestamp_utc": timestamp_value_or_null(quote.get("timestampUtc")),
@@ -498,6 +518,7 @@ pub fn project_broker_search_response(
     });
 
     Ok(json!({
+        "requested_quote_source": input.quote_source().as_graphql(),
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
         "query": search_term,
@@ -571,6 +592,8 @@ pub fn project_broker_quote_response(
     }
 
     let quote = security.get("quoteTick").cloned().unwrap_or(Value::Null);
+    crate::quote_source::validate_quote_tick(&quote)
+        .map_err(|message| anyhow!("Broker response invalid: {message}"))?;
     let mut performances = quote
         .get("performancesByTimeframe")
         .and_then(Value::as_array)
@@ -602,6 +625,7 @@ pub fn project_broker_quote_response(
         .collect::<Vec<_>>();
 
     Ok(json!({
+        "requested_quote_source": input.quote_source().as_graphql(),
         "account_id": input.account_id_value(),
         "portfolio_id": input.portfolio_id_value(),
         "security_id": security.get("id").cloned().unwrap_or(Value::Null),
@@ -609,6 +633,7 @@ pub fn project_broker_quote_response(
         "name": security.get("name").cloned().unwrap_or(Value::Null),
         "security_type": security.get("type").cloned().unwrap_or(Value::Null),
         "quote_tick_id": quote.get("id").cloned().unwrap_or(Value::Null),
+        "quote_venue": quote.get("venue").cloned().unwrap_or(Value::Null),
         "quote_mid_price": quote.get("midPrice").cloned().unwrap_or(Value::Null),
         "quote_bid_price": quote.get("bidPrice").cloned().unwrap_or(Value::Null),
         "quote_ask_price": quote.get("askPrice").cloned().unwrap_or(Value::Null),
@@ -1347,7 +1372,7 @@ fn map_security_trade_details(transaction: &Value, typename: &str) -> Value {
         "aggregated_transaction_taxes": map_aggregated_transaction_taxes(
             transaction.get("aggregatedTransactionTaxes"),
         ),
-        "trailing_stop_info": map_trailing_stop_info(transaction.get("trailingStopInfo")),
+        "trailing_stop_info": map_trailing_stop_info(transaction),
     })
 }
 
@@ -1466,10 +1491,13 @@ fn map_aggregated_transaction_taxes(raw: Option<&Value>) -> Value {
     }
 }
 
-fn map_trailing_stop_info(raw: Option<&Value>) -> Value {
-    match raw {
+fn map_trailing_stop_info(transaction: &Value) -> Value {
+    match transaction.get("trailingStopInfo") {
         Some(value) if !value.is_null() => json!({
             "trail_type": value.get("trailType").cloned().unwrap_or(Value::Null),
+            "stop_price": transaction.get("stopPrice").cloned().unwrap_or(Value::Null),
+            "stop_price_source": if value.get("latestStopPriceTimestamp").is_some_and(|v| !v.is_null()) { "last_known" } else { "initial" },
+            "refresh_status": "not_required",
             "trail_offset": value.get("trailOffset").cloned().unwrap_or(Value::Null),
             "latest_stop_price_timestamp": timestamp_value_or_null(value.get("latestStopPriceTimestamp")),
             "latest_stop_price_epoch_second": value
